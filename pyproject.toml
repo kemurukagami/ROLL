@@ -1,3 +1,14 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "roll"
+version = "0.1.0"
+
+[tool.setuptools.packages.find]
+include = ["roll*"]
+
 [tool.black]
 line-length = 119
 target-version = ['py38']

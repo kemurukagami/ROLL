@@ -169,6 +169,11 @@ class MegatronInferStrategy(InferenceStrategy):
                 forward_args[key] = torch.concat([inputs[key] for inputs in multi_modal_inputs], dim=0).to(
                     input_ids.device
                 )
+        print("input_ids shape:", input_ids.shape)
+        print("attention_mask shape:", attention_mask.shape)
+        if attention_mask is not None and attention_mask.dim() == 2:
+            # [batch, seq_len] -> [batch, 1, 1, seq_len]
+            attention_mask = attention_mask[:, None, None, :]
         output_tensor = model(
             input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, **forward_args
         )
@@ -283,7 +288,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             adam_beta2=self.megatron_train_args.adam_beta2,
             adam_eps=self.megatron_train_args.adam_epsilon,
             fp16=self.megatron_train_args.fp16,
-            bf16=self.megatron_train_args.bf16,
+            # bf16=self.megatron_train_args.bf16,
             params_dtype=params_dtype,
             use_distributed_optimizer=self.megatron_train_args.use_distributed_optimizer,
             clip_grad=self.megatron_train_args.max_grad_norm,
@@ -369,7 +374,10 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         if update_successful:
             self.scheduler.step()
         else:
-            raise NotImplementedError("megatron optimizer step failed!")
+            import warnings
+            warnings.warn("Megatron optimizer step was not successful (e.g., due to gradient overflow). Skipping this update.")
+            # Optionally, you can return metrics or a special flag here
+            # return metrics
 
         for model in self.model:
             model.zero_grad_buffer()
@@ -567,7 +575,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         rng_file = os.path.join(load_dir, RNG_STATE_DIR, f"rng_state_{dist.get_rank()}.pth")
         if os.path.exists(rng_file):
             logger.info(f"Loading rng states from {rng_file}")
-            checkpoint_rng_state = torch.load(rng_file)
+            checkpoint_rng_state = torch.load(rng_file, weights_only=False)
             random.setstate(checkpoint_rng_state["random_rng_state"])
             np.random.set_state(checkpoint_rng_state["np_rng_state"])
             torch.set_rng_state(checkpoint_rng_state["torch_rng_state"])

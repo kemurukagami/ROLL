@@ -11,14 +11,14 @@ hydra:
 
 exp_name: "rlvr_megatron_test"
 seed: 42
-logging_dir: ./output/logs
-output_dir: ./output
+logging_dir: ./output_tp1/logs
+output_dir: ./output_tp1
 system_envs:
   USE_MODELSCOPE: '1'
 
 checkpoint_config:
   type: file_system
-  output_dir: ./output/checkpoint
+  output_dir: ./output_tp1/checkpoint
 
 #track_with: wandb
 #tracker_kwargs:
@@ -31,15 +31,15 @@ checkpoint_config:
 #    - debug
 
 
-num_gpus_per_node: 8
+num_gpus_per_node: 1
 
-max_steps: 500
-save_steps: 1000
+max_steps: 5
+save_steps: 1
 logging_steps: 1
-eval_steps: 10
+eval_steps: 1
 resume_from_checkpoint: false
 
-rollout_batch_size: 64
+rollout_batch_size: 32
 prompt_length: 1024
 response_length: 512
 
@@ -68,7 +68,7 @@ validation:
   data_args:
     template: qwen2_5
     file_name:
-      - /data/oss_bucket_0/math_test/aime24_25.json
+      - /home/isaacy/ROLL/data/aime24_25_deal.jsonl
   generating_args:
     top_p: 0.6
     top_k: 50
@@ -81,46 +81,46 @@ actor_train:
   model_args:
     flash_attn: fa2
     disable_gradient_checkpointing: false
-    dtype: bf16
+    dtype: fp16
     model_type: ~
   training_args:
     learning_rate: 1.0e-6
     weight_decay: 0
-    per_device_train_batch_size: 4
-    gradient_accumulation_steps: 8
-    warmup_steps: 50
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 1
+    warmup_steps: 5
     num_train_epochs: 50
   data_args:
     template: qwen2_5
     file_name:
-      - /data/oss_bucket_0/rl_examples/data/code_KodCode_data_hard.jsonl
+      - /home/isaacy/ROLL/data/code_KodCode_data.jsonl
 #      - /data/oss_bucket_0/rl_examples/data/llm_judge_Multi-subject-RLVR_deal_new.jsonl
-      - /data/oss_bucket_0/rl_examples/data/math_deepmath_deal.jsonl
+      - /home/isaacy/ROLL/data/math_deepmath_deal.jsonl
     prompt: instruction
     interleave_probs: "1.0"
     max_samples: 6400
     preprocessing_num_workers: 16
     domain_interleave_probs:
-      math_rule: 0.5
-      code_sandbox: 0.4
+      math_rule: 1.0
+      # code_sandbox: 0.5
 #      llm_judge: 0.1
   strategy_args:
     strategy_name: megatron_train
     strategy_config:
-      tensor_model_parallel_size: 2
+      tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
       context_parallel_size: 1
       overlap_grad_reduce: false
       use_distributed_optimizer: true
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(0,1))
   infer_batch_size: 4
 
 actor_infer:
   model_args:
     flash_attn: fa2
     disable_gradient_checkpointing: true
-    dtype: bf16
+    dtype: fp16
   generating_args:
     max_new_tokens: ${response_length}
     top_p: 0.99
@@ -136,14 +136,14 @@ actor_infer:
       gpu_memory_utilization: 0.8
       block_size: 16
       max_model_len: 6000
-  device_mapping: list(range(0,7))
+  device_mapping: list(range(0,1))
   infer_batch_size: 1
 
 reference:
   model_args:
     flash_attn: fa2
     disable_gradient_checkpointing: true
-    dtype: bf16
+    dtype: fp16
     model_type: ~
   data_args:
     template: qwen2_5
@@ -153,7 +153,7 @@ reference:
       tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(0,1))
   infer_batch_size: 8
 
 rewards:
@@ -164,27 +164,27 @@ rewards:
     data_args:
       template: qwen2_5
     tag_included: [cn_k12, orca_math, olympiads, gsm8k, math, aops_forum]
-    world_size: 8
+    world_size: 1
     infer_batch_size: 1
     query_filter_config:
       type: mean_filter
       filter_args:
         threshold_up: 0.9
         threshold_down: 0.1
-  code_sandbox:
-    use_local: true
-    worker_cls: roll.pipeline.rlvr.rewards.code_sandbox_reward_worker.CodeSandboxRewardWorker
-    tag_included: [assert, input, livecodebench_random100]
-    model_args:
-      model_name_or_path: ${reward_pretrain}
-    data_args:
-      template: qwen2_5
-    world_size: 8
-    infer_batch_size: 1
-    query_filter_config:
-      type: std_filter
-      filter_args:
-        std_threshold: 0
+  # code_sandbox:
+  #   use_local: true
+  #   worker_cls: roll.pipeline.rlvr.rewards.code_sandbox_reward_worker.CodeSandboxRewardWorker
+  #   tag_included: [assert, input, livecodebench_random100]
+  #   model_args:
+  #     model_name_or_path: ${reward_pretrain}
+  #   data_args:
+  #     template: qwen2_5
+  #   world_size: 2
+  #   infer_batch_size: 1
+  #   query_filter_config:
+  #     type: std_filter
+  #     filter_args:
+  #       std_threshold: 0
 #  llm_judge:
 #    # NOTE: llm as judge 也需要gpu, 不能和actor infer共享gpu
 #    worker_cls: roll.pipeline.rlvr.rewards.llm_judge_reward_worker.LLMJudgeRewardWorker

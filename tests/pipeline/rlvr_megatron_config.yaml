@@ -11,14 +11,14 @@ hydra:
 
 exp_name: "rlvr_megatron_test"
 seed: 42
-logging_dir: ./output_tp1/logs
-output_dir: ./output_tp1
+logging_dir: ./output_multinode/logs
+output_dir: ./output_multinode
 system_envs:
   USE_MODELSCOPE: '1'
 
 checkpoint_config:
   type: file_system
-  output_dir: ./output_tp1/checkpoint
+  output_dir: ./output_multinode/checkpoint
 
 #track_with: wandb
 #tracker_kwargs:
@@ -31,7 +31,8 @@ checkpoint_config:
 #    - debug
 
 
-num_gpus_per_node: 1
+num_gpus_per_node: 2
+num_nodes: 2
 
 max_steps: 5
 save_steps: 1
@@ -107,13 +108,13 @@ actor_train:
   strategy_args:
     strategy_name: megatron_train
     strategy_config:
-      tensor_model_parallel_size: 1
+      tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
       context_parallel_size: 1
       overlap_grad_reduce: false
       use_distributed_optimizer: true
-  device_mapping: list(range(0,1))
+  device_mapping: list(range(0,4))
   infer_batch_size: 4
 
 actor_infer:
@@ -136,7 +137,7 @@ actor_infer:
       gpu_memory_utilization: 0.8
       block_size: 16
       max_model_len: 6000
-  device_mapping: list(range(0,1))
+  device_mapping: list(range(0,4))
   infer_batch_size: 1
 
 reference:
@@ -150,10 +151,10 @@ reference:
   strategy_args:
     strategy_name: megatron_infer
     strategy_config:
-      tensor_model_parallel_size: 1
+      tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-  device_mapping: list(range(0,1))
+  device_mapping: list(range(0,4))
   infer_batch_size: 8
 
 rewards:
@@ -164,7 +165,7 @@ rewards:
     data_args:
       template: qwen2_5
     tag_included: [cn_k12, orca_math, olympiads, gsm8k, math, aops_forum]
-    world_size: 1
+    world_size: 2
     infer_batch_size: 1
     query_filter_config:
       type: mean_filter

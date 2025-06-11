@@ -11,8 +11,19 @@ from transformers.modeling_utils import (
     load_state_dict,
 )
 
+from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+    FullyParallelLoadStrategyWrapper,
+    FullyParallelSaveStrategyWrapper,
+)
+
+from typing import List, Dict, Iterator, Callable, Tuple
+import copy  
+from mcore_adapter.models.converter.model_converter import ModelConverter  
+from mcore_adapter.models.converter.dist_converter import DistConverter
+
 from .constants import TRACKER_FILENAME
 from .utils import get_logger
+import torch.distributed as dist
 
 
 logger = get_logger(__name__)

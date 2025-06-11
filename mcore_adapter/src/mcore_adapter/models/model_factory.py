@@ -205,14 +205,17 @@ class PretrainedModel(MegatronModule, ModuleUtilsMixin):
         logger.info(f"End loading, cost: {time.time() - load_start_time:0.3f}s")
         return models
 
-    def save_pretrained(self, save_directory: str, state_dict=None):
+    def save_pretrained(self, save_directory: str, state_dict=None, save_mca_config: bool = True):
         os.makedirs(save_directory, exist_ok=True)
         # TODO: better directory structure
-        tracker_file = get_checkpoint_tracker_filename(save_directory)
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            self.config.save_pretrained(save_directory)
-            with open(tracker_file, "w") as f:
-                f.write("1")
+
+        # Moved to MegatronStrategy
+        if save_mca_config:
+            tracker_file = get_checkpoint_tracker_filename(save_directory)
+            if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+                self.config.save_pretrained(save_directory)
+                with open(tracker_file, "w") as f:
+                    f.write("1")
         if not torch.distributed.is_initialized() or mpu.get_expert_data_parallel_rank() == 0:
             checkpoint_name = get_checkpoint_name(save_directory)
             ensure_directory_exists(checkpoint_name)

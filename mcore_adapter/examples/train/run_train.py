@@ -29,7 +29,8 @@ def download_model(model_name_or_path: str, local_dir: str = None) -> str:
     if os.path.isdir(model_name_or_path):
         return model_name_or_path
 
-    use_model_scope = os.getenv("USE_MODELSCOPE", "0") == "1"
+    # use_model_scope = os.getenv("USE_MODELSCOPE", "0") == "1"
+    use_model_scope = False
     temp_lock_path = os.path.join(
         "~/.cache/mcore_adapter/temp_lock",
         f"{hashlib.md5(model_name_or_path.encode()).hexdigest()}.lock",

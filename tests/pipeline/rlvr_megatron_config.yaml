@@ -11,14 +11,15 @@ hydra:
 
 exp_name: "rlvr_megatron_test"
 seed: 42
-logging_dir: ./output_multinode/logs
-output_dir: ./output_multinode
+logging_dir: ./output_reshard/logs
+output_dir: ./output_reshard
 system_envs:
-  USE_MODELSCOPE: '1'
+  USE_MODELSCOPE: '0'
 
 checkpoint_config:
   type: file_system
-  output_dir: ./output_multinode/checkpoint
+  # output_dir: /mnt/shared/output_multinode/checkpoint
+  output_dir: ./output_reshard/checkpoint
 
 #track_with: wandb
 #tracker_kwargs:
@@ -32,19 +33,20 @@ checkpoint_config:
 
 
 num_gpus_per_node: 2
-num_nodes: 2
+num_nodes: 1
 
 max_steps: 5
 save_steps: 1
 logging_steps: 1
 eval_steps: 1
-resume_from_checkpoint: false
+# resume_from_checkpoint: false
+resume_from_checkpoint: /home/isaacy/ROLL/output_reshard/checkpoint/20250610-175100/checkpoint-1
 
-rollout_batch_size: 32
+rollout_batch_size: 16
 prompt_length: 1024
 response_length: 512
 
-num_return_sequences_in_group: 8
+num_return_sequences_in_group: 2
 ppo_epochs: 1
 value_clip: 0.5
 reward_clip: 10
@@ -62,14 +64,14 @@ max_additional_running_prompts: 16
 generate_redundancy_num: 0
 
 
-pretrain: Qwen/Qwen2.5-0.5B-Instruct
-reward_pretrain: Qwen/Qwen2.5-0.5B-Instruct
+pretrain: /home/isaacy/.cache/huggingface/hub/models--Mxode--NanoLM-0.3B-Instruct-v1.1/snapshots/7a9d848188a674302d64a865786d4508be19571a
+reward_pretrain: /home/isaacy/.cache/huggingface/hub/models--Mxode--NanoLM-0.3B-Instruct-v1.1/snapshots/7a9d848188a674302d64a865786d4508be19571a
 
 validation:
   data_args:
     template: qwen2_5
     file_name:
-      - /home/isaacy/ROLL/data/aime24_25_deal.jsonl
+      - /home/isaacy/ROLL/data/aime24_25_deal_mini.jsonl
   generating_args:
     top_p: 0.6
     top_k: 50
@@ -114,7 +116,8 @@ actor_train:
       context_parallel_size: 1
       overlap_grad_reduce: false
       use_distributed_optimizer: true
-  device_mapping: list(range(0,4))
+      use_distributed_model_checkpoint: true
+  device_mapping: list(range(0,2))
   infer_batch_size: 4
 
 actor_infer:
@@ -137,7 +140,7 @@ actor_infer:
       gpu_memory_utilization: 0.8
       block_size: 16
       max_model_len: 6000
-  device_mapping: list(range(0,4))
+  device_mapping: list(range(0,2))
   infer_batch_size: 1
 
 reference:
@@ -154,7 +157,7 @@ reference:
       tensor_model_parallel_size: 2
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-  device_mapping: list(range(0,4))
+  device_mapping: list(range(0,2))
   infer_batch_size: 8
 
 rewards:
@@ -165,7 +168,7 @@ rewards:
     data_args:
       template: qwen2_5
     tag_included: [cn_k12, orca_math, olympiads, gsm8k, math, aops_forum]
-    world_size: 2
+    world_size: 1
     infer_batch_size: 1
     query_filter_config:
       type: mean_filter

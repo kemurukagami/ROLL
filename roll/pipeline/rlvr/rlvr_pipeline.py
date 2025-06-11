@@ -322,6 +322,8 @@ class RLVRPipeline(BasePipeline):
         actor_train_timer = _Timer(window_size=5)
 
         for global_step in range(self.pipeline_config.max_steps):
+            # self.do_checkpoint(global_step=global_step)
+            # break
             if global_step <= self.state.step:
                 global_step += 1
                 continue

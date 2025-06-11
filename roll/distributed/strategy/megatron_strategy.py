@@ -20,7 +20,9 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker, reduce_aux_losses_tracker_across_ranks
 
 from mcore_adapter import TrainingArguments
-from mcore_adapter.checkpointing import get_checkpoint_dir, load_state_dict_from_checkpoint
+from mcore_adapter.checkpointing import get_checkpoint_dir, get_checkpoint_tracker_filename
+from mcore_adapter.models.model_utils import exists_mca_config
+from mcore_adapter.models.model_config import McaModelConfig
 from mcore_adapter.initialize import initialize_megatron
 from mcore_adapter.parallel_functions import vocab_parallel_logprobs, context_parallel_gather
 from mcore_adapter.trainer.utils import get_megatron_lr_scheduler
@@ -467,21 +469,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         RotaryEmbedding.forward.cache_clear()
         torch.cuda.empty_cache()
 
-    def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", **kwargs):
-        logger.info(f"save_dir: {save_dir}")
-        with Timer("load") as load_timer:
-            self.load_states()
+    def save_checkpoint(self, save_dir, global_step, ckpt_id, tag="checkpoint", **kwargs):  
+        logger.info(f"save_dir: {save_dir}")  
+        with Timer("load") as load_timer:  
+            self.load_states()  
 
-        # save model and tokenizer
-        if len(self.models_unwrapped) == 1:
-            self.models_unwrapped[0].save_pretrained(save_dir)
-        else:
-            state_dict = {f"model{i}": model.state_dict_for_save_checkpoint() for i, model in
-                          enumerate(self.models_unwrapped)}
-            self.models_unwrapped[0].save_pretrained(save_dir, state_dict=state_dict)
-        if dist.get_rank() == 0:
-            if self.tokenizer is not None:
-                self.tokenizer.save_pretrained(save_dir)
 
         # save optimizer
         checkpoint_dir = get_checkpoint_dir(save_dir,
@@ -505,36 +497,43 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         if dist.is_initialized():
             dist.barrier()
+        # Save tokenizer (only on rank 0)  
+        if dist.get_rank() == 0:  
+            if self.tokenizer is not None:  
+                self.tokenizer.save_pretrained(save_dir)  
 
-        # save lr_scheduler
-        if dist.get_rank() == 0:
-            torch.save(self.scheduler.state_dict(), os.path.join(save_dir, SCHEDULER_NAME))
+        # save model
+        self.save_model_checkpoint(save_dir, tag=tag, **kwargs)
 
-        # save rng state
-        rng_states = {
-            "random_rng_state": random.getstate(),
-            "np_rng_state": np.random.get_state(),
-            "torch_rng_state": torch.get_rng_state(),
-            "cuda_rng_state": torch.cuda.get_rng_state(),
-            "rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states(),
-        }
-        rgn_path = os.path.join(save_dir, RNG_STATE_DIR, f"rng_state_{dist.get_rank()}.pth")
-        os.makedirs(os.path.dirname(rgn_path), exist_ok=True)
+        # save lr_scheduler (existing logic)  
+        if dist.get_rank() == 0:  
+            torch.save(self.scheduler.state_dict(), os.path.join(save_dir, SCHEDULER_NAME))  
+    
+        # save rng state (existing logic)  
+        rng_states = {  
+            "random_rng_state": random.getstate(),  
+            "np_rng_state": np.random.get_state(),  
+            "torch_rng_state": torch.get_rng_state(),  
+            "cuda_rng_state": torch.cuda.get_rng_state(),  
+            "rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states(),  
+        }  
+        rgn_path = os.path.join(save_dir, RNG_STATE_DIR, f"rng_state_{dist.get_rank()}.pth")  
+        os.makedirs(os.path.dirname(rgn_path), exist_ok=True)  
         torch.save(rng_states, rgn_path)
-
-        if self.worker_config.checkpoint_config.get("async_upload", True):
-            self.thread_executor.submit(self.checkpoint_manager.upload, ckpt_id=ckpt_id, local_state_path=save_dir)
-        else:
-            self.checkpoint_manager.upload(ckpt_id=ckpt_id, local_state_path=save_dir)
-
-        metrics = {
-            "load": load_timer.last,
-        }
+    
+        if self.worker_config.checkpoint_config.get("async_upload", True):  
+            self.thread_executor.submit(self.checkpoint_manager.upload, ckpt_id=ckpt_id, local_state_path=save_dir)  
+        else:  
+            self.checkpoint_manager.upload(ckpt_id=ckpt_id, local_state_path=save_dir)  
+    
+        metrics = {  
+            "load": load_timer.last,  
+        }  
         return metrics
 
     def load_checkpoint(self, load_dir, tag="checkpoint", **kwargs):
         logger.info(f"load checkpoint from {load_dir}")
-
+            
         # load optimizer
         optimizer_checkpoint = get_checkpoint_dir(
             load_dir, iteration=1, return_base_dir=self.megatron_train_args.use_distributed_optimizer
@@ -560,29 +559,99 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 os.path.join(optimizer_checkpoint, OPTIMIZER_NAME), map_location=self.megatron_train_args.device
             )
         self.optimizer.load_state_dict(state_dict)
-
-        # load lr_scheduler
-        self.scheduler.load_state_dict(torch.load(os.path.join(load_dir, SCHEDULER_NAME)))
-
+        
         # load model state dict
-        state_dict = load_state_dict_from_checkpoint(load_dir)
-        assert state_dict is not None, "No model state_dict found in checkpoint."
-        self.model.models = self.models_unwrapped
-        self.model.load_state_dict(state_dict)
-        self.model.models = self.models_wrapped
-
+        if self.megatron_train_args.use_distributed_model_checkpoint:  
+            # Load distributed model checkpoint  
+            model_checkpoint_dir = get_checkpoint_dir(load_dir, return_base_dir=True)  
+            model_checkpoint_dir = os.path.join(model_checkpoint_dir, "dist_model")  
+            
+            model_shared_state_dict = self.model.sharded_state_dict()  
+            load_strategy = dist_checkpointing.serialization.get_default_load_sharded_strategy(model_checkpoint_dir)  
+            load_strategy = FullyParallelLoadStrategyWrapper(  
+                load_strategy, mpu.get_data_parallel_group(with_context_parallel=True)  
+            )  
+            state_dict = dist_checkpointing.load(model_shared_state_dict, model_checkpoint_dir, load_strategy)  
+            
+            # Remove 'module.' prefix if present  
+            cleaned_state_dict = {}  
+            for key, value in state_dict.items():  
+                if key.startswith('module.'):  
+                    cleaned_key = key[7:]  # Remove 'module.' prefix  
+                    cleaned_state_dict[cleaned_key] = value  
+                else:  
+                    cleaned_state_dict[key] = value  
+            
+            self.model.models = self.models_unwrapped  
+            self.model.load_state_dict(cleaned_state_dict, strict=False)  # Use strict=False to handle missing _extra_state  
+            self.model.models = self.models_wrapped  
+            logger.info("Successfully loaded distributed model checkpoint")
+            
+        else:  
+            state_dict = torch.load(  
+                os.path.join(optimizer_checkpoint, OPTIMIZER_NAME), map_location=self.megatron_train_args.device  
+            )  
+    
+        # load lr_scheduler  
+        self.scheduler.load_state_dict(torch.load(os.path.join(load_dir, SCHEDULER_NAME)))  
+    
+    
         # load rng state
-        rng_file = os.path.join(load_dir, RNG_STATE_DIR, f"rng_state_{dist.get_rank()}.pth")
-        if os.path.exists(rng_file):
-            logger.info(f"Loading rng states from {rng_file}")
-            checkpoint_rng_state = torch.load(rng_file, weights_only=False)
-            random.setstate(checkpoint_rng_state["random_rng_state"])
-            np.random.set_state(checkpoint_rng_state["np_rng_state"])
-            torch.set_rng_state(checkpoint_rng_state["torch_rng_state"])
-            torch.cuda.set_rng_state(checkpoint_rng_state["cuda_rng_state"])
-            # Check for empty states array
-            if not checkpoint_rng_state["rng_tracker_states"]:
-                raise KeyError
-            tensor_parallel.get_cuda_rng_tracker().set_states(checkpoint_rng_state["rng_tracker_states"])
-        else:
-            logger.info(f"not load rng state, not found file: {rng_file}")
+        if self.check_checkpoint_compatibility(load_dir):
+            rng_file = os.path.join(load_dir, RNG_STATE_DIR, f"rng_state_{dist.get_rank()}.pth")  
+            if os.path.exists(rng_file):  
+                logger.info(f"Loading rng states from {rng_file}")  
+                checkpoint_rng_state = torch.load(rng_file, weights_only=False)  
+                random.setstate(checkpoint_rng_state["random_rng_state"])  
+                np.random.set_state(checkpoint_rng_state["np_rng_state"])  
+                torch.set_rng_state(checkpoint_rng_state["torch_rng_state"])  
+                torch.cuda.set_rng_state(checkpoint_rng_state["cuda_rng_state"])  
+                if not checkpoint_rng_state["rng_tracker_states"]:  
+                    raise KeyError  
+                tensor_parallel.get_cuda_rng_tracker().set_states(checkpoint_rng_state["rng_tracker_states"])  
+            else:  
+                logger.info(f"not load rng state, not found file: {rng_file}")
+
+
+    def save_model_checkpoint(self, save_dir, tag="checkpoint", **kwargs):
+        # save model 
+        tracker_file = get_checkpoint_tracker_filename(save_dir)
+
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            self.models_unwrapped[0].config.save_pretrained(save_dir)
+            with open(tracker_file, "w") as f:
+                f.write("1")
+
+        if self.megatron_train_args.use_distributed_model_checkpoint:  
+            # Use distributed checkpointing for model weights  
+            model_checkpoint_dir = get_checkpoint_dir(save_dir, return_base_dir=True)  
+            model_checkpoint_dir = os.path.join(model_checkpoint_dir, "dist_model")  
+            os.makedirs(model_checkpoint_dir, exist_ok=True)  
+            
+            model_shared_state_dict = self.model.sharded_state_dict()  
+            dist_checkpointing.save(  
+                model_shared_state_dict,  
+                checkpoint_dir=model_checkpoint_dir,  
+                sharded_strategy=self.save_strategy,  
+                async_sharded_save=False,  
+            )  
+            logger.info(f"Saved distributed model checkpoint to {model_checkpoint_dir}")  
+        else:  
+            # Current HuggingFace format  
+            if len(self.models_unwrapped) == 1:  
+                self.models_unwrapped[0].save_pretrained(save_dir, save_mca_config=False)  
+            else:  
+                state_dict = {f"model{i}": model.state_dict_for_save_checkpoint() for i, model in  
+                            enumerate(self.models_unwrapped)}  
+                self.models_unwrapped[0].save_pretrained(save_dir, state_dict=state_dict, save_mca_config=False)  
+
+    # this would be used to check if the parallelism config is compatible with the checkpoint
+    def check_checkpoint_compatibility(self, checkpoint_dir):  
+        current_config = self.model.config 
+        
+        # Load config from checkpoint  
+        if exists_mca_config(checkpoint_dir):  
+            checkpoint_config = McaModelConfig.from_pretrained(checkpoint_dir)  
+            
+            return current_config.distribute_config_match(checkpoint_config)  
+        return False

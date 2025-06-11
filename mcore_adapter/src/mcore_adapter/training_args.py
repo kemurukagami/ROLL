@@ -240,6 +240,10 @@ class MegatronArguments(DistributingParallelArguments):
         default=False,
         metadata={"help": "Use distributed optimizer."},
     )
+    use_distributed_model_checkpoint: bool = field(  
+        default=False,  
+        metadata={"help": "Use distributed checkpointing for model weights."},  
+    )
     overlap_grad_reduce: bool = field(
         default=False,
         metadata={"help": "If true, overlap grad reduce-scatter with backward compute in distributed optimizer."},

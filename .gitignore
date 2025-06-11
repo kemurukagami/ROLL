@@ -1,3 +1,8 @@
+output/
+output_multinode/
+output_reshard/
+output_tp1/
+
 *.pyc
 */checkpoint_dir
 */dataset

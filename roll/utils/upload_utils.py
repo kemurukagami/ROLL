@@ -27,3 +27,19 @@ class FileSystemUploader:
         logger.info(f"{local_state_path} save to {ckpt_id_output_dir}, wait...")
         shutil.copytree(local_state_path, ckpt_id_output_dir, dirs_exist_ok=True)
         logger.info(f"{local_state_path} save to {ckpt_id_output_dir}, done...")
+    
+    def upload_file(self, ckpt_id: str, local_file_path: str, relative_path: str = None, **kwargs):  
+        """Upload a single file to the checkpoint directory"""  
+        ckpt_id_output_dir = os.path.join(self.output_dir, ckpt_id)  
+        os.makedirs(ckpt_id_output_dir, exist_ok=True)  
+          
+        if relative_path:  
+            target_dir = os.path.join(ckpt_id_output_dir, os.path.dirname(relative_path))  
+            os.makedirs(target_dir, exist_ok=True)  
+            target_path = os.path.join(ckpt_id_output_dir, relative_path)  
+        else:  
+            target_path = os.path.join(ckpt_id_output_dir, os.path.basename(local_file_path))  
+          
+        logger.info(f"Uploading {local_file_path} to {target_path}")  
+        shutil.copy2(local_file_path, target_path)  
+        logger.info(f"Upload complete: {target_path}")

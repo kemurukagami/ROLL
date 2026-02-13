@@ -201,7 +201,21 @@ def state_offload_manger(strategy, metrics: Dict, metric_infix: str, is_offload_
         metrics[f"time/{metric_infix}/execute"] = execute_timer.last
         metrics[f"time/{metric_infix}/onload"] = onload_timer.last
         metrics[f"time/{metric_infix}/offload"] = offload_timer.last
-    del os.environ["roll_EXEC_FUNC_NAME"]
+    os.environ.pop("roll_EXEC_FUNC_NAME", None)
+
+
+@contextmanager
+def state_offload_manager(strategy, metrics: Dict, metric_infix: str, is_offload_states=True, load_kwargs={}):
+    # Compatibility wrapper: upstream historically used a misspelled name.
+    # TODO(ENG-123): migrate callers to state_offload_manager(...) and remove alias in a future cleanup.
+    with state_offload_manger(
+        strategy,
+        metrics=metrics,
+        metric_infix=metric_infix,
+        is_offload_states=is_offload_states,
+        load_kwargs=load_kwargs,
+    ):
+        yield
 
 
 @contextmanager

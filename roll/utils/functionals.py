@@ -926,7 +926,28 @@ def postprocess_generate(
         batch["prompt_id"] = prompt_id
     if logprobs is not None:
         batch["infer_logprobs"] = logprobs
-    return DataProto(batch=batch)
+    meta_info = dict(prompts.meta_info) if prompts.meta_info is not None else {}
+
+    non_tensor_batch = {}
+    if prompts.non_tensor_batch:
+        # `prompts` is batch_size=N; output is batch_size=N*num_return_sequences.
+        input_batch_size = int(prompts.batch.batch_size[0]) if prompts.batch is not None else 0
+        if input_batch_size <= 0:
+            input_batch_size = output_batch_size // int(num_return_sequences)
+        for key, val in prompts.non_tensor_batch.items():
+            if val is None:
+                continue
+            if not isinstance(val, np.ndarray):
+                raise TypeError(f"non_tensor_batch[{key!r}] must be np.ndarray, got {type(val).__name__}")
+            if len(val) == output_batch_size:
+                non_tensor_batch[key] = val
+            elif len(val) == input_batch_size:
+                non_tensor_batch[key] = np.repeat(val, int(num_return_sequences))
+            else:
+                raise ValueError(
+                    f"non_tensor_batch[{key!r}] length mismatch: len={len(val)}, expected {input_batch_size} or {output_batch_size}"
+                )
+    return DataProto(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
 
 
 def get_dist_info_from_comm_plan(comm_plan, rank_in_cluster, rank_in_worker):
@@ -1286,4 +1307,3 @@ def batch_balance(batch: DataProto, dp_size, minibatch_size, logging_prefix="glo
     metrics = {}
     metrics.update(global_balance_stats)
     return metrics
-

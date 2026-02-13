@@ -2,6 +2,7 @@ import copy
 import enum
 import itertools
 import math
+import os
 import queue
 import random
 import threading
@@ -402,8 +403,10 @@ class AsyncDynamicSamplingScheduler:
             logger.info("use_additional_prompts is False, disable query and response filtering.")
 
         self.cluster_max_running_requests = self.pipeline_config.max_running_requests * self.actor_cluster.dp_size
+        pipeline_id = os.environ.get("PIPELINE_ID") or None
+        counter_name = f"{pipeline_id}_DynamicSchedulerRequestCounter" if pipeline_id else "DynamicSchedulerRequestCounter"
         self.request_counter = GlobalCounter.options(
-            name="DynamicSchedulerRequestCounter",
+            name=counter_name,
             get_if_exists=True,
             namespace=RAY_NAMESPACE,
         ).remote()

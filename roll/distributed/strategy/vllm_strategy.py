@@ -342,7 +342,7 @@ class VllmStrategy(InferenceStrategy):
     async def offload_states(self, include=None, non_blocking=False):
         await self.model.reset_prefix_cache()
         if include is None or OffloadStateType.model_params in include:
-            if self.is_model_in_gpu and self.worker.pipeline_config.is_actor_infer_colocated:
+            if self.is_model_in_gpu:
                 await self.model.offload_states(self.sleep_level)
                 self.is_model_in_gpu = False
         gc.collect()

@@ -1,4 +1,6 @@
 import asyncio
+import math
+import os
 import random
 import time
 from dataclasses import dataclass, field
@@ -205,6 +207,7 @@ class GroupData:
     group_id: int
     episode_id: int
     create_step: int
+    created_at: float
     rollouts: List[DataProto] = field(default_factory=list)
     running_rollouts: int = 0 
 
@@ -256,7 +259,11 @@ class GroupQueue:
     def advance_group(self, create_step):
         assert not self.quit
         self.groups[self.next_episode_id] = GroupData(
-            group_id=self.group_id, episode_id=self.next_episode_id, create_step=create_step)
+            group_id=self.group_id,
+            episode_id=self.next_episode_id,
+            create_step=create_step,
+            created_at=time.time(),
+        )
         self.next_episode_id += 1
 
     def _advance_step(self, create_step):
@@ -317,9 +324,9 @@ class GroupQueue:
                 await self.progress.wait()
         return None
 
-    def put(self, episode_id, start_step, rollout):
-        if episode_id not in self.groups: # ignore rollouts from outdated episode
-            return
+    def put(self, episode_id, start_step, rollout) -> Dict[str, Any]:
+        if episode_id not in self.groups:  # ignore rollouts from outdated episode
+            return {"status": "ignored", "non_null_added": 0}
         group = self.groups[episode_id]
         assert start_step >= group.create_step, f"{start_step=} {group.create_step=}"
         group.rollouts.append(rollout)
@@ -327,6 +334,7 @@ class GroupQueue:
             if all(rollout is None for rollout in group.rollouts):
                 logger.info(f"GroupQueue: group {self.group_id} exit")
                 self.complete.set()
+                return {"status": "exit", "non_null_added": 0}
             elif self.group_filter.filter(group_id=self.group_id, episode_id=episode_id, group=group.rollouts):
                 logger.info(f"filter rollout group {group.group_id} episode {group.episode_id}")
                 self.group_filter_count += 1
@@ -334,9 +342,12 @@ class GroupQueue:
                 if self.env_monitor:
                     self.env_monitor.cleanup_episode(self.group_id, episode_id)
                 self.advance_group(create_step=self.current_step)
+                return {"status": "filtered", "non_null_added": 0 if rollout is None else 1}
             else:
                 self.complete.set()
                 self.progress_bar.update(self.group_size)
+                return {"status": "completed", "non_null_added": 0 if rollout is None else 1}
+        return {"status": "partial", "non_null_added": 0 if rollout is None else 1}
 
     async def get(self) -> GroupData:
         while True:
@@ -363,6 +374,17 @@ class GroupQueueManager:
         self.pending_gets = set()
         self.rollout_complete = {}
 
+        self.pipeline_id = os.environ.get("PIPELINE_ID") or None
+        self._schedrl_enabled = os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and self.mode == "train"
+        self._schedrl_scheduler = None
+        if self._schedrl_enabled:
+            if not self.pipeline_id:
+                raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+            try:
+                self._schedrl_scheduler = ray.get_actor("schedrl:scheduler", namespace="schedrl")
+            except Exception as e:
+                raise RuntimeError("Failed to resolve schedrl:scheduler in namespace 'schedrl'") from e
+
         group_filter_cls = safe_import_class(env_manager_config.group_filter_cls)
         assert group_filter_cls
         self.group_filter = group_filter_cls(config, env_manager_config, mode)
@@ -370,9 +392,11 @@ class GroupQueueManager:
         if self.mode == "train":
             self.async_generation_ratio = config.async_generation_ratio
             self.max_traj_per_env = env_manager_config.max_traj_per_env if config.rollout_batch_size > 0 else None
+            self.rollout_batch_size = int(config.rollout_batch_size)
         else:
             self.async_generation_ratio = 0
             self.max_traj_per_env = env_manager_config.max_traj_per_env if config.val_batch_size > 0 else None
+            self.rollout_batch_size = int(config.val_batch_size)
 
         # Initialize env activity monitor first (before creating GroupQueues)
         self.group_queue: Dict[int, GroupQueue] = {}
@@ -405,6 +429,94 @@ class GroupQueueManager:
         self.total = 0
         self.waiting = 0
 
+        # Progress tracking (SchedRL only; fork parity).
+        self._progress_last_bucket: Optional[int] = None
+        self._progress_new_batch = False
+        self._progress_total_required_estimated = self._estimate_total_required()
+        self._progress_collected_estimated = 0
+        self._progress_episode_non_null: Dict[Tuple[int, int], int] = {}
+        if self._schedrl_enabled:
+            self._mark_new_batch()
+            self._maybe_emit_progress(current_train_step=None)
+
+    def _estimate_total_required(self) -> int:
+        if self.max_traj_per_env is None:
+            return 0
+        episodes_per_group = (self.async_generation_ratio + 1) * self.max_traj_per_env
+        return len(self.group_queue) * episodes_per_group * self.group_size
+
+    def _mark_new_batch(self) -> None:
+        self._progress_new_batch = True
+
+    def _compute_progress(self) -> Tuple[int, int, int, Optional[float]]:
+        if self.max_traj_per_env is None:
+            # Unbounded mode: do not report progress in Phase 3.
+            return 0, 0, 0, None
+
+        total_required = self._progress_total_required_estimated
+        collected = min(self._progress_collected_estimated, total_required)
+
+        oldest_ts: Optional[float] = None
+        for group_queue in self.group_queue.values():
+            for group in group_queue.groups.values():
+                if len(group.rollouts) < self.group_size:
+                    if oldest_ts is None or group.created_at < oldest_ts:
+                        oldest_ts = group.created_at
+
+        remaining = max(total_required - collected, 0)
+        return total_required, collected, remaining, oldest_ts
+
+    def _maybe_emit_progress(self, *, current_train_step: Optional[int]) -> None:
+        if not self._schedrl_enabled:
+            return
+        if self.max_traj_per_env is None:
+            return
+        if self._schedrl_scheduler is None:
+            raise RuntimeError("SCHEDRL progress enabled but schedrl:scheduler handle is missing")
+        if not self.pipeline_id:
+            raise RuntimeError("SCHEDRL progress enabled but PIPELINE_ID is missing")
+
+        total_required, collected, remaining, oldest_ts = self._compute_progress()
+        if total_required <= 0:
+            return
+
+        percent_completed = float(collected) / float(max(total_required, 1))
+        # 2% buckets (0..50). Bucket 0 means 0% completed, bucket 50 means 100% completed.
+        bucket = math.floor(percent_completed * 50)
+
+        should_emit = (
+            bucket != self._progress_last_bucket
+            or remaining == 0
+            or collected >= total_required
+            or self._progress_new_batch
+        )
+        if not should_emit:
+            return
+
+        emitted_for_new_batch = self._progress_new_batch
+        self._progress_last_bucket = bucket
+        self._progress_new_batch = False
+
+        from schedrl.protocol.types import ProgressReport
+
+        report = ProgressReport(
+            pipeline_id=str(self.pipeline_id),
+            queued_trajectories=0,
+            inflight_trajectories=0,
+            step_target_trajectories=int(total_required),
+            percent_completed=float(collected) / float(max(total_required, 1)),
+            oldest_unfinished_creation_ts=oldest_ts,
+            fifo_timestamp=time.time(),
+            metrics={
+                "mode": self.mode,
+                "remaining": int(remaining),
+                "bucket": int(bucket),
+                "new_batch": bool(emitted_for_new_batch),
+                "current_train_step": current_train_step,
+            },
+        )
+        self._schedrl_scheduler.report_progress.remote(report)
+
     def collect_metrics(self):
         group_filter_count = 0
         for group_queue in self.group_queue.values():
@@ -419,10 +531,20 @@ class GroupQueueManager:
         self.pending_gets = set()
         for group_queue in self.group_queue.values():
             group_queue.clear()
+        if self.max_traj_per_env is not None:
+            self._progress_collected_estimated = 0
+            self._progress_episode_non_null.clear()
+        self._mark_new_batch()
+        self._maybe_emit_progress(current_train_step=None)
 
     def advance_step(self, step):
         for group_queue in self.group_queue.values():
             group_queue.advance_step(step)
+        if self.max_traj_per_env is not None:
+            self._progress_collected_estimated = 0
+            self._progress_episode_non_null.clear()
+        self._mark_new_batch()
+        self._maybe_emit_progress(current_train_step=int(step) if step is not None else None)
 
     async def get_episode_id(self, group_id, env_id=None):
         """
@@ -470,9 +592,24 @@ class GroupQueueManager:
             self.env_monitor.record_activity(group_id, env_id, episode_id, rollout)
 
         self.waiting += 1
-        self.group_queue[group_id].put(episode_id, start_step, rollout)
+        put_result = self.group_queue[group_id].put(episode_id, start_step, rollout)
+        if self.max_traj_per_env is not None:
+            status = str(put_result.get("status", ""))
+            non_null_added = int(put_result.get("non_null_added", 0))
+            episode_key = (group_id, episode_id)
+
+            if non_null_added:
+                self._progress_episode_non_null[episode_key] = self._progress_episode_non_null.get(episode_key, 0) + 1
+                self._progress_collected_estimated += non_null_added
+
+            if status in {"filtered", "exit"}:
+                rolled_back = self._progress_episode_non_null.pop(episode_key, 0)
+                self._progress_collected_estimated = max(self._progress_collected_estimated - rolled_back, 0)
+            elif status == "completed":
+                self._progress_episode_non_null.pop(episode_key, None)
         self.waiting -= 1
         self.total += 1
+        self._maybe_emit_progress(current_train_step=int(start_step) if start_step is not None else None)
 
     async def get_batch(self, batch_size, current_step) -> List[DataProto]:
         """
@@ -509,7 +646,16 @@ class GroupQueueManager:
                     done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                     while done and (batch_size < 0 or len(ret) < batch_size):
                         d = done.pop()
-                        group = await d
+                        try:
+                            group = await d
+                        except asyncio.CancelledError:
+                            # Best-effort cleanup: cancellation is expected during clear()/shutdown().
+                            continue
+                        except Exception as e:
+                            # Fail-fast: clean up any outstanding tasks and surface the error.
+                            for t in pending:
+                                t.cancel()
+                            raise RuntimeError(f"GroupQueue.get() task failed (group_id={d.get_name()!r})") from e
                         group_rollout = group.rollouts
                         self.total -= len(group_rollout)
 
@@ -561,11 +707,16 @@ class RolloutScheduler(RolloutMockMixin):
         self.resource_manager = resource_manager
         self.infer_cluster = infer_cluster
         self.mode = mode
+        self.pipeline_id = os.environ.get("PIPELINE_ID") or None
 
         env_num = self.env_manager_config.world_size * self.env_manager_config.max_env_num_per_worker
 
         self.env_output_queue = GroupQueueManager.options(
-            name=f"GroupQueueManager-{mode}",
+            name=(
+                f"{self.pipeline_id}_group_queue_manager_{mode}"
+                if self.pipeline_id
+                else f"GroupQueueManager-{mode}"
+            ),
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False),
@@ -577,7 +728,11 @@ class RolloutScheduler(RolloutMockMixin):
         )
 
         self.generate_scheduler = RequestScheduler.options(
-                name=f"RequestScheduler-{self.env_manager_config.name}-{mode}",
+                name=(
+                    f"{self.pipeline_id}_request_scheduler_{mode}"
+                    if self.pipeline_id
+                    else f"RequestScheduler-{self.env_manager_config.name}-{mode}"
+                ),
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -639,7 +794,8 @@ class RolloutScheduler(RolloutMockMixin):
 
         await asyncio.gather(*self.es_manager.update_step(global_step, blocking=False))
         await self.env_output_queue.advance_step.remote(global_step)
-        await self.generate_scheduler.resume.remote()
+        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+            await self.generate_scheduler.resume.remote()
 
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
         await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)

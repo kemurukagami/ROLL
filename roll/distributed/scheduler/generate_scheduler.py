@@ -5,6 +5,7 @@ import random
 import math
 import uuid
 import time
+import sys
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
 from itertools import cycle
@@ -102,8 +103,10 @@ class LoadBalancer:
             self._dp_rank = dp_rank
 
         def __del__(self):
-            # User must call clear or consume all lease to give back credit explicitly.
-            assert self.lease == 0
+            # Avoid raising inside __del__ (exceptions here are noisy and unreliable).
+            # If a Lease is GC'ed with remaining credit, it indicates a bug in the caller.
+            if getattr(self, "lease", 0) != 0:
+                sys.stderr.write(f"[roll][ERROR] LoadBalancer.Lease GC'ed with remaining lease={self.lease}\n")
 
         def clear(self):
             assert self.lease >= 0
@@ -152,6 +155,13 @@ class LoadBalancer:
         Dispatching n sample of a prompt to the same worker using best fit strategy (using
         linear search for simplicity), blocking wait if no worker is available.
         """
+        if not isinstance(credit, int) or credit <= 0:
+            raise ValueError(f"credit must be positive int, got {credit!r}")
+        if credit > self.max_running_requests:
+            raise ValueError(
+                f"credit={credit} exceeds max_running_requests={self.max_running_requests}; "
+                "increase max_running_requests or reduce per-request credit"
+            )
         while True:
             while self._suspend:
                 self.suspend_event.clear()
@@ -161,10 +171,11 @@ class LoadBalancer:
             for dp_rank, running_requests in self.workers.items():
                 if running_requests >= self.max_running_requests:
                     continue
+                if running_requests + credit > self.max_running_requests:
+                    continue
                 if target == -1 or running_requests < self.workers[target]:
                     target = dp_rank
             if target != -1:
-                # FIXME may send more than max_running_requests (i.e. workers[target] + credit > max_running_requests)
                 self.workers[target] += credit
                 self.running_request += credit
                 return self.Lease(self, lease=credit, dp_rank=target)
@@ -176,12 +187,19 @@ class LoadBalancer:
         For multi-turn rollout.
         """
         assert dp_rank in self.workers
+        if not isinstance(credit, int) or credit <= 0:
+            raise ValueError(f"credit must be positive int, got {credit!r}")
+        if credit > self.max_running_requests:
+            raise ValueError(
+                f"credit={credit} exceeds max_running_requests={self.max_running_requests}; "
+                "increase max_running_requests or reduce per-request credit"
+            )
         while True:
             while self._suspend:
                 self.suspend_event.clear()
                 await self.suspend_event.wait()
 
-            if self.workers[dp_rank] < self.max_running_requests:
+            if self.workers[dp_rank] + credit <= self.max_running_requests:
                 self.workers[dp_rank] += credit
                 self.running_request += credit
                 return
@@ -601,6 +619,17 @@ class Scheduler:
         request_id = f"{self.request_id}_{self.request_counter}"
         self.request_counter += 1
         return request_id
+
+
+@ray.remote
+class GlobalCounter:
+    def __init__(self):
+        self._value = 0
+
+    def get_value(self) -> int:
+        value = int(self._value)
+        self._value = value + 1
+        return value
 
 
 @ray.remote
@@ -1071,8 +1100,8 @@ class DynamicSamplingScheduler(RolloutMockMixin, Scheduler):
             while True:
                 try:
                     prompt_id = await self.replay_buffer.poll()
-                except:
-                    logger.info(f"stop sending_request coroutine")
+                except asyncio.CancelledError:
+                    logger.info("stop sending_request coroutine (shutdown)")
                     break
                 task = tg.create_task(RolloutContext.process_new_prompt(scheduler=self, prompt_id=prompt_id))
                 self.running_tasks[prompt_id] = task
@@ -1083,8 +1112,8 @@ class DynamicSamplingScheduler(RolloutMockMixin, Scheduler):
 
     def get_next_dataset_item(self):
         if self.dataset_iter is None:
-            random.seed(self.pipeline_config.seed + self.dataset_epoch)
-            random.shuffle(self.indices)
+            rng = random.Random(int(self.pipeline_config.seed) + int(self.dataset_epoch))
+            rng.shuffle(self.indices)
             self.dataset_iter = iter(self.indices)
             logger.info(f"{'-'.join(self.reward_clusters.keys())} dataset epoch: {self.dataset_epoch}")
 
@@ -1092,8 +1121,8 @@ class DynamicSamplingScheduler(RolloutMockMixin, Scheduler):
             dataset_item = self.dataset[next(self.dataset_iter)]
         except StopIteration:
             self.dataset_epoch += 1
-            random.seed(self.pipeline_config.seed + self.dataset_epoch)
-            random.shuffle(self.indices)
+            rng = random.Random(int(self.pipeline_config.seed) + int(self.dataset_epoch))
+            rng.shuffle(self.indices)
             self.dataset_iter = iter(self.indices)
             dataset_item = self.dataset[next(self.dataset_iter)]
             logger.info(f"{'-'.join(self.reward_clusters.keys())} dataset epoch: {self.dataset_epoch}")
@@ -1212,14 +1241,14 @@ class RolloutContext:
         # the real sampling_start_step can be different from self.sampling_start_step.
         try:
             sampling_start_step = await self._scheduler.replay_buffer.begin(prompt_id=self.prompt_id)
-        except:
+        except BaseException:
             self._lease.clear()
             raise
         self.sampling_start_step = sampling_start_step
 
         try:
             yield
-        except:
+        except BaseException:
             self._lease.clear()
             raise
         finally:
@@ -1228,6 +1257,11 @@ class RolloutContext:
                 len(self._scheduler.running_requests[self._lease._dp_rank][self.prompt_id]) == 0
             ), f"User should gather all running requests: {self._scheduler.running_requests[self._lease._dp_rank][self.prompt_id]=}"
             self._scheduler.running_requests[self._lease._dp_rank].pop(self.prompt_id, None)
+            if self._lease is not None:
+                # Always release remaining lease credit back to LoadBalancer.
+                # In the happy path, this is a no-op if the lease has been fully consumed.
+                self._lease.clear()
+                self._lease = None
             self._in_do_generate_and_reward = False
 
     async def generate(
@@ -1303,19 +1337,32 @@ class RequestScheduler:
         # Active DP ranks for request routing
         self.active_dp_ranks: Set[int] = set(range(self.infer_cluster.world_size))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
+        self.swapping_lock = asyncio.Lock()  # Serialize shrink/expand lifecycle operations
 
     async def generate_one_request(self, data: DataProto):
-        await self._check_suspend()
+        # NOTE: do not block while holding routing_lock. Re-check suspend after acquiring lock
+        # to avoid TOCTOU with shrink-to-zero and concurrent shrink/expand.
+        while True:
+            await self._check_suspend()
+            src_rank = data.meta_info["src_rank"]
+            # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
+            async with self.routing_lock:
+                if self.need_suspend:
+                    continue
+                if not self.active_dp_ranks:
+                    raise RuntimeError("No active DP ranks and not suspended")
 
-        src_rank = data.meta_info["src_rank"]
-        # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
-        async with self.routing_lock:
-            # Least-loaded dispatch
-            if src_rank not in self.src_rank2_dp_rank:
-                dp_rank = self._get_least_active_dp_rank()
-                self.src_rank2_dp_rank[src_rank] = dp_rank
+                dp_rank = self.src_rank2_dp_rank.get(src_rank)
+                if dp_rank is not None and dp_rank not in self.active_dp_ranks:
+                    self.src_rank2_dp_rank.pop(src_rank, None)
+                    dp_rank = None
 
-        dp_rank = self.src_rank2_dp_rank[src_rank]
+                # Least-loaded dispatch
+                if dp_rank is None:
+                    dp_rank = self._get_least_active_dp_rank()
+                    self.src_rank2_dp_rank[src_rank] = dp_rank
+                break
+
         request_id = f"{self.request_id}_{self.request_counter}"
         self.request_counter += 1
         data.meta_info["request_id"] = request_id
@@ -1330,6 +1377,7 @@ class RequestScheduler:
             self.running_requests[dp_rank].remove(request_id)
             self.empty_notifier.set()
             # Cleanup tracking (on both success and abort paths)
+            self.request_id_2_dp_rank.pop(request_id, None)
             self.request_id_2_src_rank.pop(request_id, None)
 
         assert response_data is not None
@@ -1504,11 +1552,13 @@ class RequestScheduler:
             RuntimeError: If shrink operation fails
         """
         keep_ranks = list(self.active_dp_ranks - set(shrink_dp_ranks))
-        if not keep_ranks:
-            raise ValueError("Cannot shrink to zero active ranks")
-
         old_active_ranks = self.active_dp_ranks.copy()
+        old_need_suspend = self.need_suspend
         self.active_dp_ranks = set(keep_ranks)
+        if not self.active_dp_ranks:
+            # Shrink-to-zero: block future generate_one_request() calls until expansion.
+            self.suspend_notifier.clear()
+            self.need_suspend = True
 
         try:
             total_aborted = 0
@@ -1553,6 +1603,9 @@ class RequestScheduler:
 
         except Exception as e:
             self.active_dp_ranks = old_active_ranks
+            self.need_suspend = old_need_suspend
+            if not self.need_suspend:
+                self.suspend_notifier.set()
             raise RuntimeError(f"Shrink failed: {e}") from e
 
     async def rebalance_on_expand(self, expand_dp_ranks: List[int]) -> Dict[str, int]:
@@ -1628,9 +1681,12 @@ class RequestScheduler:
         # Calculate counts before updating active_dp_ranks
         old_dp_count = len(self.active_dp_ranks)
         old_active_dp_ranks = self.active_dp_ranks.copy()
+        was_empty = old_dp_count == 0
 
         self.active_dp_ranks.update(expand_dp_ranks)
         new_dp_count = len(self.active_dp_ranks)
+        if was_empty and new_dp_count > 0:
+            self.resume()
 
         total_src_ranks = len(self.src_rank2_dp_rank)
         if total_src_ranks == 0:
@@ -1652,20 +1708,26 @@ class RequestScheduler:
 
         # Round-robin selection: iterate over old workers and select one src_rank at a time
         # todo optimization:(yangpeng) take uneven dp load into consideration and do dynamic load balancing, not just RR
+        available_to_abort = sum(len(v) for v in dp_rank_to_src_ranks.values())
+        if available_to_abort <= 0:
+            logger.info("Expand: no rebalancing possible (no src_ranks on old workers)")
+            return {"aborted": 0, "remapped": 0}
+        remaining_to_abort = min(src_ranks_to_abort, available_to_abort)
         selected_src_ranks = []
-        remaining_to_abort = src_ranks_to_abort
-        for dp_rank in cycle(dp_rank_to_src_ranks.keys()):
-            if not dp_rank in old_active_dp_ranks:
-                continue
-
-            if remaining_to_abort <= 0:
-                break
-
+        dp_ranks_rr = list(dp_rank_to_src_ranks.keys())
+        empty_streak = 0
+        idx = 0
+        while remaining_to_abort > 0:
+            dp_rank = dp_ranks_rr[idx % len(dp_ranks_rr)]
+            idx += 1
             src_ranks_on_worker = dp_rank_to_src_ranks.get(dp_rank, [])
             if not src_ranks_on_worker:
+                empty_streak += 1
+                if empty_streak >= len(dp_ranks_rr):
+                    break
                 continue
+            empty_streak = 0
             selected_src_ranks.append(src_ranks_on_worker.pop(0))
-
             remaining_to_abort -= 1
 
         # Remove from mapping and group by dp_rank for abort
@@ -1771,10 +1833,17 @@ class RequestScheduler:
                 raise ValueError(f"[{mode}] DP rank {dp_rank} out of range [0, {self.infer_cluster.world_size})")
 
         # AST: State consistency
+        if mode not in ("shrink", "expand"):
+            raise ValueError(f"Invalid mode: {mode}")
 
-        for dp_rank in ranks:
-            if dp_rank not in self.active_dp_ranks:
-                raise ValueError(f"DP rank {dp_rank} not active {mode=}")
+        if mode == "shrink":
+            for dp_rank in ranks:
+                if dp_rank not in self.active_dp_ranks:
+                    raise ValueError(f"[shrink] DP rank {dp_rank} not active")
+        else:
+            for dp_rank in ranks:
+                if dp_rank in self.active_dp_ranks:
+                    raise ValueError(f"[expand] DP rank {dp_rank} already active")
 
     async def shrink_workers(self, target_gpus: List[int]) -> Dict[str, Any]:
         """Complete atomic shrink operation: validate → rebalance → offload → update routing.
@@ -1815,28 +1884,28 @@ class RequestScheduler:
             - Offloads model states from shrinking workers to CPU
         """
         start_time = time.time()
+        async with self.swapping_lock:
+            # VAL: VAL_NON_EMPTY, VAL_NO_DUPLICATES
+            self._validate_target_gpus(target_gpus, mode="shrink")
+            # Calculate DP ranks to offload
+            target_gpus = set(target_gpus)
+            offload_ranks = [dp for dp in range(self.infer_cluster.world_size)
+                             if set(self._get_gpus_for_dp_rank(dp)).intersection(target_gpus)]
 
-        # VAL: VAL_NON_EMPTY, VAL_NO_DUPLICATES
-        self._validate_target_gpus(target_gpus, mode="shrink")
-        # Calculate DP ranks to offload
-        target_gpus = set(target_gpus)
-        offload_ranks = [dp for dp in range(self.infer_cluster.world_size)
-                         if set(self._get_gpus_for_dp_rank(dp)).intersection(target_gpus)]
+            # VAL: VAL_NON_EMPTY, state consistency check
+            self._validate_calculated_ranks(offload_ranks, mode="shrink")
 
-        # VAL: VAL_NON_EMPTY, state consistency check
-        self._validate_calculated_ranks(offload_ranks, mode="shrink")
+            # Atomic operation under routing_lock
+            async with self.routing_lock:
+                # Rebalance (abort + update active_dp_ranks)
+                result = await self.rebalance_on_shrink(offload_ranks)
 
-        # Atomic operation under routing_lock
-        async with self.routing_lock:
-            # Rebalance (abort + update active_dp_ranks)
-            result = await self.rebalance_on_shrink(offload_ranks)
-        # release the lock before blocking offload so that active dp rank can work immediately
-        # Offload states from target workers
-        offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
-        await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
+            # Offload states from target workers
+            offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
+            await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
 
-        return {**result, "shrink_duration_ms": (time.time() - start_time) * 1000,
-                "offload_ranks": offload_ranks}
+            return {**result, "shrink_duration_ms": (time.time() - start_time) * 1000,
+                    "offload_ranks": offload_ranks}
 
     async def expand_workers(self, target_gpus: List[int], skip_load: bool = False) -> Dict[str, Any]:
         """Complete atomic expand operation: validate → load → rebalance → update routing.
@@ -1882,28 +1951,27 @@ class RequestScheduler:
             - Clears src_rank mappings for rebalanced environments (will route to new workers)
         """
         start_time = time.time()
+        async with self.swapping_lock:
+            # VAL: VAL_NON_EMPTY, VAL_NO_DUPLICATES
+            self._validate_target_gpus(target_gpus, mode="expand")
 
-        # VAL: VAL_NON_EMPTY, VAL_NO_DUPLICATES
-        self._validate_target_gpus(target_gpus, mode="expand")
+            # Calculate DP ranks to restore
+            target_gpus = set(target_gpus)
+            load_ranks = [dp for dp in range(self.infer_cluster.world_size)
+                          if set(self._get_gpus_for_dp_rank(dp)).issubset(target_gpus)]
 
-        # Calculate DP ranks to restore
-        target_gpus = set(target_gpus)
-        load_ranks = [dp for dp in range(self.infer_cluster.world_size)
-                      if set(self._get_gpus_for_dp_rank(dp)).issubset(target_gpus)]
+            # VAL: VAL_NON_EMPTY, state consistency check
+            # Skip validation when skip_load=True because ranks may already be "active" in cluster
+            # (model states loaded by model_update) but not tracked in active_dp_ranks yet
+            if not skip_load:
+                self._validate_calculated_ranks(load_ranks, mode="expand")
+                load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
 
-        # VAL: VAL_NON_EMPTY, state consistency check
-        # Skip validation when skip_load=True because ranks may already be "active" in cluster
-        # (model states loaded by model_update) but not tracked in active_dp_ranks yet
-        if not skip_load:
-            self._validate_calculated_ranks(load_ranks, mode="expand")
-            load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
-            await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
+            # Atomic operation under routing_lock
+            async with self.routing_lock:
+                # Rebalance (update active_dp_ranks + conditional abort)
+                result = await self.rebalance_on_expand(load_ranks)
 
-        # Atomic operation under routing_lock
-        async with self.routing_lock:
-
-            # Rebalance (update active_dp_ranks + conditional abort)
-            result = await self.rebalance_on_expand(load_ranks)
-
-        return {**result, "expand_duration_ms": (time.time() - start_time) * 1000,
-                "load_ranks": load_ranks}
+            return {**result, "expand_duration_ms": (time.time() - start_time) * 1000,
+                    "load_ranks": load_ranks}

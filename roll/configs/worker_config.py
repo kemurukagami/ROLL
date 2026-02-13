@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import ast
 from typing import Dict, List, Literal, Optional, Union
 
 from roll.configs import DataArguments, GeneratingArguments, ModelArguments
@@ -240,7 +241,7 @@ class WorkerConfig:
                 )
 
         if self.device_mapping is not None:
-            self.device_mapping = eval(self.device_mapping)
+            self.device_mapping = ast.literal_eval(self.device_mapping)
             assert (
                 len(self.device_mapping) % self.num_gpus_per_worker == 0
             ), f"len(device_mapping)={len(self.device_mapping)} must be divisible by num_gpus_per_worker={self.num_gpus_per_worker}."
@@ -287,4 +288,3 @@ def is_actor_infer_overlapping_with_any_cluster(actor_infer: WorkerConfig, actor
                 return True
 
     return False
-

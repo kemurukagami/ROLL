@@ -12,7 +12,7 @@ from roll.distributed.scheduler.decorator import Dispatch, register
 from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.scheduler.storage import SharedStorage
 from roll.utils.checkpoint_manager import download_model
-from roll.utils.constants import RAY_NAMESPACE, STORAGE_NAME
+from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE, RAY_NAMESPACE, STORAGE_NAME
 from roll.utils.context_managers import state_offload_manger
 from roll.utils.logging import get_logger
 from roll.utils.network_utils import collect_free_port, get_node_ip
@@ -53,8 +53,9 @@ class Worker:
         self.rank = int(os.environ.get("RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        self.pipeline_id = os.environ.get("PIPELINE_ID") or None
         self.shared_storage = SharedStorage.options(
-            name=STORAGE_NAME, get_if_exists=True, namespace=RAY_NAMESPACE
+            name=STORAGE_NAME, get_if_exists=True, namespace=GLOBAL_STORAGE_NAMESPACE
         ).remote()
 
         if self.rank == 0:
@@ -65,9 +66,8 @@ class Worker:
 
         self.master_addr = os.environ["MASTER_ADDR"]
         self.master_port = int(os.environ["MASTER_PORT"])
-        self.shared_storage.put.remote(
-            self.cluster_name, {"MASTER_ADDR": self.master_addr, "MASTER_PORT": self.master_port}
-        )
+        rendezvous_key = f"{self.pipeline_id}:{self.cluster_name}" if self.pipeline_id else self.cluster_name
+        self.shared_storage.put.remote(rendezvous_key, {"MASTER_ADDR": self.master_addr, "MASTER_PORT": self.master_port})
         # NOTE: 自定义Worker时根据需要配置rank_info
         self.rank_info = RankInfo(
             world_size=self.world_size,
@@ -96,16 +96,17 @@ class Worker:
     @staticmethod
     def get_free_port():
         shared_storage = SharedStorage.options(
-            name=STORAGE_NAME, get_if_exists=True, namespace=RAY_NAMESPACE
+            name=STORAGE_NAME, get_if_exists=True, namespace=GLOBAL_STORAGE_NAMESPACE
         ).remote()
+        pipeline_id = os.environ.get("PIPELINE_ID") or None
         master_addr = Worker.get_node_ip()
         max_retry_count = int(os.environ.get("MAX_PORT_RETRY_COUNT", 1000))
         retry_count = 0
         master_port = collect_free_port()
         while retry_count < max_retry_count:
             master_addr_port_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
-            if ray.get(shared_storage.get.remote(master_addr_port_key)) is None:
-                ray.get(shared_storage.put.remote(master_addr_port_key, True))
+            claimed = ray.get(shared_storage.try_put.remote(master_addr_port_key, pipeline_id if pipeline_id else True))
+            if claimed:
                 break
             master_port = collect_free_port()
             retry_count += 1

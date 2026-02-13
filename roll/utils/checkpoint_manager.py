@@ -12,7 +12,7 @@ from filelock import FileLock
 from huggingface_hub import snapshot_download
 
 from roll.distributed.scheduler.storage import SharedStorage
-from roll.utils.constants import STORAGE_NAME, RAY_NAMESPACE
+from roll.utils.constants import GLOBAL_STORAGE_NAMESPACE, STORAGE_NAME
 from roll.utils.logging import get_logger
 from roll.utils.network_utils import get_node_ip
 from roll.utils.upload_utils import uploader_registry
@@ -43,7 +43,7 @@ def model_path_cache(func):
         global shared_storage
         if shared_storage is None:
             shared_storage = SharedStorage.options(
-                name=STORAGE_NAME, get_if_exists=True, namespace=RAY_NAMESPACE
+                name=STORAGE_NAME, get_if_exists=True, namespace=GLOBAL_STORAGE_NAMESPACE
             ).remote()
         cached_path = ray.get(shared_storage.get.remote(key=f"{node_ip}:{model_name_or_path}"))
         if cached_path is None or not os.path.exists(cached_path):

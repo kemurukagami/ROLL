@@ -23,6 +23,9 @@ from roll.platforms import current_platform
 
 logger = get_logger()
 
+def _is_library_mode() -> bool:
+    return os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1"
+
 
 def start_ray_cluster():
     rank = get_driver_rank()
@@ -54,6 +57,21 @@ def start_ray_cluster():
 
 
 def init():
+    if _is_library_mode():
+        runtime_env = {
+            "env_vars": current_platform.get_custom_env_vars(),
+        }
+        if not ray.is_initialized():
+            ray.init(
+                address="auto",
+                namespace=RAY_NAMESPACE,
+                ignore_reinit_error=True,
+                log_to_driver=True,
+                runtime_env=runtime_env,
+            )
+        logger.info("ROLL init: library mode enabled; leaving Ray cluster lifecycle to the caller")
+        return
+
     rank = get_driver_rank()
     world_size = get_driver_world_size()
     master_addr = get_driver_master_addr()

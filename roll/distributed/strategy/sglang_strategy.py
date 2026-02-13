@@ -109,7 +109,7 @@ class SgLangStrategy(InferenceStrategy):
                 "trust_remote_code": True,
                 "tp_size": tp_size,
                 "log_level": sglang_config.get("log_level", "info"),
-                "port": 30000 + dp_rank * 500,
+                "port": self.worker.get_free_port(),
                 # 'disable_cuda_graph': True,
                 "disable_custom_all_reduce": sglang_config.get("disable_custom_all_reduce", True),
                 'nnodes': nnodes, 
@@ -118,7 +118,7 @@ class SgLangStrategy(InferenceStrategy):
         )
 
         if nnodes > 1:
-            sglang_config['dist_init_addr'] = f'{ray.util.get_node_ip_address()}:{collect_free_port()}'
+            sglang_config['dist_init_addr'] = f'{ray.util.get_node_ip_address()}:{self.worker.get_free_port()}'
 
         logger.info(f"[sglang][sglang_config]: {sglang_config}")
         
@@ -378,7 +378,7 @@ class SgLangStrategy(InferenceStrategy):
 
     async def offload_states(self, include=None, non_blocking=False):
         if include is None or OffloadStateType.model_params in include:
-            if self.worker.pipeline_config.is_actor_infer_colocated and self.is_model_in_gpu:
+            if self.is_model_in_gpu:
                 await self.model.tokenizer_manager.release_memory_occupation(ReleaseMemoryOccupationReqInput(), None)
                 logger.info("self.model.release_memory_occupation exec ....")
                 # always release all

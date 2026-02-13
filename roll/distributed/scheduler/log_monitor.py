@@ -218,6 +218,14 @@ class LogMonitorListener:
             time.sleep(0.1)
 
     def stop(self):
+        if os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1":
+            StdPublisher.close_file_handlers()
+            time.sleep(0.2)
+            try:
+                self.log_monitor_thread.join(2)
+            except Exception:
+                pass
+            return
         StdPublisher.close_file_handlers()
         time.sleep(5)
         self.log_monitor_thread.join(2)
@@ -235,6 +243,8 @@ class LogMonitorListener:
         subprocess.run(cmd, shell=True, capture_output=True)
 
     def start(self):
+        if os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1":
+            return
         atexit.register(self.stop)
 
         if self.rank == 0:

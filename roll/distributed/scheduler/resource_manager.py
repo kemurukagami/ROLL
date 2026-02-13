@@ -2,6 +2,7 @@ import dataclasses
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 
+import os
 import ray
 from ray.util.placement_group import PlacementGroup
 
@@ -36,6 +37,8 @@ class ResourceManager:
         self.num_nodes = num_nodes
         self.gpu_per_node = num_gpus_per_node
         self.num_gpus = self.gpu_per_node * self.num_nodes
+        self._pipeline_id = os.environ.get("PIPELINE_ID") or None
+        self._pg_name_prefix = f"schedrl_pg:{self._pipeline_id}:" if self._pipeline_id else None
 
         if self.gpu_per_node > 0:
             assert self.num_gpus <= available_gpu, f"num_gpus {self.num_gpus} > available_gpu {available_gpu}"
@@ -45,7 +48,10 @@ class ResourceManager:
                 node_cpu = int(node["Resources"]["CPU"])
                 bundles.append({current_platform.ray_device_key: self.gpu_per_node, "CPU": max(node_cpu / 2, 1)})
 
-            self.placement_groups = [ray.util.placement_group([bundle]) for bundle in bundles]
+            self.placement_groups = [
+                ray.util.placement_group([bundle], name=f"{self._pg_name_prefix}{i}" if self._pg_name_prefix else None)
+                for i, bundle in enumerate(bundles)
+            ]
             ray.get([pg.ready() for pg in self.placement_groups])
             gpu_ranks = ray.get([
                 get_visible_gpus.options(
@@ -75,7 +81,10 @@ class ResourceManager:
             node = nodes_maybe_used[0]
             node_cpu = int(node["Resources"]["CPU"])
             bundles = [{"CPU": node_cpu}] * self.num_nodes
-            self.placement_groups = [ray.util.placement_group([bundle]) for bundle in bundles]
+            self.placement_groups = [
+                ray.util.placement_group([bundle], name=f"{self._pg_name_prefix}cpu:{i}" if self._pg_name_prefix else None)
+                for i, bundle in enumerate(bundles)
+            ]
             ray.get([pg.ready() for pg in self.placement_groups])
             self.node_ranks = [0]
             self.node2pg: Dict[int, PlacementGroup] = {}

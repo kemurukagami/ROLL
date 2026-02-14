@@ -404,6 +404,8 @@ class AsyncDynamicSamplingScheduler:
 
         self.cluster_max_running_requests = self.pipeline_config.max_running_requests * self.actor_cluster.dp_size
         pipeline_id = os.environ.get("PIPELINE_ID") or None
+        if pipeline_id is None and os.environ.get("ROLL_RAY_NAMESPACE"):
+            raise RuntimeError("PIPELINE_ID must be set when ROLL_RAY_NAMESPACE is set (multi-pipeline mode)")
         counter_name = f"{pipeline_id}_DynamicSchedulerRequestCounter" if pipeline_id else "DynamicSchedulerRequestCounter"
         self.request_counter = GlobalCounter.options(
             name=counter_name,

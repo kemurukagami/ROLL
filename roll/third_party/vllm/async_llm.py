@@ -21,6 +21,9 @@ class CustomAsyncLLM(AsyncLLM):
     async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
         await self.engine_core.collective_rpc_async(method="update_parameter_in_bucket", args=(serialized_named_tensors, is_lora))
 
+    async def destroy_collective_group(self, group_name: str):
+        await self.engine_core.collective_rpc_async(method="destroy_collective_group", args=(group_name,))
+
     async def add_lora(self, *args, **kwargs):
         await self.engine_core.collective_rpc_async(method="custom_add_lora", args=args, kwargs=kwargs)
 

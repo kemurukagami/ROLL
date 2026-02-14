@@ -34,6 +34,14 @@ logger = get_logger()
 EXCEPTION_MONITOR_ACTOR_NAME = "ExceptionMonitor"
 
 
+def _schedrl_disable_ray_cluster_lifecycle() -> bool:
+    # ENG-123: do not let per-pipeline workers stop the job-global Ray cluster.
+    # Use SCHEDRL_CONTROL_PLANE as the source-of-truth (SCHEDRL_LIBRARY_MODE may be false in future service mode).
+    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+        return True
+    return os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1"
+
+
 class StdPublisher:
 
     file_handlers = {}
@@ -218,7 +226,7 @@ class LogMonitorListener:
             time.sleep(0.1)
 
     def stop(self):
-        if os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1":
+        if _schedrl_disable_ray_cluster_lifecycle():
             StdPublisher.close_file_handlers()
             time.sleep(0.2)
             try:
@@ -243,7 +251,7 @@ class LogMonitorListener:
         subprocess.run(cmd, shell=True, capture_output=True)
 
     def start(self):
-        if os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1":
+        if _schedrl_disable_ray_cluster_lifecycle():
             return
         atexit.register(self.stop)
 

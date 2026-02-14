@@ -129,19 +129,14 @@ class SchedRLAdapter:
         )
 
         self._schedrl_orchestrator = ray.get_actor("schedrl:orchestrator", namespace="schedrl")
-        self._schedrl_scheduler = ray.get_actor("schedrl:scheduler", namespace="schedrl")
-        self._request_scheduler_cache: Dict[str, Any] = {}
         self._coordinator = None
+        # NOTE: infer resize serialization is owned by the per-pipeline pipeline-side resize actor.
 
-        ray.get(
-            self._schedrl_orchestrator.register_pipeline.remote(
-                pipeline_id=self._registration.pipeline_id,
-                ray_namespace=self._registration.ray_namespace,
-                cluster_tp_configs=self._registration.cluster_tp_configs,
-                cluster_device_mappings=self._registration.cluster_device_mappings,
-            )
-        )
-        ray.get(self._schedrl_orchestrator.admit_pipeline.remote(pipeline_id=self._registration.pipeline_id))
+        # Driver is responsible for:
+        # - orchestrator.allocate_pipeline_id()
+        # - orchestrator.register_pipeline(...)
+        # - orchestrator.admit_pipeline(...)
+        # before creating this adapter actor.
 
     def get_registration(self) -> PipelineRegistration:
         return self._registration
@@ -199,54 +194,6 @@ class SchedRLAdapter:
         _update_system_envs(getattr(pipeline_config, "train_env_manager", None))
         _update_system_envs(getattr(pipeline_config, "val_env_manager", None))
 
-    def _get_or_lookup_request_scheduler(self, *, mode: str) -> Any:
-        _require_ray()
-        import ray
-
-        if mode not in {"train", "val"}:
-            raise ValueError(f"mode must be 'train'|'val', got {mode!r}")
-
-        cached = self._request_scheduler_cache.get(mode)
-        if cached is not None:
-            return cached
-
-        name = f"{self._pipeline_id}_request_scheduler_{mode}"
-        try:
-            handle = ray.get_actor(name, namespace=self._ray_namespace)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to resolve RequestScheduler actor {name!r} in namespace {self._ray_namespace!r}"
-            ) from e
-        self._request_scheduler_cache[mode] = handle
-        return handle
-
-    def _try_get_request_scheduler(self, *, mode: str) -> Optional[Any]:
-        """Best-effort actor lookup.
-
-        Contract:
-        - Returns None if the named actor doesn't exist yet.
-        - Any other failure is treated as fatal (fail-fast).
-        """
-        _require_ray()
-        import ray
-
-        cached = self._request_scheduler_cache.get(mode)
-        if cached is not None:
-            return cached
-
-        name = f"{self._pipeline_id}_request_scheduler_{mode}"
-        try:
-            handle = ray.get_actor(name, namespace=self._ray_namespace)
-        except ValueError:
-            return None
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to resolve RequestScheduler actor {name!r} in namespace {self._ray_namespace!r}"
-            ) from e
-
-        self._request_scheduler_cache[mode] = handle
-        return handle
-
     def _dp_ranks_to_gpu_ids(self, *, dp_ranks: List[int]) -> List[int]:
         cfg = self._registration
         tp_size = int(cfg.cluster_tp_configs["actor_infer"])
@@ -268,46 +215,42 @@ class SchedRLAdapter:
             gpu_ids.extend(device_mapping[start : start + tp_size])
         return sorted(set(int(x) for x in gpu_ids))
 
-    async def shrink_workers(self, dp_ranks_to_remove: List[int]) -> Dict[str, Any]:
-        """SchedRL scheduler shrink hook: dp_ranks -> RequestScheduler.shrink_workers(target_gpus=...)."""
+    async def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> Dict[str, Any]:
+        """Pipeline-scoped resize for actor_infer (ENG-123).
+
+        Contract: exactly one of {dp_ranks_to_remove, dp_ranks_to_add} must be non-empty.
+        Applies to both train+val RequestSchedulers (shared infer cluster):
+        - Shrink: train offloads; val routing-only (skip_offload=True).
+        - Expand: train loads + optional selective update; val routing-only (skip_load=True).
+
+        NOTE: This intentionally does NOT call suspend()/resume() globally. Upstream RequestScheduler.shrink_workers()
+        removes shrinking ranks from active_dp_ranks under routing_lock and aborts/drains only impacted ranks; new
+        requests continue on remaining ranks. Shrink-to-zero and expand-from-zero are handled internally via
+        need_suspend/resume().
+        """
         _require_ray()
-
-        if not isinstance(dp_ranks_to_remove, list) or not dp_ranks_to_remove:
-            raise ValueError("dp_ranks_to_remove must be a non-empty list[int]")
-
-        target_gpus = self._dp_ranks_to_gpu_ids(dp_ranks=dp_ranks_to_remove)
-        train_scheduler = self._get_or_lookup_request_scheduler(mode="train")
-        val_scheduler = self._try_get_request_scheduler(mode="val")
-
-        train_ref = train_scheduler.shrink_workers.remote(target_gpus)
-        refs = [train_ref]
-        if val_scheduler is not None:
-            refs.append(val_scheduler.shrink_workers.remote(target_gpus))
-
-        results = await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in refs])
-        train_result = results[0]
-        if len(results) > 1:
-            train_result = dict(train_result)
-            train_result["val_result"] = results[1]
-        return train_result
-
-    async def expand_workers(self, dp_ranks_to_add: List[int]) -> Dict[str, Any]:
+        if not isinstance(dp_ranks_to_remove, list):
+            raise ValueError("dp_ranks_to_remove must be list[int]")
+        if not isinstance(dp_ranks_to_add, list):
+            raise ValueError("dp_ranks_to_add must be list[int]")
+        if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
+            raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
         _require_ray()
+        import ray
 
-        if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
-            raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
-        target_gpus = self._dp_ranks_to_gpu_ids(dp_ranks=dp_ranks_to_add)
-        train_scheduler = self._get_or_lookup_request_scheduler(mode="train")
-        val_scheduler = self._try_get_request_scheduler(mode="val")
+        # NOTE: adapter does not coordinate train/val request schedulers directly; it delegates to the
+        # per-pipeline coordinator actor (single serialization boundary owned by pipeline runtime).
+        resize_actor_name = f"schedrl:pipeline:{self._pipeline_id}"
+        try:
+            resize_actor = ray.get_actor(resize_actor_name, namespace=self._ray_namespace)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to resolve pipeline coordinator actor {resize_actor_name!r} in namespace {self._ray_namespace!r} "
+                f"for pipeline_id={self._pipeline_id!r}"
+            ) from e
 
-        train_ref = train_scheduler.expand_workers.remote(target_gpus)
-        refs = [train_ref]
-        if val_scheduler is not None:
-            refs.append(val_scheduler.expand_workers.remote(target_gpus))
-
-        results = await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in refs])
-        train_result = results[0]
-        if len(results) > 1:
-            train_result = dict(train_result)
-            train_result["val_result"] = results[1]
-        return train_result
+        ref = resize_actor.resize_infer.remote(
+            dp_ranks_to_remove=list(dp_ranks_to_remove),
+            dp_ranks_to_add=list(dp_ranks_to_add),
+        )
+        return await asyncio.wrap_future(ref.future())

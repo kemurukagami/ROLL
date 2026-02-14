@@ -1,4 +1,5 @@
 import asyncio
+import os
 import time
 from typing import Dict
 import ray
@@ -67,13 +68,17 @@ class LimiterClient:
     
     def __init__(self, tag: str = "default", max_concurrent_calls: int = 10):
         self.tag = tag
+        self.pipeline_id = os.environ.get("PIPELINE_ID") or ""
         self.limiter = None
         self.max_concurrent_calls = max_concurrent_calls
         self._initialize_limiter()
     
     def _initialize_limiter(self):
         """Initialize global rate limiter"""
-        limiter_name = f"GlobalLimiter_{self.tag}"
+        if self.pipeline_id:
+            limiter_name = f"{self.pipeline_id}_GlobalLimiter_{self.tag}"
+        else:
+            limiter_name = f"GlobalLimiter_{self.tag}"
         self.limiter = GlobalLimiter.options(
             name=limiter_name,
             get_if_exists=True,
@@ -117,9 +122,11 @@ _global_limiters = {}
 def get_global_limiter(tag: str = "default", max_concurrent_calls: int = 10) -> LimiterClient:
     """Get API rate limiter instance for specified tag"""
     global _global_limiters
-    if tag not in _global_limiters:
-        _global_limiters[tag] = LimiterClient(tag=tag, max_concurrent_calls=max_concurrent_calls)
-    return _global_limiters[tag]
+    pipeline_id = os.environ.get("PIPELINE_ID") or ""
+    key = f"{pipeline_id}:{tag}" if pipeline_id else tag
+    if key not in _global_limiters:
+        _global_limiters[key] = LimiterClient(tag=tag, max_concurrent_calls=max_concurrent_calls)
+    return _global_limiters[key]
 
 def clear_global_limiters(tag: str = None):
     """Clear limiter instances

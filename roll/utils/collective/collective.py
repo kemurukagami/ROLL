@@ -22,7 +22,7 @@ class GroupManager:
         self._group_name_map = {}
 
     def create_collective_group(self, backend, world_size, rank, master_addr: str, master_port: int, group_name, global_ranks=None):
-        self._name_group_map[group_name] = init_custom_process_group(
+        group = init_custom_process_group(
             backend=backend,
             init_method=f"tcp://{master_addr}:{master_port}",
             world_size=world_size,
@@ -30,8 +30,9 @@ class GroupManager:
             group_name=group_name,
             global_ranks=global_ranks
         )
-
-        return self._name_group_map[group_name]
+        self._name_group_map[group_name] = group
+        self._group_name_map[group] = group_name
+        return group
 
     def is_group_exist(self, group_name):
         return group_name in self._name_group_map
@@ -51,6 +52,10 @@ class GroupManager:
 
         # release the collective group resource
         g = self._name_group_map[group_name]
+        try:
+            dist.destroy_process_group(g)
+        except Exception as e:
+            raise RuntimeError(f"Failed to destroy process group: group_name={group_name}") from e
         # clean up the dicts
         del self._group_name_map[g]
         del self._name_group_map[group_name]
@@ -103,3 +108,8 @@ def broadcast_object_list(object_list, src=None, group_name="default", device=No
     assert (src is not None and group_src is None) or (src is None and group_src is not None),\
         ("Either src or group_src must be set, but they cannot be set simultaneously.")
     dist.broadcast_object_list(object_list, src=src, group_src=group_src, group=_group_mgr.get_group_by_name(group_name))
+
+
+def destroy_collective_group(group_name: str) -> None:
+    global _group_mgr
+    _group_mgr.destroy_collective_group(group_name)

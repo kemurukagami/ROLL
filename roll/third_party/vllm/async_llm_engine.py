@@ -20,6 +20,9 @@ class CustomAsyncLLMEngine(AsyncLLMEngine):
     async def update_parameter_in_bucket(self, *args, **kwargs):
         self.engine.model_executor.collective_rpc(method="update_parameter_in_bucket", args=args, kwargs=kwargs)
 
+    async def destroy_collective_group(self, group_name: str):
+        self.engine.model_executor.collective_rpc(method="destroy_collective_group", args=(group_name,), kwargs={})
+
     async def add_lora(self, *args, **kwargs):
         self.engine.model_executor.collective_rpc(method="custom_add_lora", args=args, kwargs=kwargs)
 

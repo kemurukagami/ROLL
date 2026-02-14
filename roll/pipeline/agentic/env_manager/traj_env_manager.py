@@ -107,7 +107,7 @@ class TrajEnvManager(BaseEnvManager):
         traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
         traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
         turn_id = int(self.rollout_cache.step)
-        attempt = 0
+        attempt = int(getattr(self.rollout_cache, "attempt", 0))
 
         from schedrl.protocol.request_id import build_request_id
 
@@ -149,6 +149,11 @@ class TrajEnvManager(BaseEnvManager):
             with Timer(name="step", logger=None) as step_timer:
                 if stop_reason == GenerateStopReason.FINISH:
                     rollout_cache: RolloutCache = self.step(lm_output)
+                elif stop_reason == GenerateStopReason.ABORT:
+                    # Retry the same turn (same step) after abort. This is used to survive
+                    # shrink/rebalance aborts. Each retry increments attempt so request_ids remain unique.
+                    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+                        self.rollout_cache.attempt += 1
             log_stats["step_time"].append(step_timer.last)
 
             if self.running and (rollout_cache.terminated or stop_reason == GenerateStopReason.MAX_LENGTH):
@@ -202,6 +207,7 @@ class TrajEnvManager(BaseEnvManager):
         suffix = info.pop("suffix", None)
 
         self.rollout_cache.step += 1
+        self.rollout_cache.attempt = 0
         self.rollout_cache.terminated = terminated
         self.rollout_cache.truncated = truncated
         if self.rollout_cache.step >= self.env_config.max_steps:

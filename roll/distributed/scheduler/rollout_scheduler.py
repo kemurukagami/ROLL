@@ -19,6 +19,7 @@ from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.pipeline.agentic.agentic_config import EnvManagerConfig
 from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
+from roll.utils.constants import RAY_NAMESPACE
 from roll.utils.logging import get_logger
 
 logger = get_logger()
@@ -708,6 +709,8 @@ class RolloutScheduler(RolloutMockMixin):
         self.infer_cluster = infer_cluster
         self.mode = mode
         self.pipeline_id = os.environ.get("PIPELINE_ID") or None
+        if self.pipeline_id is None and os.environ.get("ROLL_RAY_NAMESPACE"):
+            raise RuntimeError("PIPELINE_ID must be set when ROLL_RAY_NAMESPACE is set (multi-pipeline mode)")
 
         env_num = self.env_manager_config.world_size * self.env_manager_config.max_env_num_per_worker
 
@@ -717,6 +720,7 @@ class RolloutScheduler(RolloutMockMixin):
                 if self.pipeline_id
                 else f"GroupQueueManager-{mode}"
             ),
+            namespace=RAY_NAMESPACE,
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False),
@@ -733,6 +737,7 @@ class RolloutScheduler(RolloutMockMixin):
                     if self.pipeline_id
                     else f"RequestScheduler-{self.env_manager_config.name}-{mode}"
                 ),
+                namespace=RAY_NAMESPACE,
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -827,7 +832,7 @@ class RolloutScheduler(RolloutMockMixin):
 
         return batch
 
-    async def shrink_sampler(self, target_gpus: List[int]) -> Dict[str, Any]:
+    async def shrink_sampler(self, dp_ranks: List[int], skip_offload: bool = False) -> Dict[str, Any]:
         """Thin wrapper: Delegate shrink operation to RequestScheduler.
 
         v4.6 ARCHITECTURAL CHANGE: RolloutScheduler no longer performs validation,
@@ -835,7 +840,8 @@ class RolloutScheduler(RolloutMockMixin):
         owned by RequestScheduler for atomic execution under routing_lock.
 
         Args:
-            target_gpus: GPU IDs to free (e.g., [4,5] for actor_train or [6,7] for critic)
+            dp_ranks: DP ranks to offload / deactivate for routing
+            skip_offload: If True, skip physical offload (use when another coupled scheduler already offloaded).
 
         Returns:
             Dict with metrics from RequestScheduler.shrink_workers():
@@ -861,14 +867,14 @@ class RolloutScheduler(RolloutMockMixin):
         start_time = time.time()
 
         # Delegate complete shrink operation to RequestScheduler (atomic under routing_lock)
-        result = await self.generate_scheduler.shrink_workers.remote(target_gpus)
+        result = await self.generate_scheduler.shrink_workers.remote(dp_ranks, skip_offload=bool(skip_offload))
 
         # Add timing from RolloutScheduler perspective
         result["rollout_scheduler_duration_ms"] = (time.time() - start_time) * 1000
 
         return result
 
-    async def expand_sampler(self, target_gpus: List[int], skip_load: bool = False) -> Dict[str, Any]:
+    async def expand_sampler(self, dp_ranks: List[int], skip_load: bool = False) -> Dict[str, Any]:
         """Thin wrapper: Delegate expand operation to RequestScheduler.
 
         v4.6 ARCHITECTURAL CHANGE: RolloutScheduler no longer performs validation,
@@ -876,7 +882,7 @@ class RolloutScheduler(RolloutMockMixin):
         owned by RequestScheduler for atomic execution under routing_lock.
 
         Args:
-            target_gpus: GPU IDs to restore (e.g., [4,5] for actor_train or [6,7] for critic)
+            dp_ranks: DP ranks to load / activate for routing
             skip_load: If True, skip model loading (use when model_update already loaded states).
                       This only updates active_dp_ranks to restore routing state.
 
@@ -907,7 +913,7 @@ class RolloutScheduler(RolloutMockMixin):
         start_time = time.time()
 
         # Delegate complete expand operation to RequestScheduler (atomic under routing_lock)
-        result = await self.generate_scheduler.expand_workers.remote(target_gpus, skip_load)
+        result = await self.generate_scheduler.expand_workers.remote(dp_ranks, skip_load)
 
         # Add timing from RolloutScheduler perspective
         result["rollout_scheduler_duration_ms"] = (time.time() - start_time) * 1000

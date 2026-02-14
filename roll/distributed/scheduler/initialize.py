@@ -24,6 +24,10 @@ from roll.platforms import current_platform
 logger = get_logger()
 
 def _is_library_mode() -> bool:
+    # ENG-123: treat SCHEDRL_CONTROL_PLANE=schedrl as the source-of-truth for "SchedRL-owned cluster lifecycle".
+    # Keep SCHEDRL_LIBRARY_MODE as a backwards-compatible override.
+    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+        return True
     return os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1"
 
 

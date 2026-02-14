@@ -1,10 +1,11 @@
 import math
 import os
 import random
+import threading
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
-from typing import TYPE_CHECKING, Callable, Dict, Iterator, List, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import ray
@@ -46,7 +47,11 @@ from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.strategy.strategy import InferenceStrategy, TrainStrategy
 from roll.models.model_providers import default_processor_provider, default_tokenizer_provider
 from roll.platforms import current_platform
-from roll.third_party.megatron.model_update import MegatronWeightUpdater
+from roll.third_party.megatron.model_update import (
+    MegatronWeightUpdater,
+    gather_all_hf_weights,
+    gather_weights_meta_cross_pp,
+)
 from roll.third_party.megatron.offload_states_patch import (
     MegatronOffloadStateType,
     bind_megatron_offload_states_func,
@@ -63,10 +68,14 @@ from roll.utils.constants import (
     SCHEDULER_NAME,
 )
 from roll.utils.context_managers import disable_gradients
+from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
 from roll.utils.dynamic_batching import make_micro_batch_iter_for_dynamic_batching
 from roll.utils.functionals import append_to_dict, reduce_metrics, adjust_sequence_length
+from roll.utils.collective import collective
 from roll.utils.logging import get_logger
+from roll.utils.network_utils import collect_free_port, get_node_ip
 from roll.utils.offload_states import OffloadStateType
+from roll.utils.send_recv_utils import named_tensors_from_bucket, serialize_named_weights
 from roll.utils.sequence_packing import make_micro_batch_iter_for_sequence_packing, restore_results_order
 
 
@@ -965,6 +974,15 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.processor = None
         self._validate_access_integrity = True
 
+        # ENG-123 Phase 4: sender-side cached buckets + promotion + selective sync.
+        self._cache_lock = threading.Lock()
+        self._cache_map: Dict[Tuple[int, int], List[Any]] = {}
+        self._latest_cached: Optional[Tuple[int, int]] = None
+        self._active_cached: Optional[Tuple[int, int]] = None
+        self._selective_update_weights_meta = None
+        self._selective_sync_cpu_group = None
+        self._selective_sync_cpu_group_size: Optional[int] = None
+
     def initialize(self, model_provider):
         self.seq_length = self.worker.pipeline_config.sequence_length
         self.weight_updaters: dict[str, MegatronWeightUpdater] = {}
@@ -1175,10 +1193,235 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     mtp_total_loss_dict[name] = mtp_losses[i].item()
                 MTPLossLoggingHelper.clean_loss_in_tracker()
                 metrics.update(mtp_total_loss_dict)
+
+        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+            checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
+            self._build_latest_bucket_cache(checkpoint_version=checkpoint_version, global_step=int(global_step))
         return metrics
 
     def model_update(self, model_update_name: str):
         return self.weight_updaters[model_update_name].model_update()
+
+    def _ensure_selective_sync_cpu_group(self, *, infer_tp_size: int) -> None:
+        if self._selective_sync_cpu_group is not None and self._selective_sync_cpu_group_size == int(infer_tp_size):
+            return
+
+        infer_tp_size = int(infer_tp_size)
+        if infer_tp_size <= 0:
+            raise ValueError(f"infer_tp_size must be positive int, got {infer_tp_size}")
+
+        world_size = dist.get_world_size()
+        if world_size % infer_tp_size != 0:
+            raise RuntimeError(f"train world_size={world_size} must be divisible by infer_tp_size={infer_tp_size}")
+
+        self._selective_sync_cpu_group = None
+        for start_rank in range(0, world_size, infer_tp_size):
+            end_rank = start_rank + infer_tp_size
+            group_ranks = list(range(start_rank, end_rank))
+            new_group = dist.new_group(ranks=group_ranks, backend="gloo")
+            if dist.get_rank() in group_ranks:
+                self._selective_sync_cpu_group = new_group
+
+        if self._selective_sync_cpu_group is None:
+            raise RuntimeError("Failed to resolve selective_sync cpu group for this rank")
+        self._selective_sync_cpu_group_size = infer_tp_size
+
+    def _build_latest_bucket_cache(self, *, checkpoint_version: int, global_step: int) -> None:
+        buffer_size = int(self.worker.pipeline_config.model_update_buffer_size_mb) * 1024 * 1024
+        cache_key = (int(checkpoint_version), int(global_step))
+
+        with self._cache_lock:
+            if self._selective_update_weights_meta is None:
+                self._selective_update_weights_meta = gather_weights_meta_cross_pp(self.models_unwrapped)
+
+            cached_buckets: List[Any] = []
+            for hf_named_weights in gather_all_hf_weights(
+                self.models_unwrapped,
+                buffer_size=buffer_size,
+                weights_meta=self._selective_update_weights_meta,
+            ):
+                cached_buckets.append(serialize_named_weights(hf_named_weights, infer_strategy="vllm"))
+
+            self._cache_map[cache_key] = cached_buckets
+            self._latest_cached = cache_key
+
+    def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
+        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+            raise RuntimeError("promote_active_checkpoint is only supported under SchedRL control plane")
+
+        cache_key = (int(checkpoint_version), int(global_step))
+        with self._cache_lock:
+            if cache_key not in self._cache_map:
+                raise RuntimeError(f"promote_active_checkpoint missing cache_key={cache_key}")
+            self._active_cached = cache_key
+
+            keep: Set[Tuple[int, int]] = set()
+            if self._latest_cached is not None:
+                keep.add(self._latest_cached)
+            keep.add(self._active_cached)
+
+            for key in list(self._cache_map.keys()):
+                if key not in keep:
+                    del self._cache_map[key]
+
+    def selective_sync_active_cache(
+        self,
+        *,
+        sync_id: str,
+        tgt_dp_ranks: List[int],
+        tgt_workers,
+        tgt_device_mapping: List[int],
+        tgt_num_gpus_per_worker: int,
+    ) -> None:
+        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+            raise RuntimeError("selective_sync_active_cache is only supported under SchedRL control plane")
+
+        tgt_dp_ranks = sorted(set(int(r) for r in tgt_dp_ranks))
+        if not tgt_dp_ranks:
+            raise ValueError("tgt_dp_ranks must be non-empty")
+        if not tgt_device_mapping:
+            raise ValueError("tgt_device_mapping must be non-empty")
+        if not isinstance(tgt_num_gpus_per_worker, int) or int(tgt_num_gpus_per_worker) <= 0:
+            raise ValueError("tgt_num_gpus_per_worker must be positive int")
+        if len(tgt_device_mapping) % int(tgt_num_gpus_per_worker) != 0:
+            raise RuntimeError("tgt_device_mapping length must be divisible by tgt_num_gpus_per_worker")
+
+        def _dp_rank_gpus(dp_rank: int) -> List[int]:
+            start = int(dp_rank) * int(tgt_num_gpus_per_worker)
+            end = start + int(tgt_num_gpus_per_worker)
+            return [int(x) for x in tgt_device_mapping[start:end]]
+
+        is_lora = self.worker_config.model_args.lora_target is not None
+        world_rank = dist.get_rank()
+
+        with self._cache_lock:
+            if self._active_cached is None:
+                raise RuntimeError("selective_sync_active_cache requires an active promoted cache (active_cached is unset)")
+            if self._active_cached not in self._cache_map:
+                raise RuntimeError(f"active_cached={self._active_cached} missing from cache_map")
+            cached_buckets = list(self._cache_map[self._active_cached])
+
+            train_devices = set(int(x) for x in (self.worker_config.device_mapping or []))
+            infer_devices = set(int(x) for x in tgt_device_mapping)
+            is_colocated = bool(train_devices.intersection(infer_devices))
+
+            ipc_target_dp_ranks: Set[int] = set()
+            broadcast_target_dp_ranks: Set[int] = set()
+            for dp_rank in tgt_dp_ranks:
+                gpus = _dp_rank_gpus(dp_rank)
+                if any(g in train_devices for g in gpus) and is_colocated:
+                    ipc_target_dp_ranks.add(int(dp_rank))
+                else:
+                    broadcast_target_dp_ranks.add(int(dp_rank))
+
+            # IPC path (colocated overlapped workers): reuse upstream Megatron mapping/group behavior.
+            if ipc_target_dp_ranks:
+                train_mapping = [int(x) for x in (self.worker_config.device_mapping or [])]
+                if not train_mapping:
+                    raise RuntimeError("train device_mapping is empty; cannot perform IPC selective sync")
+
+                device_start_diff = min(train_mapping) - min(int(x) for x in tgt_device_mapping)
+                device_end_diff = max(train_mapping) - max(int(x) for x in tgt_device_mapping)
+                if device_start_diff % int(tgt_num_gpus_per_worker) != 0 or device_end_diff % int(tgt_num_gpus_per_worker) != 0:
+                    raise RuntimeError(
+                        "device_mapping diff must be divisible by tgt_num_gpus_per_worker "
+                        f"({device_start_diff=}, {device_end_diff=}, {tgt_num_gpus_per_worker=})"
+                    )
+
+                self._ensure_selective_sync_cpu_group(infer_tp_size=int(tgt_num_gpus_per_worker))
+                co_infer_rank = dist.get_rank(self._selective_sync_cpu_group)
+                infer_parallel_size = dist.get_world_size(self._selective_sync_cpu_group)
+                infer_worker_idx = (int(world_rank) + int(device_start_diff)) // int(tgt_num_gpus_per_worker)
+
+                if 0 <= infer_worker_idx < len(tgt_workers) and infer_worker_idx in ipc_target_dp_ranks:
+                    co_infer_worker = tgt_workers[infer_worker_idx]
+                    for serialized_tensors in cached_buckets:
+                        infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
+                        dist.gather_object(
+                            serialized_tensors,
+                            infer_parallel_tensors,
+                            group_dst=0,
+                            group=self._selective_sync_cpu_group,
+                        )
+                        if co_infer_rank == 0:
+                            ray.get(
+                                co_infer_worker.update_parameter_in_bucket.remote(
+                                    infer_parallel_tensors,
+                                    is_lora=is_lora,
+                                )
+                            )
+
+            # Broadcast path (separated workers): subset-scoped ephemeral collective group.
+            group_name = None
+            broadcast_workers = None
+            try:
+                if broadcast_target_dp_ranks and world_rank == 0:
+                    broadcast_workers = [tgt_workers[r] for r in sorted(broadcast_target_dp_ranks)]
+
+                    infer_device_num = int(tgt_num_gpus_per_worker) * len(broadcast_workers)
+                    master_address, master_port = get_node_ip(), collect_free_port()
+
+                    safe_sync_id = str(sync_id).replace("/", "_")
+                    group_name = f"{safe_sync_id}_broadcast"
+
+                    setup_refs = [
+                        worker.setup_collective_group.remote(
+                            master_address=master_address,
+                            master_port=master_port,
+                            group_name=group_name,
+                            rank_offset=i * int(tgt_num_gpus_per_worker) + 1,
+                            world_size=infer_device_num + 1,
+                        )
+                        for i, worker in enumerate(broadcast_workers)
+                    ]
+                    collective.init_collective_group(
+                        infer_device_num + 1,
+                        0,
+                        group_name=group_name,
+                        master_addr=master_address,
+                        master_port=master_port,
+                    )
+                    ray.get(setup_refs)
+
+                    for serialized_tensors in cached_buckets:
+                        bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_tensors)
+                        named_params = named_tensors_from_bucket(**bucket_with_meta)
+
+                        names = [n for n, _ in named_params]
+                        dtypes = [t.dtype for _, t in named_params]
+                        shapes = [t.shape for _, t in named_params]
+
+                        recv_refs = [
+                            worker.broadcast_parameter.remote(
+                                group_name=group_name,
+                                names=names,
+                                dtypes=dtypes,
+                                shapes=shapes,
+                                is_lora=is_lora,
+                            )
+                            for worker in broadcast_workers
+                        ]
+
+                        handles = []
+                        for _, weight in named_params:
+                            handles.append(
+                                collective.broadcast(
+                                    tensor=weight,
+                                    src_rank=0,
+                                    group_name=group_name,
+                                    async_op=True,
+                                )
+                            )
+                        for handle in handles:
+                            handle.wait()
+                        ray.get(recv_refs)
+            finally:
+                if group_name is not None and broadcast_workers is not None and world_rank == 0:
+                    collective.destroy_collective_group(group_name)
+                    ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
+
+            # Critical: ensure all sender ranks complete this sync before allowing another to start.
+            dist.barrier()
 
     def load_states(self, include=None, non_blocking=False):
         if include is not None:

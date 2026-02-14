@@ -66,6 +66,8 @@ class Worker:
 
         self.master_addr = os.environ["MASTER_ADDR"]
         self.master_port = int(os.environ["MASTER_PORT"])
+        if self.pipeline_id is None and os.environ.get("ROLL_RAY_NAMESPACE"):
+            raise RuntimeError("PIPELINE_ID must be set when ROLL_RAY_NAMESPACE is set (multi-pipeline mode)")
         rendezvous_key = f"{self.pipeline_id}:{self.cluster_name}" if self.pipeline_id else self.cluster_name
         self.shared_storage.put.remote(rendezvous_key, {"MASTER_ADDR": self.master_addr, "MASTER_PORT": self.master_port})
         # NOTE: 自定义Worker时根据需要配置rank_info
@@ -234,6 +236,36 @@ class Worker:
             self.strategy.update_parameter_in_bucket(*args, **kwargs)
         else:
             self.logger.warning("worker has not strategy")
+
+    def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
+        if getattr(self, "strategy", None) is None:
+            raise RuntimeError("worker has no strategy")
+        promote = getattr(self.strategy, "promote_active_checkpoint", None)
+        if not callable(promote):
+            raise RuntimeError(f"{type(self.strategy).__name__} does not support promote_active_checkpoint")
+        promote(checkpoint_version=int(checkpoint_version), global_step=int(global_step))
+
+    def selective_sync_active_cache(
+        self,
+        *,
+        sync_id: str,
+        tgt_dp_ranks,
+        tgt_workers,
+        tgt_device_mapping,
+        tgt_num_gpus_per_worker: int,
+    ) -> None:
+        if getattr(self, "strategy", None) is None:
+            raise RuntimeError("worker has no strategy")
+        fn = getattr(self.strategy, "selective_sync_active_cache", None)
+        if not callable(fn):
+            raise RuntimeError(f"{type(self.strategy).__name__} does not support selective_sync_active_cache")
+        fn(
+            sync_id=str(sync_id),
+            tgt_dp_ranks=tgt_dp_ranks,
+            tgt_workers=tgt_workers,
+            tgt_device_mapping=tgt_device_mapping,
+            tgt_num_gpus_per_worker=int(tgt_num_gpus_per_worker),
+        )
 
     def add_lora(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:

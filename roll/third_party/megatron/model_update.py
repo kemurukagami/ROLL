@@ -358,9 +358,9 @@ class MegatronWeightUpdater:
         self._weights_meta = gather_weights_meta_cross_pp(self.models_unwrapped)
 
     def _setup_separated_model_update(self):
-        self._model_update_locker = Locker.options(
-            name="model_update_locker", get_if_exists=True, namespace=RAY_NAMESPACE
-        ).remote()
+        pipeline_id = os.environ.get("PIPELINE_ID")
+        locker_name = f"{pipeline_id}_model_update_locker" if pipeline_id else "model_update_locker"
+        self._model_update_locker = Locker.options(name=locker_name, get_if_exists=True, namespace=RAY_NAMESPACE).remote()
         if not (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
         ):

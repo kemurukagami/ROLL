@@ -18,6 +18,7 @@ class RolloutCache:
     truncated: bool = False
     terminated: bool = False
     step: int = 0
+    attempt: int = 0
 
 
 class BaseEnvManager:

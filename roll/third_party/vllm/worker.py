@@ -114,6 +114,9 @@ class WorkerBase:
         )
         logger.info(f"setup_collective_group: {group_name} rank: {group_rank} world_size: {world_size}")
 
+    def destroy_collective_group(self, group_name: str):
+        collective.destroy_collective_group(group_name)
+
     def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
         weights_and_handles = []
         for name, dtype, shape in zip(names, dtypes, shapes):

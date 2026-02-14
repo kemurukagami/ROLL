@@ -2,7 +2,8 @@ import json
 import os.path
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List
+import threading
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import ray
@@ -139,6 +140,7 @@ class AgenticPipeline(BasePipeline):
         # INIT PHASE: Create RolloutSchedulers
         self.train_rollout_scheduler = ray.remote(RolloutScheduler).options(
             name="RolloutScheduler-train",
+            namespace=RAY_NAMESPACE,
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False)).remote(
@@ -151,6 +153,7 @@ class AgenticPipeline(BasePipeline):
 
         self.val_rollout_scheduler = ray.remote(RolloutScheduler).options(
             name="RolloutScheduler-val",
+            namespace=RAY_NAMESPACE,
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False)).remote(
@@ -163,6 +166,17 @@ class AgenticPipeline(BasePipeline):
         self.val_dataset_manager = GlobalDatasetManager.options(name=f"val_dataset_manager",
                                                                 get_if_exists=True,
                                                                 namespace=RAY_NAMESPACE).remote()
+
+        # Per-pipeline infer resize serialization boundary (ENG-123).
+        infer_strategy_config = self.actor_infer.worker_config.strategy_args.strategy_config
+        tp_size = int(infer_strategy_config.get("tensor_parallel_size", 1))
+        pp_size = int(infer_strategy_config.get("pipeline_parallel_size", 1))
+        self._infer_gpus_per_dp_rank = tp_size * pp_size
+        self._infer_device_mapping = list(getattr(self.pipeline_config.actor_infer, "device_mapping", None) or [])
+        if not self._infer_device_mapping:
+            raise RuntimeError("actor_infer.device_mapping must be set")
+        self._infer_resize_lock = threading.Lock()
+
         # INIT PHASE: Initialize Clusters
         refs: List[ray.ObjectRef] = []
         refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
@@ -198,6 +212,122 @@ class AgenticPipeline(BasePipeline):
             self.partial_gpu_mode = self._validate_partial_gpu_config()
         else:
             self.partial_gpu_mode = False
+
+    def _dp_ranks_to_target_gpus(self, *, dp_ranks: List[int]) -> List[int]:
+        if not isinstance(dp_ranks, list) or not dp_ranks:
+            raise ValueError("dp_ranks must be a non-empty list[int]")
+        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
+        if gpus_per_dp_rank <= 0:
+            raise RuntimeError("Invalid infer gpus_per_dp_rank")
+        device_mapping = list(self._infer_device_mapping)
+        if len(device_mapping) % gpus_per_dp_rank != 0:
+            raise RuntimeError("actor_infer.device_mapping length must be divisible by gpus_per_dp_rank")
+
+        max_dp = len(device_mapping) // gpus_per_dp_rank
+        out: List[int] = []
+        for dp_rank in dp_ranks:
+            r = int(dp_rank)
+            if not (0 <= r < max_dp):
+                raise ValueError(f"dp_rank {r} out of range [0, {max_dp})")
+            start = r * gpus_per_dp_rank
+            out.extend(device_mapping[start : start + gpus_per_dp_rank])
+        return sorted(set(int(x) for x in out))
+
+    def _target_gpus_to_dp_ranks_to_remove(self, *, target_gpus: List[int]) -> List[int]:
+        if not isinstance(target_gpus, list) or not target_gpus:
+            raise ValueError("target_gpus must be a non-empty list[int]")
+        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
+        device_mapping = list(self._infer_device_mapping)
+        if len(device_mapping) % gpus_per_dp_rank != 0:
+            raise RuntimeError("actor_infer.device_mapping length must be divisible by gpus_per_dp_rank")
+        target = set(int(x) for x in target_gpus)
+        # Check target GPU alignment with rollout DP granularity
+        min_gpu = min(target)
+        max_gpu = max(target)
+        if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
+            logger.warning(
+                f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
+                f"({gpus_per_dp_rank}). DP rank boundary violation detected "
+                f"for target GPUs {sorted(target)}. "
+                f"Rollout DP ranks may not cleanly map to training GPUs."
+            )
+        max_dp = len(device_mapping) // gpus_per_dp_rank
+        out: List[int] = []
+        for dp_rank in range(max_dp):
+            start = dp_rank * gpus_per_dp_rank
+            dp_gpus = set(int(x) for x in device_mapping[start : start + gpus_per_dp_rank])
+            if dp_gpus.intersection(target):
+                out.append(dp_rank)
+        if not out:
+            raise RuntimeError("No dp ranks matched target_gpus for shrink")
+        return out
+
+    def _target_gpus_to_dp_ranks_to_add(self, *, target_gpus: List[int]) -> List[int]:
+        if not isinstance(target_gpus, list) or not target_gpus:
+            raise ValueError("target_gpus must be a non-empty list[int]")
+        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
+        device_mapping = list(self._infer_device_mapping)
+        if len(device_mapping) % gpus_per_dp_rank != 0:
+            raise RuntimeError("actor_infer.device_mapping length must be divisible by gpus_per_dp_rank")
+        target = set(int(x) for x in target_gpus)
+        # Check target GPU alignment with rollout DP granularity
+        min_gpu = min(target)
+        max_gpu = max(target)
+        if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
+            logger.warning(
+                f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
+                f"({gpus_per_dp_rank}). DP rank boundary violation detected "
+                f"for target GPUs {sorted(target)}. "
+                f"Rollout DP ranks may not cleanly map to training GPUs."
+            )
+        max_dp = len(device_mapping) // gpus_per_dp_rank
+        out: List[int] = []
+        for dp_rank in range(max_dp):
+            start = dp_rank * gpus_per_dp_rank
+            dp_gpus = set(int(x) for x in device_mapping[start : start + gpus_per_dp_rank])
+            if dp_gpus and dp_gpus.issubset(target):
+                out.append(dp_rank)
+        if not out:
+            raise RuntimeError("No dp ranks matched target_gpus for expand")
+        return out
+
+    def _shrink_workers(self, *, dp_ranks_to_remove: List[int]) -> Dict[str, Any]:
+        """Pipeline-local shrink helper (ENG-123).
+
+        Serializes with a per-pipeline lock and performs:
+        - val routing-only shrink first (skip_offload=True)
+        - train shrink second (skip_offload=False; real offload)
+        """
+        if not isinstance(dp_ranks_to_remove, list) or not dp_ranks_to_remove:
+            raise ValueError("dp_ranks_to_remove must be a non-empty list[int]")
+        with self._infer_resize_lock:
+            val_metrics = ray.get(
+                self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks_to_remove, skip_offload=True)
+            )
+            train_metrics = ray.get(
+                self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks_to_remove, skip_offload=False)
+            )
+            out = dict(train_metrics or {})
+            out["val_result"] = val_metrics
+            return out
+
+    def _expand_workers(self, *, dp_ranks_to_add: List[int], train_skip_load: bool) -> Dict[str, Any]:
+        """Pipeline-local expand helper (ENG-123).
+
+        Serializes with a per-pipeline lock and performs:
+        - train expand first (skip_load=train_skip_load)
+        - val routing-only expand second (skip_load=True)
+        """
+        if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
+            raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
+        with self._infer_resize_lock:
+            train_metrics = ray.get(
+                self.train_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=bool(train_skip_load))
+            )
+            val_metrics = ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=True))
+            out = dict(train_metrics or {})
+            out["val_result"] = val_metrics
+            return out
 
     @torch.no_grad()
     def run(self):
@@ -245,19 +375,19 @@ class AgenticPipeline(BasePipeline):
                     #          model_update just loaded states to [0,1,2,3], so update routing state to match.
                     #          Use skip_load=True to avoid re-loading already-loaded model states.
                     if self.partial_gpu_mode and global_step > 0:
-                        target_gpus = []
-                        if hasattr(self.actor_train.worker_config, 'device_mapping') and self.actor_train.worker_config.device_mapping:
-                            target_gpus.extend(self.actor_train.worker_config.device_mapping)
-                        if self.pipeline_config.adv_estimator == "gae":
-                            if hasattr(self.critic.worker_config, 'device_mapping') and self.critic.worker_config.device_mapping:
-                                target_gpus.extend(self.critic.worker_config.device_mapping)
-
-                        if target_gpus:
-                            expand_metrics = ray.get(
-                                self.train_rollout_scheduler.expand_sampler.remote(target_gpus, skip_load=True)
-                            )
-                            logger.info(f"Expand routing state (skip_load): {expand_metrics}")
-                            metrics.update({"expand/" + k: v for k, v in expand_metrics.items()})
+                        # Routing restore after model_update: model_update loaded states to all GPUs in actor_infer's
+                        # device_mapping. Expand should restore routing without re-loading.
+                        #
+                        # Expand selection rule (current requirement): add a dp-rank iff its full dp-slice (the
+                        # gpus_per_dp_rank-sized slice in device_mapping) is fully contained in the available GPU set.
+                        #
+                        # TODO/FIXME: This assumes dp-rank slices align with the trainer boundary (i.e., a dp slice is
+                        # not split across "trainer-owned" vs "infer-owned" GPU sets). If a rollout dp-rank ever spans
+                        # that boundary, this translation will need to change (likely operate in dp-rank space end-to-end).
+                        dp_ranks_to_add = self._target_gpus_to_dp_ranks_to_add(target_gpus=list(self._infer_device_mapping))
+                        expand_metrics = self._expand_workers(dp_ranks_to_add=dp_ranks_to_add, train_skip_load=True)
+                        logger.info(f"Expand routing state: {expand_metrics}")
+                        metrics.update({"expand/" + k: v for k, v in expand_metrics.items()})
 
                     batch: DataProto = DataProto()
                     batch.meta_info = {"global_step": global_step}
@@ -328,7 +458,8 @@ class AgenticPipeline(BasePipeline):
                                     target_gpus.extend(self.critic.worker_config.device_mapping)
 
                             assert target_gpus, "cannot be empty"
-                            shrink_metrics = ray.get(self.train_rollout_scheduler.shrink_sampler.remote(target_gpus))
+                            dp_ranks_to_remove = self._target_gpus_to_dp_ranks_to_remove(target_gpus=list(target_gpus))
+                            shrink_metrics = self._shrink_workers(dp_ranks_to_remove=dp_ranks_to_remove)
                             logger.info(f"Shrink sampler: {shrink_metrics}")
                             metrics.update({"shrink/" + k: v for k, v in shrink_metrics.items()})
                         metrics["time/step_shrink"] = shrink_timer.last

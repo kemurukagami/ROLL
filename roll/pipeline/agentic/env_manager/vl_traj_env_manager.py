@@ -184,6 +184,8 @@ class VLTrajEnvManager(TrajEnvManager):
                     self.stop_reason = EpisodeStopReason.MAX_LENGTH
                 elif generation_stop_reason == GenerateStopReason.ABORT:
                     self.stop_reason = EpisodeStopReason.ABORT
+                    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+                        self.rollout_cache.attempt += 1
             log_stats["current_step"].append(self.current_step)
             log_stats["generate_time"].append(generate_timer.last)
 
@@ -223,6 +225,7 @@ class VLTrajEnvManager(TrajEnvManager):
         suffix = info.pop("suffix", None)
 
         self.rollout_cache.step += 1
+        self.rollout_cache.attempt = 0
         self.rollout_cache.terminated = terminated
         self.rollout_cache.truncated = truncated
         if self.rollout_cache.step >= self.env_config.max_steps:

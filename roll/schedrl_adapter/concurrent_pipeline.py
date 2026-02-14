@@ -39,7 +39,7 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
     """SchedRL-controlled variant of ROLL AgenticPipeline (ENG-123 Phase 3).
 
     Key differences from upstream AgenticPipeline.run():
-    - Before each rollout, request generation GPUs from SchedRL and expand actor_infer accordingly.
+    - Before each rollout, request generation GPUs from SchedRL (scheduler drives expand via adapter).
     - After each rollout, shrink actor_infer to zero and release allocation back to SchedRL.
     - Validation runs synchronously to avoid racing with shrink/release.
     """
@@ -54,6 +54,24 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
         except Exception as e:
             raise RuntimeError("Failed to resolve schedrl:scheduler in namespace 'schedrl'") from e
         self._actor_infer_cluster_id = f"{self._pipeline_id}_actor_infer"
+        self._ensure_model_update_service()
+
+    def _ensure_model_update_service(self) -> None:
+        from roll.schedrl_adapter.model_update_service import ModelUpdateService
+        from roll.utils.constants import RAY_NAMESPACE
+
+        ModelUpdateSvc = ModelUpdateService.options(
+            name=f"{self._pipeline_id}_model_update_service",
+            namespace=RAY_NAMESPACE,
+            get_if_exists=True,
+            max_restarts=0,
+            max_task_retries=0,
+        )
+        ModelUpdateSvc.remote(
+            pipeline_id=self._pipeline_id,
+            src_cluster=self.actor_train,
+            tgt_cluster=self.actor_infer,
+        )
 
     def _actor_infer_device_mapping(self) -> List[int]:
         mapping = getattr(self.pipeline_config.actor_infer, "device_mapping", None)
@@ -66,6 +84,17 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
         if not all(isinstance(x, int) and x >= 0 for x in mapping):
             raise RuntimeError("actor_infer.device_mapping must be list[int>=0]")
         return list(mapping)
+
+    def _actor_infer_all_dp_ranks(self) -> List[int]:
+        infer_strategy_config = self.actor_infer.worker_config.strategy_args.strategy_config
+        tp_size = int(infer_strategy_config.get("tensor_parallel_size", 1))
+        pp_size = int(infer_strategy_config.get("pipeline_parallel_size", 1))
+        gpus_per_dp_rank = tp_size * pp_size
+        device_mapping = self._actor_infer_device_mapping()
+        if len(device_mapping) % int(gpus_per_dp_rank) != 0:
+            raise RuntimeError("actor_infer.device_mapping length must be divisible by gpus_per_dp_rank")
+        max_dp = len(device_mapping) // int(gpus_per_dp_rank)
+        return list(range(int(max_dp)))
 
     def _request_and_expand_actor_infer(self, *, global_step: int) -> List[int]:
         from schedrl.protocol.types import Priority
@@ -84,16 +113,6 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
             raise RuntimeError(
                 f"schedrl:scheduler allocated empty GPU list for cluster_id={self._actor_infer_cluster_id!r}"
             )
-
-        expand_metrics = ray.get(self.train_rollout_scheduler.expand_sampler.remote(allocated, skip_load=False))
-        logger.info(
-            f"[schedrl][{self._pipeline_id}] expand actor_infer: step={global_step} gpus={sorted(allocated)} {expand_metrics}"
-        )
-        # Keep val RequestScheduler routing consistent with train (same infer cluster; no extra loads).
-        val_expand_metrics = ray.get(self.val_rollout_scheduler.expand_sampler.remote(allocated, skip_load=True))
-        logger.info(
-            f"[schedrl][{self._pipeline_id}] expand actor_infer(val): step={global_step} gpus={sorted(allocated)} {val_expand_metrics}"
-        )
         return allocated
 
     def _notify_ready_to_release_actor_infer(self, *, global_step: int, planned_release_gpu_ids: List[int]) -> List[int]:
@@ -131,9 +150,10 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
         # Start from a well-defined state: actor_infer offloaded + routing disabled until we request GPUs.
         ray.get(self.train_rollout_scheduler.suspend.remote())
         try:
-            ray.get(self.train_rollout_scheduler.shrink_sampler.remote(self._actor_infer_device_mapping()))
+            dp_ranks = self._actor_infer_all_dp_ranks()
+            ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks))
             ray.get(self.val_rollout_scheduler.suspend.remote())
-            ray.get(self.val_rollout_scheduler.shrink_sampler.remote(self._actor_infer_device_mapping()))
+            ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks))
         except Exception:
             # Fail-fast semantics: if this doesn't work, the pipeline can't be safely controlled by SchedRL.
             raise
@@ -378,6 +398,13 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                             actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
                             actor_train_metrics: DataProto = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
                             metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+                            checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
+                            ray.get(
+                                [
+                                    worker.promote_active_checkpoint.remote(checkpoint_version, int(global_step))
+                                    for worker in self.actor_train.workers
+                                ]
+                            )
 
                         if self.pipeline_config.adv_estimator == "gae":
                             critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
@@ -465,6 +492,19 @@ class SchedRLConcurrentPipeline:
             raise ValueError("pipeline_id must be non-empty str")
         self._pipeline_id = pipeline_id
         self._pipeline: Optional[_SchedRLAgenticPipeline] = None
+
+    def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> Dict[str, Any]:
+        if self._pipeline is None:
+            raise RuntimeError("Pipeline not initialized; call run() first")
+        if not isinstance(dp_ranks_to_remove, list):
+            raise ValueError("dp_ranks_to_remove must be list[int]")
+        if not isinstance(dp_ranks_to_add, list):
+            raise ValueError("dp_ranks_to_add must be list[int]")
+        if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
+            raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
+        if dp_ranks_to_remove:
+            return self._pipeline._shrink_workers(dp_ranks_to_remove=list(dp_ranks_to_remove))
+        return self._pipeline._expand_workers(dp_ranks_to_add=list(dp_ranks_to_add), train_skip_load=False)
 
     def run(self, *, pipeline_config: Any) -> None:
         self._pipeline = _SchedRLAgenticPipeline(pipeline_id=self._pipeline_id, pipeline_config=pipeline_config)

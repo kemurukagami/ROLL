@@ -73,6 +73,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                     self.stop_reason = EpisodeStopReason.MAX_LENGTH
                 elif stop_reason == GenerateStopReason.ABORT:
                     self.stop_reason = EpisodeStopReason.ABORT
+                    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+                        self.rollout_cache.attempt += 1
             self.log_stats["current_step"].append(self.current_step)
             self.log_stats["generate_time"].append(round(generate_timer.last))
 
@@ -139,6 +141,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         observation, reward, terminated, truncated, info = self.env.step(action=response)
 
         self.rollout_cache.step += 1
+        self.rollout_cache.attempt = 0
 
         # terminated 完全由swe|tb env决定
         self.rollout_cache.terminated = terminated

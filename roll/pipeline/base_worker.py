@@ -456,6 +456,12 @@ class InferWorker(Worker):
     async def setup_collective_group(self, *args, **kwargs):
         await self.strategy.setup_collective_group(*args, **kwargs)
 
+    async def destroy_collective_group(self, group_name: str):
+        destroy = getattr(self.strategy, "destroy_collective_group", None)
+        if not callable(destroy):
+            raise RuntimeError(f"{type(self.strategy).__name__} does not support destroy_collective_group")
+        await destroy(group_name)
+
     async def start_model_update(self, *args, **kwargs):
         raise NotImplementedError
 

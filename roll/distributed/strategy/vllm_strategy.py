@@ -363,6 +363,9 @@ class VllmStrategy(InferenceStrategy):
     async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
         await self.model.update_parameter_in_bucket(serialized_named_tensors, is_lora)
 
+    async def destroy_collective_group(self, group_name: str):
+        await self.model.destroy_collective_group(group_name)
+
     async def add_lora(self, peft_config):
         peft_config["target_modules"] = set(self.worker_config.model_args.lora_target)
         await self.model.add_lora(peft_config)

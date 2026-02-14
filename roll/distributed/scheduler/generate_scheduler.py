@@ -6,6 +6,7 @@ import math
 import uuid
 import time
 import sys
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
 from itertools import cycle
@@ -35,6 +36,7 @@ from roll.utils.taskgroups import TaskGroup # TODO use official TaskGroup after 
 from roll.utils.metrics.metrics_manager import DurationTracker
 from roll.utils.import_utils import safe_import_class
 from roll.utils.logging import get_logger
+from roll.utils.constants import RAY_NAMESPACE
 
 
 logger = get_logger()
@@ -1337,7 +1339,6 @@ class RequestScheduler:
         # Active DP ranks for request routing
         self.active_dp_ranks: Set[int] = set(range(self.infer_cluster.world_size))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
-        self.swapping_lock = asyncio.Lock()  # Serialize shrink/expand lifecycle operations
 
     async def generate_one_request(self, data: DataProto):
         # NOTE: do not block while holding routing_lock. Re-check suspend after acquiring lock
@@ -1845,7 +1846,21 @@ class RequestScheduler:
                 if dp_rank in self.active_dp_ranks:
                     raise ValueError(f"[expand] DP rank {dp_rank} already active")
 
-    async def shrink_workers(self, target_gpus: List[int]) -> Dict[str, Any]:
+    def _validate_dp_ranks_input(self, dp_ranks: List[int], *, mode: str) -> List[int]:
+        if not isinstance(dp_ranks, list) or not dp_ranks:
+            raise ValueError(f"{mode}: dp_ranks must be a non-empty list[int]")
+        out: List[int] = []
+        for x in dp_ranks:
+            if not isinstance(x, int):
+                raise TypeError(f"{mode}: dp_ranks must be list[int], got element {type(x).__name__}")
+            if not (0 <= x < self.infer_cluster.world_size):
+                raise ValueError(f"{mode}: dp_rank {x} out of range [0, {self.infer_cluster.world_size})")
+            out.append(int(x))
+        if len(out) != len(set(out)):
+            raise ValueError(f"{mode}: dp_ranks contains duplicates")
+        return out
+
+    async def shrink_workers(self, dp_ranks: List[int], skip_offload: bool = False) -> Dict[str, Any]:
         """Complete atomic shrink operation: validate → rebalance → offload → update routing.
 
         Orchestrates the full worker shrink process:
@@ -1884,30 +1899,28 @@ class RequestScheduler:
             - Offloads model states from shrinking workers to CPU
         """
         start_time = time.time()
-        async with self.swapping_lock:
-            # VAL: VAL_NON_EMPTY, VAL_NO_DUPLICATES
-            self._validate_target_gpus(target_gpus, mode="shrink")
-            # Calculate DP ranks to offload
-            target_gpus = set(target_gpus)
-            offload_ranks = [dp for dp in range(self.infer_cluster.world_size)
-                             if set(self._get_gpus_for_dp_rank(dp)).intersection(target_gpus)]
+        offload_ranks = self._validate_dp_ranks_input(dp_ranks, mode="shrink")
 
-            # VAL: VAL_NON_EMPTY, state consistency check
-            self._validate_calculated_ranks(offload_ranks, mode="shrink")
+        # VAL: VAL_NON_EMPTY, state consistency check
+        self._validate_calculated_ranks(offload_ranks, mode="shrink")
 
-            # Atomic operation under routing_lock
-            async with self.routing_lock:
-                # Rebalance (abort + update active_dp_ranks)
-                result = await self.rebalance_on_shrink(offload_ranks)
+        # Atomic routing update under routing_lock
+        async with self.routing_lock:
+            # Rebalance (abort + update active_dp_ranks)
+            result = await self.rebalance_on_shrink(offload_ranks)
 
+        if not bool(skip_offload):
             # Offload states from target workers
             offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
             await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
 
-            return {**result, "shrink_duration_ms": (time.time() - start_time) * 1000,
-                    "offload_ranks": offload_ranks}
+        return {
+            **result,
+            "shrink_duration_ms": (time.time() - start_time) * 1000,
+            "offload_ranks": offload_ranks,
+        }
 
-    async def expand_workers(self, target_gpus: List[int], skip_load: bool = False) -> Dict[str, Any]:
+    async def expand_workers(self, dp_ranks: List[int], skip_load: bool = False) -> Dict[str, Any]:
         """Complete atomic expand operation: validate → load → rebalance → update routing.
 
         Orchestrates the full worker expand process:
@@ -1951,27 +1964,39 @@ class RequestScheduler:
             - Clears src_rank mappings for rebalanced environments (will route to new workers)
         """
         start_time = time.time()
-        async with self.swapping_lock:
-            # VAL: VAL_NON_EMPTY, VAL_NO_DUPLICATES
-            self._validate_target_gpus(target_gpus, mode="expand")
+        load_ranks = self._validate_dp_ranks_input(dp_ranks, mode="expand")
 
-            # Calculate DP ranks to restore
-            target_gpus = set(target_gpus)
-            load_ranks = [dp for dp in range(self.infer_cluster.world_size)
-                          if set(self._get_gpus_for_dp_rank(dp)).issubset(target_gpus)]
+        # Skip validation when skip_load=True because callers may pass ranks that are already active
+        # in active_dp_ranks (e.g., "restore routing to full set" semantics).
+        if not skip_load:
+            self._validate_calculated_ranks(load_ranks, mode="expand")
+            load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+            await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
 
-            # VAL: VAL_NON_EMPTY, state consistency check
-            # Skip validation when skip_load=True because ranks may already be "active" in cluster
-            # (model states loaded by model_update) but not tracked in active_dp_ranks yet
-            if not skip_load:
-                self._validate_calculated_ranks(load_ranks, mode="expand")
-                load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
-                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
+            if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and load_ranks:
+                pipeline_id = os.environ.get("PIPELINE_ID") or None
+                if not pipeline_id:
+                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+                try:
+                    model_update_service = ray.get_actor(
+                        f"{pipeline_id}_model_update_service",
+                        namespace=RAY_NAMESPACE,
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Failed to resolve ModelUpdateService for pipeline_id={pipeline_id!r} "
+                        f"(expected name={pipeline_id}_model_update_service in namespace={RAY_NAMESPACE!r})"
+                    ) from e
+                ref = model_update_service.sync_selected_workers.remote(load_ranks)
+                await asyncio.wrap_future(ref.future())
 
-            # Atomic operation under routing_lock
-            async with self.routing_lock:
-                # Rebalance (update active_dp_ranks + conditional abort)
-                result = await self.rebalance_on_expand(load_ranks)
+        # Atomic operation under routing_lock
+        async with self.routing_lock:
+            # Rebalance (update active_dp_ranks + conditional abort)
+            result = await self.rebalance_on_expand(load_ranks)
 
-            return {**result, "expand_duration_ms": (time.time() - start_time) * 1000,
-                    "load_ranks": load_ranks}
+        return {
+            **result,
+            "expand_duration_ms": (time.time() - start_time) * 1000,
+            "load_ranks": load_ranks,
+        }

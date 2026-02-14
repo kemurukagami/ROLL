@@ -2,6 +2,15 @@ import enum
 import os
 
 
+_SCHEDRL_CONTROL_PLANE = os.environ.get("SCHEDRL_CONTROL_PLANE", "")
+if _SCHEDRL_CONTROL_PLANE == "schedrl":
+    ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
+    if not ray_namespace:
+        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set before importing roll.*")
+    pipeline_id = os.environ.get("PIPELINE_ID")
+    if not pipeline_id:
+        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set before importing roll.*")
+
 RAY_NAMESPACE = os.environ.get("ROLL_RAY_NAMESPACE", "roll")
 GLOBAL_STORAGE_NAMESPACE = "global_storage_namespace"
 STORAGE_NAME = "SHARED_STORAGE_ACTOR"

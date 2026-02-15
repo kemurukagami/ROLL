@@ -65,27 +65,6 @@ def _resolve_hydra_config_path(*, roll_root: Path, arg_config_path: str) -> tupl
     )
 
 
-def _inject_system_envs(*, pipeline_config: Any, envs: Dict[str, str]) -> None:
-    def _update_system_envs(obj: Any) -> None:
-        if obj is None:
-            return
-        system_envs = getattr(obj, "system_envs", None)
-        if system_envs is None:
-            setattr(obj, "system_envs", dict(envs))
-            return
-        if not isinstance(system_envs, dict):
-            raise RuntimeError(f"Expected system_envs to be dict, got {type(system_envs).__name__}")
-        system_envs.update(envs)
-
-    _update_system_envs(getattr(pipeline_config, "actor_train", None))
-    _update_system_envs(getattr(pipeline_config, "actor_infer", None))
-    _update_system_envs(getattr(pipeline_config, "reference", None))
-    _update_system_envs(getattr(pipeline_config, "critic", None))
-    _update_system_envs(getattr(pipeline_config, "reward", None))
-    _update_system_envs(getattr(pipeline_config, "train_env_manager", None))
-    _update_system_envs(getattr(pipeline_config, "val_env_manager", None))
-
-
 def _cluster_registry_inputs(*, pipeline_config: Any) -> tuple[Dict[str, int], Dict[str, List[int]]]:
     cluster_tp_configs: Dict[str, int] = {}
     cluster_device_mappings: Dict[str, List[int]] = {}
@@ -212,17 +191,12 @@ def main() -> None:
         ).remote(
             pipeline_id=pipeline_id,
             pipeline_config=pipeline_config,
-            cluster_tp_configs=cluster_tp_configs,
-            cluster_device_mappings=cluster_device_mappings,
         )
         adapters.append(adapter)
 
-        envs = ray.get(adapter.get_pipeline_env_vars.remote())
-        _inject_system_envs(pipeline_config=pipeline_config, envs=envs)
-
-        coordinator = ray.get(adapter.ensure_coordinator.remote())
+        coordinator = ray.get(adapter.create_coordinator.remote(pipeline_config=pipeline_config))
         coordinators.append(coordinator)
-        run_refs.append(coordinator.run.remote(pipeline_config=pipeline_config))
+        run_refs.append(coordinator.run.remote())
 
         if admit_delay_s > 0 and i < len(pipeline_ids) - 1:
             import time

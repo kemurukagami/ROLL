@@ -384,7 +384,14 @@ class GroupQueueManager:
             try:
                 self._schedrl_scheduler = ray.get_actor("schedrl:scheduler", namespace="schedrl")
             except Exception as e:
-                raise RuntimeError("Failed to resolve schedrl:scheduler in namespace 'schedrl'") from e
+                # Expectation: the central schedrl scheduler actor ('schedrl:scheduler')
+                # must already be created before GroupQueueManager is instantiated.
+                # Fail loudly with a clear message to aid debugging of startup ordering.
+                raise RuntimeError(
+                    "Failed to resolve schedrl:scheduler in namespace 'schedrl'. "
+                    "GroupQueueManager expects the central scheduler actor to be present before startup; "
+                    "ensure the orchestrator created it earlier or that startup ordering is correct."
+                ) from e
 
         group_filter_cls = safe_import_class(env_manager_config.group_filter_cls)
         assert group_filter_cls
@@ -440,13 +447,36 @@ class GroupQueueManager:
             self._mark_new_batch()
             self._maybe_emit_progress(current_train_step=None)
 
+    def _resolve_num_return_sequences(self) -> int:
+        # SchedRL progress should be expressed in "trajectory units" that match the rollout batch contract.
+        #
+        # In ROLL's request scheduler, the effective number of finished samples required for a "batch" is
+        # `batch_size * num_return_sequences` (not scaled by async_generation_ratio).
+        raw = None
+        generating_args = getattr(self.env_manager_config, "generating_args", None)
+        if generating_args is not None:
+            raw = getattr(generating_args, "num_return_sequences", None)
+        if raw is None:
+            actor_infer = getattr(self.config, "actor_infer", None)
+            generating_args = getattr(actor_infer, "generating_args", None) if actor_infer is not None else None
+            if generating_args is not None:
+                raw = getattr(generating_args, "num_return_sequences", None)
+
+        n = 1 if raw is None else int(raw)
+        if n <= 0:
+            raise RuntimeError(f"Invalid num_return_sequences={raw!r}; expected > 0")
+        return n
+
     def _estimate_total_required(self) -> int:
         if self.max_traj_per_env is None:
             return 0
-        episodes_per_group = (self.async_generation_ratio + 1) * self.max_traj_per_env
-        return len(self.group_queue) * episodes_per_group * self.group_size
+        # Denominator for progress is the per-step rollout batch target (trajectory units).
+        # It must not depend on async_generation_ratio (async controls overlap/pausing, not the required sample count).
+        num_return_sequences = self._resolve_num_return_sequences()
+        return int(self.rollout_batch_size) * int(num_return_sequences)
 
     def _mark_new_batch(self) -> None:
+        self._progress_total_required_estimated = self._estimate_total_required()
         self._progress_new_batch = True
 
     def _compute_progress(self) -> Tuple[int, int, int, Optional[float]]:

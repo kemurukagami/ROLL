@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import os
 import asyncio
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
+import ray
 
-def _require_ray():
-    try:
-        import ray  # noqa: F401
-    except Exception as e:
-        raise RuntimeError("roll.schedrl_adapter requires ray") from e
+from schedrl.protocol.request_id import validate_pipeline_id
+from schedrl.protocol.types import ActionResponse
 
 
 def _get_pipeline_namespace(pipeline_id: str) -> str:
@@ -18,9 +14,6 @@ def _get_pipeline_namespace(pipeline_id: str) -> str:
 
 
 def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[str, str]:
-    _require_ray()
-    import ray
-
     job_id = ray.get_runtime_context().get_job_id()
     scratch_root = f"/tmp/schedrl/{pipeline_id}/{job_id}"
     shared_root = "/tmp/schedrl/shared"
@@ -75,14 +68,6 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
         raise RuntimeError("ENG-123 Phase 3 requires actor_infer vLLM sleep_level=2 (drop model weights on offload).")
 
 
-@dataclass(frozen=True, slots=True)
-class PipelineRegistration:
-    pipeline_id: str
-    ray_namespace: str
-    cluster_tp_configs: Dict[str, int]
-    cluster_device_mappings: Dict[str, List[int]]
-
-
 class SchedRLAdapter:
     """Per-pipeline adapter actor (ENG-123 Phase 3).
 
@@ -96,14 +81,7 @@ class SchedRLAdapter:
         *,
         pipeline_id: str,
         pipeline_config: Any,
-        cluster_tp_configs: Dict[str, int],
-        cluster_device_mappings: Dict[str, List[int]],
     ):
-        _require_ray()
-        import ray
-
-        from schedrl.protocol.request_id import validate_pipeline_id
-
         validate_pipeline_id(pipeline_id)
         self._pipeline_id = pipeline_id
         self._ray_namespace = _get_pipeline_namespace(pipeline_id)
@@ -112,23 +90,6 @@ class SchedRLAdapter:
         _validate_cpu_only_reward(pipeline_config=pipeline_config)
         _validate_vllm_sleep_level(pipeline_config=pipeline_config)
 
-        if not isinstance(cluster_tp_configs, dict) or not cluster_tp_configs:
-            raise ValueError("cluster_tp_configs must be non-empty dict[str,int]")
-        if not isinstance(cluster_device_mappings, dict) or not cluster_device_mappings:
-            raise ValueError("cluster_device_mappings must be non-empty dict[str,list[int]]")
-        if set(cluster_tp_configs.keys()) != set(cluster_device_mappings.keys()):
-            raise ValueError("cluster_tp_configs and cluster_device_mappings must have identical keys")
-        if "actor_infer" not in cluster_tp_configs:
-            raise ValueError("cluster_tp_configs must include 'actor_infer'")
-
-        self._registration = PipelineRegistration(
-            pipeline_id=pipeline_id,
-            ray_namespace=self._ray_namespace,
-            cluster_tp_configs={k: int(v) for k, v in cluster_tp_configs.items()},
-            cluster_device_mappings={k: list(v) for k, v in cluster_device_mappings.items()},
-        )
-
-        self._schedrl_orchestrator = ray.get_actor("schedrl:orchestrator", namespace="schedrl")
         self._coordinator = None
         # NOTE: infer resize serialization is owned by the per-pipeline pipeline-side resize actor.
 
@@ -138,36 +99,27 @@ class SchedRLAdapter:
         # - orchestrator.admit_pipeline(...)
         # before creating this adapter actor.
 
-    def get_registration(self) -> PipelineRegistration:
-        return self._registration
-
-    def get_pipeline_env_vars(self) -> Dict[str, str]:
-        return dict(self._pipeline_env_vars)
-
-    def ensure_coordinator(self) -> Any:
-        _require_ray()
-        import ray
-
+    def create_coordinator(self, *, pipeline_config: Any) -> Any:
         if self._coordinator is not None:
             return self._coordinator
 
         from roll.schedrl_adapter.concurrent_pipeline import SchedRLConcurrentPipeline
 
         Coordinator = ray.remote(SchedRLConcurrentPipeline)
+        # Safety: always inject env vars before constructing the coordinator, so callers can't
+        # accidentally create a pipeline with missing system_envs.
+        self._inject_pipeline_env_vars(pipeline_config=pipeline_config)
         self._coordinator = Coordinator.options(
             name=f"schedrl:pipeline:{self._pipeline_id}",
             namespace=self._ray_namespace,
             get_if_exists=True,
             max_restarts=0,
             max_task_retries=0,
+            # Critical: allow resize RPCs to run while `run()` is in-flight.
+            max_concurrency=1000,
             runtime_env={"env_vars": dict(self._pipeline_env_vars)},
-        ).remote(pipeline_id=self._pipeline_id)
+        ).remote(pipeline_id=self._pipeline_id, pipeline_config=pipeline_config)
         return self._coordinator
-
-    def start_pipeline(self, *, pipeline_config: Any) -> None:
-        self._inject_pipeline_env_vars(pipeline_config=pipeline_config)
-        coordinator = self.ensure_coordinator()
-        coordinator.run.remote(pipeline_config=pipeline_config)
 
     def _inject_pipeline_env_vars(self, *, pipeline_config: Any) -> None:
         envs = dict(self._pipeline_env_vars)
@@ -194,28 +146,7 @@ class SchedRLAdapter:
         _update_system_envs(getattr(pipeline_config, "train_env_manager", None))
         _update_system_envs(getattr(pipeline_config, "val_env_manager", None))
 
-    def _dp_ranks_to_gpu_ids(self, *, dp_ranks: List[int]) -> List[int]:
-        cfg = self._registration
-        tp_size = int(cfg.cluster_tp_configs["actor_infer"])
-        device_mapping = list(cfg.cluster_device_mappings["actor_infer"])
-        if tp_size <= 0:
-            raise RuntimeError(f"Invalid actor_infer tp_size={tp_size}")
-        if not device_mapping:
-            raise RuntimeError("actor_infer device_mapping is empty")
-        if len(device_mapping) % tp_size != 0:
-            raise RuntimeError("actor_infer device_mapping length must be divisible by tp_size")
-
-        max_dp = len(device_mapping) // tp_size
-        gpu_ids: List[int] = []
-        for dp_rank in dp_ranks:
-            r = int(dp_rank)
-            if not (0 <= r < max_dp):
-                raise ValueError(f"dp_rank {r} out of range [0, {max_dp})")
-            start = r * tp_size
-            gpu_ids.extend(device_mapping[start : start + tp_size])
-        return sorted(set(int(x) for x in gpu_ids))
-
-    async def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> Dict[str, Any]:
+    async def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         """Pipeline-scoped resize for actor_infer (ENG-123).
 
         Contract: exactly one of {dp_ranks_to_remove, dp_ranks_to_add} must be non-empty.
@@ -228,15 +159,12 @@ class SchedRLAdapter:
         requests continue on remaining ranks. Shrink-to-zero and expand-from-zero are handled internally via
         need_suspend/resume().
         """
-        _require_ray()
         if not isinstance(dp_ranks_to_remove, list):
             raise ValueError("dp_ranks_to_remove must be list[int]")
         if not isinstance(dp_ranks_to_add, list):
             raise ValueError("dp_ranks_to_add must be list[int]")
         if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
             raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
-        _require_ray()
-        import ray
 
         # NOTE: adapter does not coordinate train/val request schedulers directly; it delegates to the
         # per-pipeline coordinator actor (single serialization boundary owned by pipeline runtime).
@@ -253,4 +181,5 @@ class SchedRLAdapter:
             dp_ranks_to_remove=list(dp_ranks_to_remove),
             dp_ranks_to_add=list(dp_ranks_to_add),
         )
-        return await asyncio.wrap_future(ref.future())
+        await asyncio.wrap_future(ref.future())
+        return ActionResponse(success=True)

@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 import ray
 import torch
 from codetiming import Timer
 from ray.util.timer import _Timer
+
+from schedrl.protocol.types import ActionResponse
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import AgenticPipeline
@@ -35,7 +37,7 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 logger = get_logger()
 
 
-class _SchedRLAgenticPipeline(AgenticPipeline):
+class SchedRLConcurrentPipeline(AgenticPipeline):
     """SchedRL-controlled variant of ROLL AgenticPipeline (ENG-123 Phase 3).
 
     Key differences from upstream AgenticPipeline.run():
@@ -52,8 +54,18 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
         try:
             self._schedrl_scheduler = ray.get_actor("schedrl:scheduler", namespace="schedrl")
         except Exception as e:
-            raise RuntimeError("Failed to resolve schedrl:scheduler in namespace 'schedrl'") from e
+            # Expectation: the central schedrl scheduler actor ('schedrl:scheduler')
+            # must already be created before the pipeline is instantiated.
+            # Fail loudly with a clear message to aid debugging of startup ordering.
+            raise RuntimeError(
+                "Failed to resolve schedrl:scheduler in namespace 'schedrl'. "
+                "The pipeline expects the central scheduler actor to be present before startup; "
+                "ensure the orchestrator created it earlier or that startup ordering is correct."
+            ) from e
         self._actor_infer_cluster_id = f"{self._pipeline_id}_actor_infer"
+        self._actor_train_cluster_id = f"{self._pipeline_id}_actor_train"
+        self._critic_cluster_id = f"{self._pipeline_id}_critic"
+        self._reference_cluster_id = f"{self._pipeline_id}_reference"
         self._ensure_model_update_service()
 
     def _ensure_model_update_service(self) -> None:
@@ -115,6 +127,24 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
             )
         return allocated
 
+    def _request_static_cluster(self, *, cluster_id: str, priority: Any, global_step: int) -> List[int]:
+        allocated = ray.get(
+            self._schedrl_scheduler.request_gpus.remote(
+                cluster_id=str(cluster_id),
+                priority=priority,
+                global_step=global_step,
+            )
+        )
+        if not isinstance(allocated, list):
+            raise RuntimeError(f"schedrl:scheduler.request_gpus returned non-list: {type(allocated).__name__}")
+        allocated = [int(x) for x in allocated]
+        if not allocated:
+            raise RuntimeError(f"schedrl:scheduler allocated empty GPU list for cluster_id={cluster_id!r}")
+        return allocated
+
+    def _release_static_cluster(self, *, cluster_id: str, global_step: int) -> None:
+        ray.get(self._schedrl_scheduler.release_gpus.remote(cluster_id=str(cluster_id), global_step=global_step))
+
     def _notify_ready_to_release_actor_infer(self, *, global_step: int, planned_release_gpu_ids: List[int]) -> List[int]:
         timeout_s_raw = os.environ.get("SCHEDRL_NOTIFY_READY_TIMEOUT_S", "300")
         try:
@@ -170,6 +200,8 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                     # PHASE 1: Offload States
                     if self.pipeline_config.adv_estimator == "gae":
                         self.critic.offload_states(blocking=True)
+                    if self.pipeline_config.enable_reference and self.use_ref_model:
+                        self.reference.offload_states(blocking=True)
                     self.actor_train.offload_states(blocking=True)
 
                     # PHASE 2: Suspend rollout scheduler to pause request processing
@@ -234,6 +266,21 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                     metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
 
                     # PHASE 11: Reference Log Probs
+                    if self.pipeline_config.enable_reference:
+                        from schedrl.protocol.types import Priority
+
+                        if self.use_ref_model:
+                            self._request_static_cluster(
+                                cluster_id=self._reference_cluster_id,
+                                priority=Priority.REF_LOG_PROBS,
+                                global_step=global_step,
+                            )
+                        else:
+                            self._request_static_cluster(
+                                cluster_id=self._actor_train_cluster_id,
+                                priority=Priority.REF_LOG_PROBS,
+                                global_step=global_step,
+                            )
                     with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
                         if self.pipeline_config.enable_reference:
                             worker_config = (
@@ -273,6 +320,13 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                             metrics.update(reduce_metrics(ref_log_probs.meta_info.pop("metrics", {})))
                             metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
                     metrics["time/step_ref_log_probs_values_reward"] = cal_timer.last
+                    if self.pipeline_config.enable_reference:
+                        if self.use_ref_model:
+                            self.reference.offload_states(blocking=True)
+                            self._release_static_cluster(cluster_id=self._reference_cluster_id, global_step=global_step)
+                        else:
+                            self.actor_train.offload_states(blocking=True)
+                            self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
 
                     # PHASE 12: Old Log Probs & Values
                     with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
@@ -280,6 +334,13 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                             batch.meta_info["disable_adapter"] = False
                         batch.meta_info["is_offload_states"] = False
                         if self.pipeline_config.enable_old_logprobs_recompute:
+                            from schedrl.protocol.types import Priority
+
+                            self._request_static_cluster(
+                                cluster_id=self._actor_train_cluster_id,
+                                priority=Priority.OLD_LOG_PROBS,
+                                global_step=global_step,
+                            )
                             batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
                             if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
                                 batch, dynamic_batching_metrics = dynamic_batching_shard(
@@ -309,16 +370,27 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                                 loss_agg_mode="token-mean",
                             )
                             metrics.update({"critic/entropy/mean": agg_entropy.item()})
+                            self.actor_train.offload_states(blocking=True)
+                            self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
                         else:
                             batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
 
                         if self.pipeline_config.adv_estimator == "gae":
+                            from schedrl.protocol.types import Priority
+
+                            self._request_static_cluster(
+                                cluster_id=self._critic_cluster_id,
+                                priority=Priority.VALUE_COMPUTE,
+                                global_step=global_step,
+                            )
                             values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
 
                         if self.pipeline_config.adv_estimator == "gae":
                             values = DataProto.materialize_concat(data_refs=values_refs)
                             batch = batch.union(values)
                             metrics.update(reduce_metrics(values.meta_info.pop("metrics", {})))
+                            self.critic.offload_states(blocking=True)
+                            self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
 
                         if not self.pipeline_config.enable_reference:
                             batch.batch["ref_log_probs"] = batch.batch["old_log_probs"].clone()
@@ -368,9 +440,23 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                     # PHASE 14: Training (critic + actor)
                     with Timer(name="train_timer", logger=None) as train_timer:
                         if self.pipeline_config.adv_estimator == "gae":
+                            from schedrl.protocol.types import Priority
+
+                            self._request_static_cluster(
+                                cluster_id=self._critic_cluster_id,
+                                priority=Priority.CRITIC_TRAINING,
+                                global_step=global_step,
+                            )
                             critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
                         if self.pipeline_config.critic_warmup <= global_step:
+                            from schedrl.protocol.types import Priority
+
+                            self._request_static_cluster(
+                                cluster_id=self._actor_train_cluster_id,
+                                priority=Priority.ACTOR_TRAINING,
+                                global_step=global_step,
+                            )
                             batch_balance_metrics = batch_balance(
                                 batch,
                                 dp_size=self.actor_train.dp_size,
@@ -405,10 +491,14 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
                                     for worker in self.actor_train.workers
                                 ]
                             )
+                            self.actor_train.offload_states(blocking=True)
+                            self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
 
                         if self.pipeline_config.adv_estimator == "gae":
                             critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
                             metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
+                            self.critic.offload_states(blocking=True)
+                            self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
                         tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                     metrics["time/step_train"] = train_timer.last
 
@@ -485,17 +575,7 @@ class _SchedRLAgenticPipeline(AgenticPipeline):
         ray.get([self.train_rollout_scheduler.shutdown.remote(), self.val_rollout_scheduler.shutdown.remote()])
         logger.info(f"[schedrl][{self._pipeline_id}] pipeline complete!")
 
-
-class SchedRLConcurrentPipeline:
-    def __init__(self, *, pipeline_id: str):
-        if not isinstance(pipeline_id, str) or pipeline_id == "":
-            raise ValueError("pipeline_id must be non-empty str")
-        self._pipeline_id = pipeline_id
-        self._pipeline: Optional[_SchedRLAgenticPipeline] = None
-
-    def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]) -> Dict[str, Any]:
-        if self._pipeline is None:
-            raise RuntimeError("Pipeline not initialized; call run() first")
+    def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         if not isinstance(dp_ranks_to_remove, list):
             raise ValueError("dp_ranks_to_remove must be list[int]")
         if not isinstance(dp_ranks_to_add, list):
@@ -503,9 +583,7 @@ class SchedRLConcurrentPipeline:
         if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
             raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
         if dp_ranks_to_remove:
-            return self._pipeline._shrink_workers(dp_ranks_to_remove=list(dp_ranks_to_remove))
-        return self._pipeline._expand_workers(dp_ranks_to_add=list(dp_ranks_to_add), train_skip_load=False)
-
-    def run(self, *, pipeline_config: Any) -> None:
-        self._pipeline = _SchedRLAgenticPipeline(pipeline_id=self._pipeline_id, pipeline_config=pipeline_config)
-        self._pipeline.run()
+            self._shrink_workers(dp_ranks_to_remove=list(dp_ranks_to_remove))
+        else:
+            self._expand_workers(dp_ranks_to_add=list(dp_ranks_to_add), train_skip_load=False)
+        return ActionResponse(success=True)

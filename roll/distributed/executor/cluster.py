@@ -132,6 +132,16 @@ class Cluster:
                 "CLUSTER_NAME": self.cluster_name,
                 "WORKER_NAME": worker_name,
             }
+            # Prevent TorchInductor from spawning subprocess pools in Ray worker processes.
+            # This environment can hit OS process/thread limits during startup (EAGAIN), which crashes workers.
+            env_vars.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
+            env_vars.setdefault("TORCH_COMPILE_DISABLE", "1")
+            env_vars.setdefault("RAY_num_server_call_thread", "1")
+            env_vars.setdefault("OMP_NUM_THREADS", "1")
+            env_vars.setdefault("MKL_NUM_THREADS", "1")
+            env_vars.setdefault("OPENBLAS_NUM_THREADS", "1")
+            env_vars.setdefault("NUMEXPR_NUM_THREADS", "1")
+            env_vars.setdefault("TOKENIZERS_PARALLELISM", "false")
 
             if rank != 0:
                 env_vars["MASTER_ADDR"] = self.master_addr

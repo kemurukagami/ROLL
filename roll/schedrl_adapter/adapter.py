@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+from pathlib import Path
 from typing import Any, Dict, List
 
 import ray
@@ -18,12 +20,24 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
     scratch_root = f"/tmp/schedrl/{pipeline_id}/{job_id}"
     shared_root = "/tmp/schedrl/shared"
 
+    # Ensure Ray worker processes can import both `schedrl` (repo root) and `roll` (ROLL root)
+    # even when started from non-repo working directories.
+    this_file = Path(__file__).resolve()
+    repo_root = str(this_file.parents[4])   # .../SchedRL
+    roll_root = str(this_file.parents[2])   # .../SchedRL/external/ROLL_schedrl
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    pythonpath_parts = [repo_root, roll_root]
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    pythonpath = os.pathsep.join(pythonpath_parts)
+
     env_vars = {
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
         "SCHEDRL_CONTROL_PLANE": "schedrl",
         # Used by upstream ROLL shims to avoid taking down the job-global Ray cluster.
         "SCHEDRL_LIBRARY_MODE": "1",
+        "PYTHONPATH": pythonpath,
         # Shared weights/cache (big, reusable).
         "HF_HOME": f"{shared_root}/hf",
         "HUGGINGFACE_HUB_CACHE": f"{shared_root}/hf/hub",
@@ -116,9 +130,13 @@ class SchedRLAdapter:
             max_restarts=0,
             max_task_retries=0,
             # Critical: allow resize RPCs to run while `run()` is in-flight.
-            max_concurrency=1000,
+            # Keep this small: Ray uses a thread pool for sync actors; huge values can hit thread limits.
+            max_concurrency=32,
             runtime_env={"env_vars": dict(self._pipeline_env_vars)},
         ).remote(pipeline_id=self._pipeline_id, pipeline_config=pipeline_config)
+        # Initialize pipeline after actor creation so the actor creation task stays small and so we can
+        # fail fast with a clear error if any cluster init/cache prebuild step fails.
+        ray.get(self._coordinator.initialize_pipeline.remote())
         return self._coordinator
 
     def _inject_pipeline_env_vars(self, *, pipeline_config: Any) -> None:

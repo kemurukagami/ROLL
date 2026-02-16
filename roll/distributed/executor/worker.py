@@ -237,6 +237,19 @@ class Worker:
         else:
             self.logger.warning("worker has not strategy")
 
+    def build_latest_bucket_cache(self, checkpoint_version: int, global_step: int) -> None:
+        """
+        Build a sender-side CPU bucket cache for selective sync under SchedRL.
+
+        This is a thin wrapper around the strategy implementation. Fail fast if unsupported.
+        """
+        if getattr(self, "strategy", None) is None:
+            raise RuntimeError("worker has no strategy")
+        fn = getattr(self.strategy, "_build_latest_bucket_cache", None)
+        if not callable(fn):
+            raise RuntimeError(f"{type(self.strategy).__name__} does not support build_latest_bucket_cache")
+        fn(checkpoint_version=int(checkpoint_version), global_step=int(global_step))
+
     def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
         if getattr(self, "strategy", None) is None:
             raise RuntimeError("worker has no strategy")

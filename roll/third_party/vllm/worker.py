@@ -139,6 +139,23 @@ class WorkerBase:
     def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
         monkey_patch_torch_reductions()
         bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_named_tensors[self.rank])
+        # Support both formats:
+        # - {"bucket": <torch.Tensor>, "tensors_meta": ...}  (legacy / CUDA-IPC path)
+        # - {"bucket_bytes": <bytes>, "tensors_meta": ...}  (SchedRL CPU-cache safe path)
+        if "bucket" not in bucket_with_meta:
+            bucket_bytes = bucket_with_meta.get("bucket_bytes")
+            if bucket_bytes is None:
+                raise RuntimeError("update_parameter_in_bucket missing 'bucket' or 'bucket_bytes'")
+            bucket_with_meta["bucket"] = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8).to(
+                device=self.device
+            ).contiguous()
+            # Avoid passing unexpected kwargs into named_tensors_from_bucket.
+            bucket_with_meta.pop("bucket_bytes", None)
+        else:
+            bucket = bucket_with_meta["bucket"]
+            if not getattr(bucket, "is_cuda", False):
+                bucket_with_meta["bucket"] = bucket.to(device=self.device).contiguous()
+            bucket_with_meta.pop("bucket_bytes", None)
         named_params = named_tensors_from_bucket(**bucket_with_meta)
         if is_lora:
             for name, weight in named_params:

@@ -15,11 +15,12 @@ from schedrl.protocol.types import ActionResponse
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import AgenticPipeline
+from roll.pipeline.agentic.agentic_pipeline import compute_rollout_traj_metrics
+import threading
 from roll.pipeline.agentic.utils import (
     agentic_compute_advantage,
     compute_discounted_returns,
     compute_response_level_rewards,
-    compute_rollout_traj_metrics,
     dump_rollout_trajectories,
     get_agentic_response_level_mask,
 )
@@ -50,7 +51,10 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         if not isinstance(pipeline_id, str) or pipeline_id == "":
             raise ValueError("pipeline_id must be non-empty str")
         self._pipeline_id = pipeline_id
-        super().__init__(pipeline_config=pipeline_config)
+        self._pipeline_config = pipeline_config
+        self._initialized = False
+        # Ray actor can run with max_concurrency>1; guard init so resize/run can't race it.
+        self._init_lock = threading.Lock()
         try:
             self._schedrl_scheduler = ray.get_actor("schedrl:scheduler", namespace="schedrl")
         except Exception as e:
@@ -66,24 +70,327 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         self._actor_train_cluster_id = f"{self._pipeline_id}_actor_train"
         self._critic_cluster_id = f"{self._pipeline_id}_critic"
         self._reference_cluster_id = f"{self._pipeline_id}_reference"
-        self._ensure_model_update_service()
 
-    def _ensure_model_update_service(self) -> None:
-        from roll.schedrl_adapter.model_update_service import ModelUpdateService
-        from roll.utils.constants import RAY_NAMESPACE
+    def initialize_pipeline(self) -> ActionResponse:
+        """Initialize pipeline clusters/schedulers and prepare selective sync cache before first rollout."""
+        with self._init_lock:
+            if self._initialized:
+                return ActionResponse(success=True)
 
-        ModelUpdateSvc = ModelUpdateService.options(
-            name=f"{self._pipeline_id}_model_update_service",
-            namespace=RAY_NAMESPACE,
-            get_if_exists=True,
-            max_restarts=0,
-            max_task_retries=0,
-        )
-        ModelUpdateSvc.remote(
-            pipeline_id=self._pipeline_id,
-            src_cluster=self.actor_train,
-            tgt_cluster=self.actor_infer,
-        )
+            # Inline the heavy init logic (based on ConcurrentAgenticPipeline + AgenticPipeline init).
+            # Do not call AgenticPipeline.__init__ here: we need explicit ordering + central scheduler interaction.
+            from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+            from roll.distributed.executor.cluster import Cluster
+            from roll.distributed.scheduler.generate_scheduler import RequestScheduler
+            from roll.distributed.scheduler.rollout_scheduler import RolloutScheduler
+            from roll.models.model_providers import default_tokenizer_provider
+            from roll.pipeline.base_pipeline import BasePipeline
+            from roll.utils.functionals import RunningMoments
+            from roll.utils.kl_controller import get_kl_controller
+            from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
+
+            pipeline_config = self._pipeline_config
+            BasePipeline.__init__(self, pipeline_config)
+            self.pipeline_config = pipeline_config
+
+            self.pipeline_config.set_max_steps(max_steps=self.pipeline_config.max_steps)
+            actor_lora_target = getattr(self.pipeline_config.actor_train.model_args, "lora_target", None)
+            self.use_ref_model = bool(self.pipeline_config.enable_reference and (actor_lora_target is None))
+            self.partial_gpu_mode = False
+
+            self.kl_ctrl = get_kl_controller(
+                init_kl_coef=self.pipeline_config.init_kl_coef,
+                target_kl=self.pipeline_config.target_kl,
+                kl_horizon=self.pipeline_config.kl_horizon,
+            )
+
+            # INIT PHASE: Create clusters (use pipeline_id prefix to keep names readable in logs).
+            self.actor_train = Cluster(
+                name=f"{self._pipeline_id}_{self.pipeline_config.actor_train.name}",
+                worker_cls=self.pipeline_config.actor_train.worker_cls,
+                resource_manager=self.resource_manager,
+                worker_config=self.pipeline_config.actor_train,
+            )
+            self.actor_infer = Cluster(
+                name=f"{self._pipeline_id}_{self.pipeline_config.actor_infer.name}",
+                worker_cls=self.pipeline_config.actor_infer.worker_cls,
+                resource_manager=self.resource_manager,
+                worker_config=self.pipeline_config.actor_infer,
+            )
+
+            download_clusters = [self.actor_train, self.actor_infer]
+
+            if self.use_ref_model:
+                self.reference = Cluster(
+                    name=f"{self._pipeline_id}_{self.pipeline_config.reference.name}",
+                    worker_cls=self.pipeline_config.reference.worker_cls,
+                    resource_manager=self.resource_manager,
+                    worker_config=self.pipeline_config.reference,
+                )
+                download_clusters.append(self.reference)
+
+            if self.pipeline_config.adv_estimator == "gae":
+                self.critic = Cluster(
+                    name=f"{self._pipeline_id}_{self.pipeline_config.critic.name}",
+                    worker_cls=self.pipeline_config.critic.worker_cls,
+                    resource_manager=self.resource_manager,
+                    worker_config=self.pipeline_config.critic,
+                )
+                download_clusters.append(self.critic)
+
+            # Reward cluster is optional; keep consistent with AgenticPipeline behavior.
+            self.reward = None
+            self.reward_scheduler = None
+            if self.pipeline_config.reward is not None and len(self.pipeline_config.reward.device_mapping) > 0:
+                self.reward = Cluster(
+                    name=f"{self._pipeline_id}_{self.pipeline_config.reward.name}",
+                    worker_cls=self.pipeline_config.reward.worker_cls,
+                    resource_manager=self.resource_manager,
+                    worker_config=self.pipeline_config.reward,
+                )
+                download_clusters.append(self.reward)
+
+            # INIT PHASE: Download models once per node/PG before strategy initialization.
+            self.download_models(*download_clusters)
+            self.tokenizer = default_tokenizer_provider(model_args=self.pipeline_config.actor_train.model_args)
+
+            # Reward scheduler (named actor for env managers) if reward cluster exists.
+            if self.reward:
+                reward_name = f"RewardScheduler-{self._pipeline_id}"
+                self.reward_scheduler = RequestScheduler.options(
+                    name=reward_name,
+                    get_if_exists=True,
+                    namespace=RAY_NAMESPACE,
+                    runtime_env={"env_vars": schedrl_env_vars()},
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=ray.get_runtime_context().get_node_id(),
+                        soft=False,
+                    ),
+                ).remote(
+                    infer_cluster=self.reward,
+                    pipeline_config=self.pipeline_config,
+                    resource_manager=self.resource_manager,
+                )
+
+            # Rollout schedulers (named actors).
+            self.train_rollout_scheduler = ray.remote(RolloutScheduler).options(
+                name=f"RolloutScheduler-{self._pipeline_id}-train",
+                namespace=RAY_NAMESPACE,
+                runtime_env={"env_vars": schedrl_env_vars()},
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ray.get_runtime_context().get_node_id(),
+                    soft=False,
+                ),
+            ).remote(
+                config=self.pipeline_config,
+                env_manager_config=self.pipeline_config.train_env_manager,
+                resource_manager=self.resource_manager,
+                infer_cluster=self.actor_infer,
+                mode="train",
+            )
+            self.val_rollout_scheduler = ray.remote(RolloutScheduler).options(
+                name=f"RolloutScheduler-{self._pipeline_id}-val",
+                namespace=RAY_NAMESPACE,
+                runtime_env={"env_vars": schedrl_env_vars()},
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ray.get_runtime_context().get_node_id(),
+                    soft=False,
+                ),
+            ).remote(
+                config=self.pipeline_config,
+                env_manager_config=self.pipeline_config.val_env_manager,
+                resource_manager=self.resource_manager,
+                infer_cluster=self.actor_infer,
+                mode="val",
+            )
+
+            # Create val dataset manager as in AgenticPipeline.
+            from roll.datasets.global_dataset import GlobalDatasetManager
+
+            self.val_dataset_manager = GlobalDatasetManager.options(
+                name="val_dataset_manager",
+                get_if_exists=True,
+                namespace=RAY_NAMESPACE,
+                runtime_env={"env_vars": schedrl_env_vars()},
+            ).remote()
+
+            # Infer resize serialization boundary (ENG-123).
+            infer_strategy_config = self.actor_infer.worker_config.strategy_args.strategy_config
+            tp_size = int(infer_strategy_config.get("tensor_parallel_size", 1))
+            pp_size = int(infer_strategy_config.get("pipeline_parallel_size", 1))
+            self._infer_gpus_per_dp_rank = tp_size * pp_size
+            self._infer_device_mapping = list(getattr(self.pipeline_config.actor_infer, "device_mapping", None) or [])
+            if not self._infer_device_mapping:
+                raise RuntimeError("actor_infer.device_mapping must be set")
+            self._infer_resize_lock = threading.Lock()
+
+            # INIT PHASE: Initialize clusters with central scheduler coordination and strict offload ordering.
+            from schedrl.protocol.types import Priority
+
+            init_global_step = -1
+            self._request_static_cluster(
+                cluster_id=self._actor_train_cluster_id,
+                priority=Priority.INITIALIZATION,
+                global_step=init_global_step,
+            )
+            try:
+                refs: List[ray.ObjectRef] = []
+                refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
+                ray.get(refs)
+
+                # Before offloading actor_train, build and promote the initial (-1) cache bucket so the first
+                # expand/broadcast can sync valid weights (initialization weights).
+                init_checkpoint_version = -1
+                init_bucket_step = -1
+                self.actor_train.load_states(blocking=True)
+                ray.get(
+                    [
+                        w.build_latest_bucket_cache.remote(
+                            checkpoint_version=int(init_checkpoint_version),
+                            global_step=int(init_bucket_step),
+                        )
+                        for w in self.actor_train.workers
+                    ]
+                )
+                ray.get(
+                    [
+                        w.promote_active_checkpoint.remote(
+                            checkpoint_version=int(init_checkpoint_version),
+                            global_step=int(init_bucket_step),
+                        )
+                        for w in self.actor_train.workers
+                    ]
+                )
+
+                # Offload training-side clusters before initializing actor_infer (avoid transient OOM).
+                self.actor_train.offload_states(blocking=True)
+            finally:
+                self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=init_global_step)
+
+            self._request_static_cluster(
+                cluster_id=self._actor_infer_cluster_id,
+                priority=Priority.INITIALIZATION,
+                global_step=init_global_step,
+            )
+            try:
+                refs = []
+                if self.reward:
+                    refs.extend(self.reward.initialize(pipeline_config=self.pipeline_config, blocking=False))
+                refs.extend(self.actor_infer.initialize(pipeline_config=self.pipeline_config, blocking=False))
+                ray.get(refs)
+                if self.reward:
+                    self.reward.offload_states(blocking=True)
+                self.actor_infer.offload_states(blocking=True)
+            finally:
+                self._release_static_cluster(cluster_id=self._actor_infer_cluster_id, global_step=init_global_step)
+
+            if self.pipeline_config.adv_estimator == "gae":
+                self._request_static_cluster(
+                    cluster_id=self._critic_cluster_id,
+                    priority=Priority.INITIALIZATION,
+                    global_step=init_global_step,
+                )
+                try:
+                    self.critic.initialize(pipeline_config=self.pipeline_config, blocking=True)
+                    self.critic.offload_states(blocking=True)
+                finally:
+                    self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=init_global_step)
+
+            if self.use_ref_model:
+                self._request_static_cluster(
+                    cluster_id=self._reference_cluster_id,
+                    priority=Priority.INITIALIZATION,
+                    global_step=init_global_step,
+                )
+                try:
+                    self.reference.initialize(pipeline_config=self.pipeline_config, blocking=True)
+                    self.reference.offload_states(blocking=True)
+                finally:
+                    self._release_static_cluster(cluster_id=self._reference_cluster_id, global_step=init_global_step)
+
+            # Setup model update pair and checkpoint clusters (required by BasePipeline.model_update/do_checkpoint).
+            self.set_model_update_pair(
+                src_cluster=self.actor_train,
+                tgt_cluster=self.actor_infer,
+                frequency=self.pipeline_config.actor_train.model_update_frequency,
+            )
+            if self.pipeline_config.adv_estimator == "gae":
+                self.set_checkpoint_clusters(self.actor_train, self.critic)
+            else:
+                self.set_checkpoint_clusters(self.actor_train)
+
+            self.running = RunningMoments()
+
+            # Validate partial GPU mode configuration and set self.partial_gpu_mode
+            if getattr(self.pipeline_config, "partial_gpu_mode", False):
+                self.partial_gpu_mode = self._validate_partial_gpu_config()
+            else:
+                self.partial_gpu_mode = False
+
+            # Namespace contract: in SchedRL mode, require explicit per-pipeline env vars (fail fast).
+            ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE", "roll")
+            if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+                env_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
+                pipeline_id_env = os.environ.get("PIPELINE_ID")
+                if not env_namespace:
+                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+                if not pipeline_id_env:
+                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+                if pipeline_id_env != self._pipeline_id:
+                    raise RuntimeError(
+                        f"PIPELINE_ID mismatch for coordinator: env PIPELINE_ID={pipeline_id_env!r} "
+                        f"!= coordinator pipeline_id={self._pipeline_id!r}"
+                    )
+                ray_namespace = env_namespace
+
+            # Align with ConcurrentAgenticPipeline: interact with central scheduler during init.
+            # The initial (-1) cache bucket is built during actor_train init above under INITIALIZATION allocation.
+
+            # Create ModelUpdateService in the per-pipeline namespace. This is used by
+            # RequestScheduler.expand_workers() in SchedRL mode to sync selected dp ranks after load.
+            from roll.schedrl_adapter.model_update_service import ModelUpdateService
+
+            runtime_env = {
+                "env_vars": {
+                    "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+                    "PIPELINE_ID": os.environ.get("PIPELINE_ID", self._pipeline_id),
+                    "ROLL_RAY_NAMESPACE": ray_namespace,
+                    "SCHEDRL_CONTROL_PLANE": os.environ.get("SCHEDRL_CONTROL_PLANE", "schedrl"),
+                    "SCHEDRL_LIBRARY_MODE": os.environ.get("SCHEDRL_LIBRARY_MODE", "1"),
+                }
+            }
+            svc = ModelUpdateService.options(
+                name=f"{self._pipeline_id}_model_update_service",
+                namespace=ray_namespace,
+                get_if_exists=True,
+                max_restarts=0,
+                max_task_retries=0,
+                runtime_env=runtime_env,
+                lifetime="detached",
+            ).remote(
+                pipeline_id=self._pipeline_id,
+                src_cluster=self.actor_train,
+                tgt_cluster=self.actor_infer,
+            )
+            ray.get(svc.__ray_ready__.remote())
+
+            # Start from a well-defined state (ENG-123):
+            # - disable routing and suspend schedulers until we request GPUs from SchedRL.
+            ray.get(self.train_rollout_scheduler.suspend.remote())
+            ray.get(self.val_rollout_scheduler.suspend.remote())
+            dp_ranks = self._actor_infer_all_dp_ranks()
+            ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
+            ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
+
+            self._initialized = True
+            return ActionResponse(success=True)
+
+    def _ensure_initialized(self) -> None:
+        if not self._initialized:
+            resp = self.initialize_pipeline()
+            if not getattr(resp, "success", False):
+                raise RuntimeError(f"initialize_pipeline failed: {resp}")
 
     def _actor_infer_device_mapping(self) -> List[int]:
         mapping = getattr(self.pipeline_config.actor_infer, "device_mapping", None)
@@ -175,18 +482,8 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
 
     @torch.no_grad()
     def run(self):
+        self._ensure_initialized()
         tps_timer = _Timer(window_size=5)
-
-        # Start from a well-defined state: actor_infer offloaded + routing disabled until we request GPUs.
-        ray.get(self.train_rollout_scheduler.suspend.remote())
-        try:
-            dp_ranks = self._actor_infer_all_dp_ranks()
-            ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks))
-            ray.get(self.val_rollout_scheduler.suspend.remote())
-            ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks))
-        except Exception:
-            # Fail-fast semantics: if this doesn't work, the pipeline can't be safely controlled by SchedRL.
-            raise
 
         for global_step in range(self.pipeline_config.max_steps):
             if global_step <= self.state.step:
@@ -576,6 +873,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         logger.info(f"[schedrl][{self._pipeline_id}] pipeline complete!")
 
     def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
+        self._ensure_initialized()
         if not isinstance(dp_ranks_to_remove, list):
             raise ValueError("dp_ranks_to_remove must be list[int]")
         if not isinstance(dp_ranks_to_add, list):

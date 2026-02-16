@@ -13,6 +13,69 @@ from vllm.v1.engine.output_processor import OutputProcessor
 
 from roll.third_party.vllm.async_llm import CustomAsyncLLM
 
+# Patch vLLM v1 dummy profiling run to avoid indexing with a NumPy int64 array.
+#
+# vllm==0.8.4 builds `logit_indices` as a NumPy array and uses it to index a torch.Tensor
+# (`hidden_states[logit_indices]`). In some environments this raises:
+#   RuntimeError: Could not infer dtype of numpy.int64
+# Convert indices to a torch.LongTensor on the correct device before indexing.
+import vllm.v1.worker.gpu_model_runner as _v1_gpu_model_runner
+import torch as _torch
+
+@_torch.inference_mode()
+def _dummy_run_fixed(self, num_tokens: int) -> _torch.Tensor:
+    assert num_tokens <= self.scheduler_config.max_num_batched_tokens
+    max_num_reqs = self.scheduler_config.max_num_seqs
+    num_reqs = max_num_reqs if num_tokens >= max_num_reqs else num_tokens
+    min_tokens_per_req = num_tokens // num_reqs
+    num_scheduled_tokens_list = [min_tokens_per_req] * num_reqs
+    num_scheduled_tokens_list[-1] += num_tokens % num_reqs
+    assert sum(num_scheduled_tokens_list) == num_tokens
+    assert len(num_scheduled_tokens_list) == num_reqs
+    num_scheduled_tokens = _v1_gpu_model_runner.np.array(
+        num_scheduled_tokens_list, dtype=_v1_gpu_model_runner.np.int32
+    )
+
+    with self.maybe_dummy_run_with_lora(self.lora_config, num_scheduled_tokens):
+        model = self.model
+        if self.is_multimodal_model:
+            input_ids = None
+            inputs_embeds = self.inputs_embeds[:num_tokens]
+        else:
+            input_ids = self.input_ids[:num_tokens]
+            inputs_embeds = None
+        if self.uses_mrope:
+            positions = self.mrope_positions[:, :num_tokens]
+        else:
+            positions = self.positions[:num_tokens]
+
+        if _v1_gpu_model_runner.get_pp_group().is_first_rank:
+            intermediate_tensors = None
+        else:
+            if self.intermediate_tensors is None:
+                self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                    batch_size=self.max_num_tokens,
+                    dtype=self.model_config.dtype,
+                    device=self.device,
+                )
+            intermediate_tensors = _v1_gpu_model_runner.IntermediateTensors(
+                {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
+            )
+
+        with _v1_gpu_model_runner.set_forward_context(None, self.vllm_config, num_tokens=num_tokens):
+            hidden_states = model(
+                input_ids=input_ids,
+                positions=positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+            )
+
+    logit_indices_np = _v1_gpu_model_runner.np.cumsum(num_scheduled_tokens) - 1
+    logit_indices = _torch.as_tensor(logit_indices_np, device=hidden_states.device, dtype=_torch.long)
+    return hidden_states[logit_indices]
+
+_v1_gpu_model_runner.GPUModelRunner._dummy_run = _dummy_run_fixed
+
 async def generate(
     self,
     prompt: PromptType,

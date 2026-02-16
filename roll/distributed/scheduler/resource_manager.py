@@ -16,14 +16,24 @@ class ResourceManager:
             The ResourceManager centrally manages the required GPU/CPU resources,
             facilitating Ray to deploy Actors on specified GPU devices.
         """
+        # NOTE: Some environments can expose Ray "GPU" resources even when `torch.cuda.is_available()`
+        # is False inside the driver/worker process (e.g., CUDA init failure or restricted device access).
+        # For GPU placement groups we must use Ray's built-in "GPU" resource key to ensure bundles are schedulable.
+        ray_device_key = current_platform.ray_device_key
+        device_control_env_var = getattr(current_platform, "device_control_env_var", None)
+        if int(num_gpus_per_node or 0) > 0:
+            ray_device_key = "GPU"
+            if not device_control_env_var:
+                device_control_env_var = "CUDA_VISIBLE_DEVICES"
+
         available_resources = ray.available_resources()
-        available_gpu = available_resources.get(current_platform.ray_device_key, 0)
+        available_gpu = available_resources.get(ray_device_key, 0)
 
         nodes_maybe_used = []
         ray_nodes = ray.nodes()
         for node in ray_nodes:
             resource = node["Resources"]
-            node_gpu_num = int(resource.get(current_platform.ray_device_key, 0))
+            node_gpu_num = int(resource.get(ray_device_key, 0))
             if node_gpu_num >= num_gpus_per_node:
                 nodes_maybe_used.append(node)
         nodes_maybe_used = sorted(nodes_maybe_used, key=lambda n: n["Resources"]["CPU"])
@@ -46,7 +56,7 @@ class ResourceManager:
             for i in range(self.num_nodes):
                 node = nodes_maybe_used[i]
                 node_cpu = int(node["Resources"]["CPU"])
-                bundles.append({current_platform.ray_device_key: self.gpu_per_node, "CPU": max(node_cpu / 2, 1)})
+                bundles.append({ray_device_key: self.gpu_per_node, "CPU": max(node_cpu / 2, 1)})
 
             self.placement_groups = [
                 ray.util.placement_group([bundle], name=f"{self._pg_name_prefix}{i}" if self._pg_name_prefix else None)
@@ -56,12 +66,8 @@ class ResourceManager:
             gpu_ranks = ray.get([
                 get_visible_gpus.options(
                     placement_group=pg,
-                    **(
-                        {"num_gpus": self.gpu_per_node}
-                        if current_platform.ray_device_key == "GPU"
-                        else {"resources": {current_platform.ray_device_key: self.gpu_per_node}}
-                    )
-                ).remote(current_platform.device_control_env_var)
+                    **({"num_gpus": self.gpu_per_node} if self.gpu_per_node > 0 else {})
+                ).remote(device_control_env_var)
                 for pg in self.placement_groups
             ])
             print(f"gpu ranks: {gpu_ranks}")

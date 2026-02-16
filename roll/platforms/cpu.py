@@ -10,6 +10,10 @@ class CpuPlatform(Platform):
     device_type: str = "cpu"
     dispatch_key: str = "CPU"
     ray_device_key: str = "CPU"
+    # Ray may hide CUDA devices from non-GPU actors (CUDA_VISIBLE_DEVICES=""),
+    # but those actors still need to configure visibility for GPU worker processes.
+    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
+    ray_experimental_noset: str = "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
     communication_backend: str = "gloo"
 
     @classmethod

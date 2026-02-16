@@ -75,7 +75,8 @@ from roll.utils.collective import collective
 from roll.utils.logging import get_logger
 from roll.utils.network_utils import collect_free_port, get_node_ip
 from roll.utils.offload_states import OffloadStateType
-from roll.utils.send_recv_utils import named_tensors_from_bucket, serialize_named_weights
+from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
+from roll.utils.send_recv_utils import _bucket_named_tensors, named_tensors_from_bucket
 from roll.utils.sequence_packing import make_micro_batch_iter_for_sequence_packing, restore_results_order
 
 
@@ -1197,6 +1198,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
             checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
             self._build_latest_bucket_cache(checkpoint_version=checkpoint_version, global_step=int(global_step))
+            # fixme(tao) it need an if test, default to false, and only promt after cache explicitly  
+            # Ensure selective sync has a valid promoted cache for the next expand/broadcast.
+            self.promote_active_checkpoint(checkpoint_version=checkpoint_version, global_step=int(global_step))
         return metrics
 
     def model_update(self, model_update_name: str):
@@ -1240,7 +1244,23 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 buffer_size=buffer_size,
                 weights_meta=self._selective_update_weights_meta,
             ):
-                cached_buckets.append(serialize_named_weights(hf_named_weights, infer_strategy="vllm"))
+                # Important: cache must be CPU-resident and must not pickle torch Tensors.
+                #
+                # If we pickle torch Tensors (even CPU tensors), torch's multiprocessing reductions can create
+                # resource-sharer connections with authkeys that are not consistent with vLLM v1 engine worker
+                # processes, resulting in "digest sent was rejected" when applying IPC updates.
+                #
+                # So we serialize the flattened bucket as raw bytes + metadata only.
+                cpu_named_weights = [(str(name), weight.detach().to("cpu").contiguous()) for name, weight in hf_named_weights]
+                bucket, tensors_meta = _bucket_named_tensors(cpu_named_weights)  # CPU int8
+                cached_buckets.append(
+                    MultiprocessingSerializer.serialize(
+                        {
+                            "bucket_bytes": memoryview(bucket.numpy()).tobytes(),
+                            "tensors_meta": tensors_meta,
+                        }
+                    )
+                )
 
             self._cache_map[cache_key] = cached_buckets
             self._latest_cached = cache_key
@@ -1385,7 +1405,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
                     for serialized_tensors in cached_buckets:
                         bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_tensors)
-                        named_params = named_tensors_from_bucket(**bucket_with_meta)
+                        # Cache stores bucket as raw bytes; reconstruct to sender GPU for NCCL broadcast.
+                        bucket_bytes = bucket_with_meta.get("bucket_bytes")
+                        tensors_meta = bucket_with_meta.get("tensors_meta")
+                        if bucket_bytes is None or tensors_meta is None:
+                            raise RuntimeError("selective_sync_active_cache cache missing bucket_bytes/tensors_meta")
+                        bucket_cpu = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8)
+                        bucket = bucket_cpu.to(current_platform.device_type).contiguous()
+                        named_params = named_tensors_from_bucket(bucket=bucket, tensors_meta=tensors_meta)
 
                         names = [n for n, _ in named_params]
                         dtypes = [t.dtype for _, t in named_params]

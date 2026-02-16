@@ -16,7 +16,7 @@ from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.driver_utils import Locker
 from roll.platforms import current_platform
 from roll.utils.collective import collective
-from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
 from roll.utils.logging import get_logger
 from roll.utils.network_utils import collect_free_port, get_node_ip
 from roll.utils.send_recv_utils import serialize_named_weights
@@ -360,7 +360,12 @@ class MegatronWeightUpdater:
     def _setup_separated_model_update(self):
         pipeline_id = os.environ.get("PIPELINE_ID")
         locker_name = f"{pipeline_id}_model_update_locker" if pipeline_id else "model_update_locker"
-        self._model_update_locker = Locker.options(name=locker_name, get_if_exists=True, namespace=RAY_NAMESPACE).remote()
+        self._model_update_locker = Locker.options(
+            name=locker_name,
+            get_if_exists=True,
+            namespace=RAY_NAMESPACE,
+            runtime_env={"env_vars": schedrl_env_vars()},
+        ).remote()
         if not (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
         ):

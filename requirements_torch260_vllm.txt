@@ -4,7 +4,7 @@ torch==2.6.0.*
 torchvision==0.21.0.*
 torchaudio==2.6.0.*
 
-flash-attn
+https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.2.post1/flash_attn-2.7.2.post1+cu12torch2.6cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
 
 transformer-engine[pytorch]==2.2.0
 deepspeed==0.16.4

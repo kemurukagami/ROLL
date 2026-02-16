@@ -30,7 +30,7 @@ checkpoint_config:
   type: file_system
   output_dir: ./output/pipeline2/checkpoints
 
-num_gpus_per_node: 4
+num_gpus_per_node: 2
 
 max_steps: 3
 save_steps: 10000
@@ -43,7 +43,7 @@ async_generation_ratio: 1
 rollout_batch_size: 8
 val_batch_size: 16
 sequence_length: 8192
-max_actions_per_traj: 20
+max_actions_per_traj: 5
 
 advantage_clip: 0.2
 ppo_epochs: 1
@@ -74,14 +74,14 @@ actor_train:
   strategy_args:
     strategy_name: megatron_train
     strategy_config:
-      tensor_model_parallel_size: 2
+      tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
       use_distributed_optimizer: true
       recompute_granularity: full
       sequence_parallel: true
       overlap_grad_reduce: true
-  device_mapping: "[2, 3]"  # Pipeline 2: GPU 2-3
+  device_mapping: "[1,]"  # Pipeline 2: GPU 1
   infer_batch_size: 1
 
 actor_infer:
@@ -89,7 +89,7 @@ actor_infer:
     disable_gradient_checkpointing: true
     dtype: bf16
   generating_args:
-    max_new_tokens: 128
+    max_new_tokens: 64
     top_p: 1
     top_k: 3
     num_beams: 1
@@ -100,12 +100,16 @@ actor_infer:
   strategy_args:
     strategy_name: vllm
     strategy_config:
+      VLLM_USE_V1: 1
       gpu_memory_utilization: 0.7
       block_size: 16
       load_format: auto
+      tensor_parallel_size: 1
+      max_num_batched_tokens: 2048
+      max_num_seqs: 2
+      enforce_eager: true
       sleep_level: 2
-      tensor_parallel_size: 2
-  device_mapping: "[0, 1, 2, 3]"  # Shared: GPU 0-3
+  device_mapping: "[0, 1, ]"  # Single-node smoke: keep actor_infer off actor_train's GPU 0
 
 reference:
   model_args:
@@ -118,10 +122,10 @@ reference:
   strategy_args:
     strategy_name: megatron_infer
     strategy_config:
-      tensor_model_parallel_size: 2
+      tensor_model_parallel_size: 1
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
-  device_mapping: "[2, 3]"  # Pipeline 2: GPU 2-3
+  device_mapping: "[1,]"  # Pipeline 2: GPU 1
   infer_batch_size: 1
 
 reward_normalization:

@@ -5,8 +5,8 @@ This ports the fork reference configs (`pipeline1_sokoban_grpo.yaml`, `pipeline2
 driver that runs 1+ pipelines concurrently under the SchedRL control plane.
 
 Usage (from repo root):
-  python third_party/ROLL/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo
-  python third_party/ROLL/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo,pipeline2_sokoban_grpo
+  python external/ROLL_schedrl/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo
+  python external/ROLL_schedrl/examples/multi_pipeline/start_multi_pipeline_test.py --config_name pipeline1_sokoban_grpo,pipeline2_sokoban_grpo
 """
 
 from __future__ import annotations
@@ -25,16 +25,40 @@ from omegaconf import OmegaConf
 
 
 def _repo_root() -> Path:
-    # .../third_party/ROLL/examples/multi_pipeline/start_multi_pipeline_test.py -> repo root
-    return Path(__file__).resolve().parents[4]
+    # Resolve the mono-repo root regardless of where this example is vendored.
+    #
+    # We intentionally avoid relying on a fixed `parents[N]` depth because this file
+    # lives under `external/ROLL_schedrl/...` in this workspace (vs `third_party/ROLL/...`
+    # in other layouts).
+    start = Path(__file__).resolve()
+    for parent in start.parents:
+        git_dir = parent / ".git"
+        if git_dir.exists() and git_dir.is_dir():
+            return parent
+        if (parent / "AGENTS.md").exists() and (parent / "schedrl").is_dir():
+            return parent
+    raise RuntimeError(f"Failed to locate repo root from {start}")
 
 
-def _ensure_import_paths() -> Path:
+def _resolve_roll_root(*, repo_root: Path) -> Path:
+    # Prefer the in-repo ROLL+SchedRL fork used by ENG-123.
+    candidates = [
+        repo_root / "external" / "ROLL_schedrl",
+        repo_root / "third_party" / "ROLL",
+        repo_root / "external" / "ROLL",
+    ]
+    for candidate in candidates:
+        if (candidate / "roll").is_dir():
+            return candidate.resolve()
+    raise RuntimeError(f"Failed to locate ROLL root under repo_root={repo_root} (tried {candidates})")
+
+
+def _ensure_import_paths() -> tuple[Path, Path]:
     repo_root = _repo_root()
-    roll_root = (repo_root / "third_party" / "ROLL").resolve()
+    roll_root = _resolve_roll_root(repo_root=repo_root)
     sys.path.insert(0, str(repo_root))
     sys.path.insert(0, str(roll_root))
-    return repo_root
+    return repo_root, roll_root
 
 
 def _resolve_hydra_config_path(*, roll_root: Path, arg_config_path: str) -> tuple[str, Path]:
@@ -70,6 +94,9 @@ def _cluster_registry_inputs(*, pipeline_config: Any) -> tuple[Dict[str, int], D
     cluster_device_mappings: Dict[str, List[int]] = {}
 
     for key in ("actor_train", "actor_infer", "reference", "critic", "reward"):
+        # Only register clusters that will actually be constructed by the pipeline.
+        if key == "reference" and hasattr(pipeline_config, "enable_reference") and not pipeline_config.enable_reference:
+            continue
         cfg = getattr(pipeline_config, key, None)
         if cfg is None:
             continue
@@ -85,8 +112,7 @@ def _cluster_registry_inputs(*, pipeline_config: Any) -> tuple[Dict[str, int], D
 
 
 def main() -> None:
-    repo_root = _ensure_import_paths()
-    roll_root = (repo_root / "third_party" / "ROLL").resolve()
+    repo_root, roll_root = _ensure_import_paths()
 
     from roll.pipeline.agentic.agentic_config import AgenticConfig
     from roll.schedrl_adapter.adapter import SchedRLAdapter, _get_pipeline_namespace
@@ -121,6 +147,19 @@ def main() -> None:
     config_names = [name.strip() for name in args.config_name.split(",") if name.strip()]
     if not config_names:
         raise ValueError("--config_name must be non-empty")
+
+    # Make the driver + all Ray workers able to import `roll` and `schedrl`.
+    # (Ray workers do not inherit the driver's `sys.path` mutations.)
+    pythonpath_parts = [str(repo_root), str(roll_root)]
+    existing_pythonpath = os.environ.get("PYTHONPATH", "")
+    if existing_pythonpath:
+        pythonpath_parts.append(existing_pythonpath)
+    worker_pythonpath = os.pathsep.join(pythonpath_parts)
+
+    # This example is often run in a single-process "smoke test" setup without a pre-existing Ray cluster.
+    # Initialize a local Ray runtime so schedrl.init() does not require an external `ray start --head`.
+    if not ray.is_initialized():
+        ray.init(namespace="schedrl", ignore_reinit_error=True, log_to_driver=True)
 
     hydra_config_path, _ = _resolve_hydra_config_path(roll_root=roll_root, arg_config_path=args.config_path)
     GlobalHydra.instance().clear()
@@ -188,6 +227,17 @@ def main() -> None:
             get_if_exists=True,
             max_restarts=0,
             max_task_retries=0,
+            # Ray does not reliably propagate env vars from parent actors. Explicitly inject the
+            # per-pipeline namespace + control-plane contract for this pipeline actor process.
+            runtime_env={
+                "env_vars": {
+                    "PYTHONPATH": worker_pythonpath,
+                    "PIPELINE_ID": str(pipeline_id),
+                    "ROLL_RAY_NAMESPACE": ray_namespace,
+                    "SCHEDRL_CONTROL_PLANE": "schedrl",
+                    "SCHEDRL_LIBRARY_MODE": "1",
+                }
+            },
         ).remote(
             pipeline_id=pipeline_id,
             pipeline_config=pipeline_config,

@@ -31,6 +31,31 @@ CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "roll")
 IGNORE_INDEX = -100
 
 
+def schedrl_env_vars() -> dict[str, str]:
+    """Env vars that must be present in all per-pipeline Ray actor processes in SchedRL mode.
+
+    Use this when creating child actors from within a pipeline actor; Ray does not reliably
+    inherit runtime_env env vars from parent actors.
+    """
+    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+        return {}
+    # In SchedRL mode, roll.* import already validated these exist; keep them explicit here too.
+    pipeline_id = os.environ.get("PIPELINE_ID")
+    ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
+    if not pipeline_id:
+        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+    if not ray_namespace:
+        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+    return {
+        "PIPELINE_ID": pipeline_id,
+        "ROLL_RAY_NAMESPACE": ray_namespace,
+        "SCHEDRL_CONTROL_PLANE": "schedrl",
+        "SCHEDRL_LIBRARY_MODE": os.environ.get("SCHEDRL_LIBRARY_MODE", "1"),
+        # Keep imports working when Ray workers start outside the repo root.
+        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+    }
+
+
 class GenerateStopReason(enum.Enum):
     FINISH = enum.auto()
     ABORT = enum.auto()

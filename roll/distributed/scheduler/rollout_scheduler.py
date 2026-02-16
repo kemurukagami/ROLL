@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray._private import profiling
+from ray.runtime_env import RuntimeEnv
 from tqdm import tqdm
 
 from roll.distributed.executor.cluster import Cluster
@@ -19,7 +20,7 @@ from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.pipeline.agentic.agentic_config import EnvManagerConfig
 from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
-from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
 from roll.utils.logging import get_logger
 
 logger = get_logger()
@@ -744,6 +745,26 @@ class RolloutScheduler(RolloutMockMixin):
 
         env_num = self.env_manager_config.world_size * self.env_manager_config.max_env_num_per_worker
 
+        # Ray creates separate worker processes for these control-plane actors (queue + request scheduler).
+        # In this environment we hit OS thread limits during import-time TorchInductor initialization inside
+        # those workers. Disable torch.compile / inductor compile workers and cap common thread pools.
+        env_vars = {
+                "TORCH_COMPILE_DISABLE": "1",
+                # TorchInductor async compile uses a subprocess pool when compile_threads > 1.
+                # In this environment that can fail with EAGAIN (fork/pthread_create) and crash Ray workers.
+                "TORCHINDUCTOR_COMPILE_THREADS": "1",
+                # Reduce Ray core worker RPC thread footprint (helps avoid hitting OS thread limits).
+                "RAY_num_server_call_thread": "1",
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "NUMEXPR_NUM_THREADS": "1",
+                "TOKENIZERS_PARALLELISM": "false",
+        }
+        # Ensure per-pipeline env vars are visible in these control-plane actor processes in SchedRL mode.
+        env_vars.update(schedrl_env_vars())
+        runtime_env = RuntimeEnv(env_vars=env_vars)
+
         self.env_output_queue = GroupQueueManager.options(
             name=(
                 f"{self.pipeline_id}_group_queue_manager_{mode}"
@@ -754,7 +775,8 @@ class RolloutScheduler(RolloutMockMixin):
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False),
-            max_concurrency = env_num + 1 # reserve extra one for get_batch
+            runtime_env=runtime_env,
+            max_concurrency=env_num + 1,  # reserve extra one for get_batch
         ).remote(
             self.config,
             self.env_manager_config,
@@ -772,7 +794,8 @@ class RolloutScheduler(RolloutMockMixin):
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
                 ),
-                max_concurrency = env_num + 1 # reserve extra one for suspend/resume
+                runtime_env=runtime_env,
+                max_concurrency=env_num + 1,  # reserve extra one for suspend/resume
             ).remote(infer_cluster=self.infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
 
         self.es_manager: Any = Cluster(

@@ -26,7 +26,7 @@ from ray._private.log_monitor import (
 from ray._private.worker import print_to_stdstream, logger as monitor_logger, print_worker_logs
 
 from roll.distributed.scheduler.driver_utils import get_driver_rank, wait_for_nodes, get_driver_world_size
-from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
 from roll.utils.logging import get_logger
 
 logger = get_logger()
@@ -257,14 +257,20 @@ class LogMonitorListener:
 
         if self.rank == 0:
             self.exception_monitor = ExceptionMonitor.options(
-                name=EXCEPTION_MONITOR_ACTOR_NAME, get_if_exists=True, namespace=RAY_NAMESPACE
+                name=EXCEPTION_MONITOR_ACTOR_NAME,
+                get_if_exists=True,
+                namespace=RAY_NAMESPACE,
+                runtime_env={"env_vars": schedrl_env_vars()},
             ).remote()
         else:
             while True:
                 if self.exception_monitor is None:
                     try:
                         self.exception_monitor = ExceptionMonitor.options(
-                            name=EXCEPTION_MONITOR_ACTOR_NAME, get_if_exists=True, namespace=RAY_NAMESPACE
+                            name=EXCEPTION_MONITOR_ACTOR_NAME,
+                            get_if_exists=True,
+                            namespace=RAY_NAMESPACE,
+                            runtime_env={"env_vars": schedrl_env_vars()},
                         ).remote()
                     except Exception as e:
                         self.exception_monitor = None

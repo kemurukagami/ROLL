@@ -20,7 +20,7 @@ from roll.datasets.global_dataset import GlobalDataset, GlobalDatasetManager
 from roll.pipeline.rlvr.rlvr_config import RewardConfig
 from roll.pipeline.agentic.llm_proxy.proxy_utils import generate_by_proxy
 from roll.utils.checkpoint_manager import file_lock_context
-from roll.utils.constants import RAY_NAMESPACE, EpisodeStopReason
+from roll.utils.constants import RAY_NAMESPACE, EpisodeStopReason, schedrl_env_vars
 from roll.utils.random_utils import all_seed
 from roll.utils.logging import get_logger
 
@@ -207,7 +207,10 @@ class DeepEyesEnv(Env):
         # Convert train/val mode to sample/traversal for GlobalDataset
         global_dataset_mode = "sample" if self.mode == "train" else "traversal"
         self.dataset = DeepEyesDataset.options(
-            name=f"{self.mode}_deepeyes", get_if_exists=True, namespace=RAY_NAMESPACE
+            name=f"{self.mode}_deepeyes",
+            get_if_exists=True,
+            namespace=RAY_NAMESPACE,
+            runtime_env={"env_vars": schedrl_env_vars()},
         ).remote(
             dataset_name=data_args.file_name,
             split="train",
@@ -218,7 +221,10 @@ class DeepEyesEnv(Env):
             idx=idx,
         )
         self.dataset_manager = GlobalDatasetManager.options(
-            name=f"{self.mode}_dataset_manager", get_if_exists=True, namespace=RAY_NAMESPACE
+            name=f"{self.mode}_dataset_manager",
+            get_if_exists=True,
+            namespace=RAY_NAMESPACE,
+            runtime_env={"env_vars": schedrl_env_vars()},
         ).remote()
         ray.get(self.dataset_manager.register.remote(dataset_name="deepeyes", dataset_ref=self.dataset))
 

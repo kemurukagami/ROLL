@@ -1975,17 +1975,20 @@ class RequestScheduler:
 
             if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and load_ranks:
                 pipeline_id = os.environ.get("PIPELINE_ID") or None
+                ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
                 if not pipeline_id:
                     raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+                if not ray_namespace:
+                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
                 try:
                     model_update_service = ray.get_actor(
                         f"{pipeline_id}_model_update_service",
-                        namespace=RAY_NAMESPACE,
+                        namespace=ray_namespace,
                     )
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to resolve ModelUpdateService for pipeline_id={pipeline_id!r} "
-                        f"(expected name={pipeline_id}_model_update_service in namespace={RAY_NAMESPACE!r})"
+                        f"(expected name={pipeline_id}_model_update_service in namespace={ray_namespace!r})"
                     ) from e
                 ref = model_update_service.sync_selected_workers.remote(load_ranks)
                 await asyncio.wrap_future(ref.future())

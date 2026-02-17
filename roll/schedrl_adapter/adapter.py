@@ -104,6 +104,18 @@ class SchedRLAdapter:
         _validate_cpu_only_reward(pipeline_config=pipeline_config)
         _validate_vllm_sleep_level(pipeline_config=pipeline_config)
 
+        # Create the cluster-wide singleton ResourceManager actor before any coordinator.
+        # The adapter actor holds 0 GPU so the PG bundle ({GPU: N}) can always be satisfied.
+        # The actor is a namespace singleton (schedrl:roll_resource_manager) shared across
+        # all concurrent pipeline coordinators.  We also capture node-0's placement group
+        # and base GPU rank here to pin coordinators to a GPU node for CUDA visibility.
+        from roll.distributed.scheduler.resource_manager import get_or_create_roll_resource_manager_actor
+        self._rm_actor = get_or_create_roll_resource_manager_actor(pipeline_config.num_gpus_per_node)
+        _rm_state = ray.get(self._rm_actor.get_state.remote())
+        # Node 0's placement group is used to schedule the coordinator on a GPU node so
+        # that Ray sets CUDA_VISIBLE_DEVICES (needed for platform detection + RNG state).
+        self._rm_node0_pg = _rm_state["node2pg"].get(0)
+
         self._coordinator = None
         # NOTE: infer resize serialization is owned by the per-pipeline pipeline-side resize actor.
 
@@ -123,6 +135,8 @@ class SchedRLAdapter:
         # Safety: always inject env vars before constructing the coordinator, so callers can't
         # accidentally create a pipeline with missing system_envs.
         self._inject_pipeline_env_vars(pipeline_config=pipeline_config)
+
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
         self._coordinator = Coordinator.options(
             name=f"schedrl:pipeline:{self._pipeline_id}",
             namespace=self._ray_namespace,
@@ -132,7 +146,15 @@ class SchedRLAdapter:
             # Critical: allow resize RPCs to run while `run()` is in-flight.
             # Keep this small: Ray uses a thread pool for sync actors; huge values can hit thread limits.
             max_concurrency=32,
-            runtime_env={"env_vars": dict(self._pipeline_env_vars)},
+            runtime_env={"env_vars": self._pipeline_env_vars},
+            # Schedule coordinator inside node-0's placement group bundle so that Ray
+            # sets CUDA_VISIBLE_DEVICES correctly (needed for checkpoint RNG state saving).
+            # num_gpus=0.01: drawn from the bundle's GPU pool (not the global pool), so
+            # the singleton RM can still hold all integer GPUs in its placement group.
+            num_gpus=0.01,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=self._rm_node0_pg,
+            ),
         ).remote(pipeline_id=self._pipeline_id, pipeline_config=pipeline_config)
         # Initialize pipeline after actor creation so the actor creation task stays small and so we can
         # fail fast with a clear error if any cluster init/cache prebuild step fails.

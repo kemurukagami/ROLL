@@ -40,9 +40,9 @@ resume_from_checkpoint: false
 
 async_generation_ratio: 1
 
-rollout_batch_size: 8
-val_batch_size: 16
-sequence_length: 8192
+rollout_batch_size: 4
+val_batch_size: 4
+sequence_length: 2048
 max_actions_per_traj: 5
 
 advantage_clip: 0.2
@@ -134,18 +134,18 @@ reward_normalization:
 
 train_env_manager:
   format_penalty: -0.15
-  max_env_num_per_worker: 16
+  max_env_num_per_worker: 4
   num_env_groups: 2
-  group_size: 8
+  group_size: 2
   tags: [SimpleSokoban]
   num_groups_partition: [2]
 
 val_env_manager:
-  max_env_num_per_worker: 32
-  num_env_groups: 16
-  group_size: 1
+  max_env_num_per_worker: 4
+  num_env_groups: 2
+  group_size: 2
   tags: [SimpleSokoban]
-  num_groups_partition: [16]
+  num_groups_partition: [2]
 
 max_tokens_per_step: 64
 

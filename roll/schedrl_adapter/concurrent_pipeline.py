@@ -376,12 +376,22 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
             ray.get(svc.__ray_ready__.remote())
 
             # Start from a well-defined state (ENG-123):
-            # - disable routing and suspend schedulers until we request GPUs from SchedRL.
-            ray.get(self.train_rollout_scheduler.suspend.remote())
-            ray.get(self.val_rollout_scheduler.suspend.remote())
+            # - disable routing until we request GPUs from SchedRL.
+            # NOTE: avoid local suspend()/resume() state transitions; shrink-to-zero is the single
+            # source of truth for pausing generation traffic, and expand-from-zero resumes internally.
             dp_ranks = self._actor_infer_all_dp_ranks()
             ray.get(self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
             ray.get(self.val_rollout_scheduler.shrink_sampler.remote(dp_ranks, skip_offload=True))
+
+            # Verify state: both schedulers must have empty active_dp_ranks after init shrink.
+            train_active = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
+            val_active = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
+            if train_active or val_active:
+                raise RuntimeError(
+                    f"Initialization failed: active_dp_ranks not empty after shrink. "
+                    f"train_active={sorted(train_active)}, val_active={sorted(val_active)}. "
+                    f"This indicates state desync between SchedRL and ROLL."
+                )
 
             self._initialized = True
             return ActionResponse(success=True)
@@ -452,7 +462,32 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
     def _release_static_cluster(self, *, cluster_id: str, global_step: int) -> None:
         ray.get(self._schedrl_scheduler.release_gpus.remote(cluster_id=str(cluster_id), global_step=global_step))
 
-    def _notify_ready_to_release_actor_infer(self, *, global_step: int, planned_release_gpu_ids: List[int]) -> List[int]:
+    def _release_and_request_static_cluster(
+        self,
+        *,
+        release_cluster_id: str,
+        release_global_step: int,
+        request_cluster_id: str,
+        request_priority: Any,
+        request_global_step: int,
+    ) -> List[int]:
+        allocated = ray.get(
+            self._schedrl_scheduler.release_and_request_gpus.remote(
+                release_cluster_id=str(release_cluster_id),
+                release_global_step=int(release_global_step),
+                request_cluster_id=str(request_cluster_id),
+                request_priority=request_priority,
+                request_global_step=int(request_global_step),
+            )
+        )
+        if not isinstance(allocated, list):
+            raise RuntimeError(f"schedrl:scheduler.release_and_request_gpus returned non-list: {type(allocated).__name__}")
+        allocated = [int(x) for x in allocated]
+        if not allocated:
+            raise RuntimeError(f"schedrl:scheduler allocated empty GPU list for cluster_id={request_cluster_id!r}")
+        return allocated
+
+    def _notify_ready_to_release_actor_infer(self, *, global_step: int) -> List[int]:
         timeout_s_raw = os.environ.get("SCHEDRL_NOTIFY_READY_TIMEOUT_S", "300")
         try:
             timeout_s = float(timeout_s_raw)
@@ -461,15 +496,11 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         if timeout_s <= 0:
             raise RuntimeError(f"SCHEDRL_NOTIFY_READY_TIMEOUT_S must be > 0, got {timeout_s!r}")
 
-        ray.get(self.train_rollout_scheduler.suspend.remote())
-        ray.get(self.val_rollout_scheduler.suspend.remote())
-
         released = ray.get(
             self._schedrl_scheduler.notify_ready_to_release.remote(
                 cluster_id=self._actor_infer_cluster_id,
                 global_step=global_step,
                 timeout_s=timeout_s,
-                planned_release_gpu_ids=list(planned_release_gpu_ids),
             )
         )
         if not isinstance(released, list):
@@ -501,8 +532,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                         self.reference.offload_states(blocking=True)
                     self.actor_train.offload_states(blocking=True)
 
-                    # PHASE 2: Suspend rollout scheduler to pause request processing
-                    ray.get(self.train_rollout_scheduler.suspend.remote())
+                    # PHASE 2: (SchedRL) no local suspend; scheduler-driven shrink/expand owns routing state.
 
                     # PHASE 3: Model Update
                     with Timer(name="model_update", logger=None) as model_update_timer:
@@ -552,7 +582,6 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                     # Release generation GPUs during training phase (scheduler-driven shrink).
                     self._notify_ready_to_release_actor_infer(
                         global_step=global_step,
-                        planned_release_gpu_ids=allocated_gpus,
                     )
 
                     batch = compute_discounted_returns(
@@ -627,6 +656,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
 
                     # PHASE 12: Old Log Probs & Values
                     with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
+                        critic_requested = False
                         if self.pipeline_config.enable_reference and not self.use_ref_model:
                             batch.meta_info["disable_adapter"] = False
                         batch.meta_info["is_offload_states"] = False
@@ -668,18 +698,29 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                             )
                             metrics.update({"critic/entropy/mean": agg_entropy.item()})
                             self.actor_train.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
+                            if self.pipeline_config.adv_estimator == "gae":
+                                self._release_and_request_static_cluster(
+                                    release_cluster_id=self._actor_train_cluster_id,
+                                    release_global_step=global_step,
+                                    request_cluster_id=self._critic_cluster_id,
+                                    request_priority=Priority.VALUE_COMPUTE,
+                                    request_global_step=global_step,
+                                )
+                                critic_requested = True
+                            else:
+                                self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
                         else:
                             batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
 
                         if self.pipeline_config.adv_estimator == "gae":
                             from schedrl.protocol.types import Priority
 
-                            self._request_static_cluster(
-                                cluster_id=self._critic_cluster_id,
-                                priority=Priority.VALUE_COMPUTE,
-                                global_step=global_step,
-                            )
+                            if not critic_requested:
+                                self._request_static_cluster(
+                                    cluster_id=self._critic_cluster_id,
+                                    priority=Priority.VALUE_COMPUTE,
+                                    global_step=global_step,
+                                )
                             values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
 
                         if self.pipeline_config.adv_estimator == "gae":
@@ -799,7 +840,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                         tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
                     metrics["time/step_train"] = train_timer.last
 
-                from roll.pipeline.agentic.utils import compute_train_data_metrics
+                from roll.pipeline.agentic.agentic_pipeline import compute_train_data_metrics
 
                 with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
                     data_metrics = compute_train_data_metrics(batch=batch)
@@ -880,8 +921,50 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
             raise ValueError("dp_ranks_to_add must be list[int]")
         if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
             raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
+
+        # Snapshot pre-state for verification
+        train_active_before = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
+        val_active_before = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
+
         if dp_ranks_to_remove:
             self._shrink_workers(dp_ranks_to_remove=list(dp_ranks_to_remove))
+            # Verify shrink: ranks should be removed from active_dp_ranks
+            train_active_after = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
+            val_active_after = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
+            expected_removed = set(dp_ranks_to_remove)
+            still_active_train = train_active_after & expected_removed
+            still_active_val = val_active_after & expected_removed
+            if still_active_train or still_active_val:
+                raise RuntimeError(
+                    f"Shrink verification failed: ranks {sorted(expected_removed)} should be inactive. "
+                    f"train still active: {sorted(still_active_train)}, val still active: {sorted(still_active_val)}. "
+                    f"Before: train={sorted(train_active_before)}, val={sorted(val_active_before)}. "
+                    f"After: train={sorted(train_active_after)}, val={sorted(val_active_after)}."
+                )
         else:
+            # PRE-condition check for expand: ranks should NOT already be active
+            expected_added = set(dp_ranks_to_add)
+            already_active_train = train_active_before & expected_added
+            already_active_val = val_active_before & expected_added
+            if already_active_train or already_active_val:
+                raise RuntimeError(
+                    f"Expand PRE-condition failed: ranks {sorted(expected_added)} should NOT be active. "
+                    f"train already active: {sorted(already_active_train)}, val already active: {sorted(already_active_val)}. "
+                    f"Current state: train={sorted(train_active_before)}, val={sorted(val_active_before)}. "
+                    f"This indicates state desync between SchedRL and ROLL."
+                )
             self._expand_workers(dp_ranks_to_add=list(dp_ranks_to_add), train_skip_load=False)
+            # Verify expand: ranks should be added to active_dp_ranks
+            train_active_after = ray.get(self.train_rollout_scheduler.get_active_dp_ranks.remote())
+            val_active_after = ray.get(self.val_rollout_scheduler.get_active_dp_ranks.remote())
+            missing_train = expected_added - train_active_after
+            missing_val = expected_added - val_active_after
+            if missing_train or missing_val:
+                raise RuntimeError(
+                    f"Expand verification failed: ranks {sorted(expected_added)} should be active. "
+                    f"train missing: {sorted(missing_train)}, val missing: {sorted(missing_val)}. "
+                    f"Before: train={sorted(train_active_before)}, val={sorted(val_active_before)}. "
+                    f"After: train={sorted(train_active_after)}, val={sorted(val_active_after)}."
+                )
+
         return ActionResponse(success=True)

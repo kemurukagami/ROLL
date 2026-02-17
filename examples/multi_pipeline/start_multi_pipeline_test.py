@@ -254,7 +254,7 @@ def main() -> None:
 
     # Block until all pipelines complete (fail-fast if any crashes).
     ray.get(run_refs)
-
+    print("done!!!")
 
 if __name__ == "__main__":
     main()

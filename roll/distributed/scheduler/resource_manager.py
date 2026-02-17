@@ -26,8 +26,11 @@ class ResourceManager:
             if not device_control_env_var:
                 device_control_env_var = "CUDA_VISIBLE_DEVICES"
 
-        available_resources = ray.available_resources()
-        available_gpu = available_resources.get(ray_device_key, 0)
+        # Use cluster_resources (total capacity) rather than available_resources
+        # (currently free) because fractional GPU allocations like num_gpus=0.01
+        # on coordinator actors temporarily reduce available_gpu below the integer total.
+        cluster_resources = ray.cluster_resources()
+        available_gpu = cluster_resources.get(ray_device_key, 0)
 
         nodes_maybe_used = []
         ray_nodes = ray.nodes()
@@ -97,6 +100,18 @@ class ResourceManager:
             for node_rank, placement_group in zip(self.node_ranks, self.placement_groups):
                 self.node2pg[node_rank] = placement_group
 
+    def get_state(self) -> dict:
+        """Return serializable state for proxy construction."""
+        return {
+            "num_nodes": self.num_nodes,
+            "gpu_per_node": self.gpu_per_node,
+            "num_gpus": self.num_gpus,
+            "node_ranks": list(self.node_ranks),
+            "gpu_ranks": list(getattr(self, "gpu_ranks", [])),
+            "node2pg": dict(self.node2pg),
+            "placement_groups": list(self.placement_groups),
+        }
+
     def nodes_placement_group(self, node_rank) -> PlacementGroup:
         """
         mesh table是 m×n，获取第node_rank nodel上gpu_rank的PlacementGroup，用于把ray.Actor部署到指定的GPU上
@@ -163,3 +178,75 @@ class ResourceManager:
         assert len(allocated_pg) == world_size
 
         return allocated_pg
+
+
+# ---------------------------------------------------------------------------
+# Singleton actor + proxy for SchedRL control-plane mode
+# ---------------------------------------------------------------------------
+
+_ROLL_RM_ACTOR_NAME = "schedrl:roll_resource_manager"
+_ROLL_RM_NAMESPACE = "schedrl"
+
+
+def get_or_create_roll_resource_manager_actor(num_gpus_per_node):
+    """Return (or lazily create) the cluster-wide singleton ResourceManager Ray actor.
+
+    In SchedRL mode all concurrent pipelines share ONE ResourceManager actor so
+    that GPU placement groups are allocated only once for the whole cluster.
+    ``num_gpus_per_node`` must be consistent across pipelines (homogeneous cluster).
+    ``num_nodes=None`` means auto-discover all eligible GPU nodes.
+    """
+    try:
+        return ray.get_actor(_ROLL_RM_ACTOR_NAME, namespace=_ROLL_RM_NAMESPACE)
+    except ValueError:
+        pass
+
+    @ray.remote(num_cpus=0, max_restarts=0, max_task_retries=0)
+    class _RollResourceManagerActor(ResourceManager):
+        pass
+
+    try:
+        return (
+            _RollResourceManagerActor.options(
+                name=_ROLL_RM_ACTOR_NAME,
+                namespace=_ROLL_RM_NAMESPACE,
+                get_if_exists=True,
+                max_restarts=0,
+                max_task_retries=0,
+            )
+            .remote(num_gpus_per_node=num_gpus_per_node, num_nodes=None)
+        )
+    except Exception:
+        return ray.get_actor(_ROLL_RM_ACTOR_NAME, namespace=_ROLL_RM_NAMESPACE)
+
+
+class RollResourceManagerProxy:
+    """Synchronous drop-in replacement for ResourceManager backed by a shared Ray actor.
+
+    Used in SchedRL control-plane mode so that all concurrent pipelines share a
+    single ResourceManager actor (and its placement groups) rather than each
+    pipeline creating its own, which would exhaust cluster GPU resources.
+
+    ``destroy_placement_group()`` is a no-op: the singleton actor owns the PGs
+    and they are cleaned up when the orchestrator tears down the actor.
+    """
+
+    def __init__(self, actor_handle):
+        self._actor = actor_handle
+        state = ray.get(self._actor.get_state.remote())
+        self.num_nodes = state["num_nodes"]
+        self.gpu_per_node = state["gpu_per_node"]
+        self.num_gpus = state["num_gpus"]
+        self.node_ranks = state["node_ranks"]
+        self.gpu_ranks = state["gpu_ranks"]
+        self.node2pg = state["node2pg"]
+        self.placement_groups = state["placement_groups"]
+
+    def nodes_placement_group(self, node_rank) -> PlacementGroup:
+        return self.node2pg[node_rank]
+
+    def allocate_placement_group(self, world_size, device_mapping=None) -> List[List[Dict]]:
+        return ray.get(self._actor.allocate_placement_group.remote(world_size, device_mapping))
+
+    def destroy_placement_group(self):
+        pass  # singleton owns PGs; orchestrator tears them down via actor kill

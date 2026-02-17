@@ -30,9 +30,19 @@ class BasePipeline:
     def __init__(self, pipeline_config):
         set_seed(seed=pipeline_config.seed)
         self.pipeline_config = pipeline_config
-        self.resource_manager = ResourceManager(
-            num_nodes=self.pipeline_config.num_nodes, num_gpus_per_node=self.pipeline_config.num_gpus_per_node
-        )
+        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+            from roll.distributed.scheduler.resource_manager import (
+                get_or_create_roll_resource_manager_actor,
+                RollResourceManagerProxy,
+            )
+            _rm_actor = get_or_create_roll_resource_manager_actor(
+                num_gpus_per_node=self.pipeline_config.num_gpus_per_node
+            )
+            self.resource_manager = RollResourceManagerProxy(_rm_actor)
+        else:
+            self.resource_manager = ResourceManager(
+                num_nodes=self.pipeline_config.num_nodes, num_gpus_per_node=self.pipeline_config.num_gpus_per_node
+            )
         self.state = WorkerState()
         self.checkpoint_manager = CheckpointManager(checkpoint_config=self.pipeline_config.checkpoint_config)
         self.tracker = create_tracker(

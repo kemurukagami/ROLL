@@ -385,5 +385,5 @@ class AgenticConfig(PPOConfig):
                     f"[ENV CONFIG] tag: {tag}, group_id: {group_id}, group_seeds: {group_seeds[group_id]}, env_id: {env_id}"
                 )
             done_groups += n_group
-        assert done_groups == env_manager_config.num_env_groups
+        assert done_groups == env_manager_config.num_env_groups, f"{done_groups=} is not { env_manager_config.num_env_groups=}"
         env_manager_config.env_configs = env_configs

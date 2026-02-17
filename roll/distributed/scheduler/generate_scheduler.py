@@ -1340,6 +1340,13 @@ class RequestScheduler:
         self.active_dp_ranks: Set[int] = set(range(self.infer_cluster.world_size))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
 
+    def get_active_dp_ranks(self) -> Set[int]:
+        """Return a copy of the current active DP ranks set.
+
+        Used for state verification after initialization shrink operations.
+        """
+        return set(self.active_dp_ranks)
+
     async def generate_one_request(self, data: DataProto):
         # NOTE: do not block while holding routing_lock. Re-check suspend after acquiring lock
         # to avoid TOCTOU with shrink-to-zero and concurrent shrink/expand.

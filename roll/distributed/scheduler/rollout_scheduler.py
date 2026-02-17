@@ -820,13 +820,22 @@ class RolloutScheduler(RolloutMockMixin):
         # Initialize rollout mock mechanism from mixin
         self._init_rollout_mock()
 
-    async def shutdown(self):
+    async def shutdown(self, timeout: float = 10.0):
         if self.rollout_task is None:
             return
-        await asyncio.gather(*self.es_manager.stop(blocking=False))
-        await self.env_output_queue.shutdown.remote()
-        await self.generate_scheduler.abort_request.remote()
-        await self.rollout_task
+
+        async def _do_shutdown():
+            await asyncio.gather(*self.es_manager.stop(blocking=False))
+            await self.env_output_queue.shutdown.remote()
+            await self.generate_scheduler.abort_request.remote()
+            await self.rollout_task
+
+        try:
+            await asyncio.wait_for(_do_shutdown(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning(f"shutdown timed out after {timeout}s, force-skipping")
+            if self.rollout_task is not None and not self.rollout_task.done():
+                self.rollout_task.cancel()
         self.rollout_task = None
 
     async def suspend(self):
@@ -972,3 +981,10 @@ class RolloutScheduler(RolloutMockMixin):
         result["rollout_scheduler_duration_ms"] = (time.time() - start_time) * 1000
 
         return result
+
+    def get_active_dp_ranks(self) -> Set[int]:
+        """Return the current active DP ranks from the underlying RequestScheduler.
+
+        Used for state verification after initialization shrink operations.
+        """
+        return ray.get(self.generate_scheduler.get_active_dp_ranks.remote())

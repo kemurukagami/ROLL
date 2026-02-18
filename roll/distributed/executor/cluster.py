@@ -37,6 +37,8 @@ class Cluster:
         worker_cls: Union[RemoteFunctionNoArgs[Worker], Type[Worker], str],
         resource_manager: ResourceManager,
         worker_config: WorkerConfig,
+        *,
+        resolve_topology: bool = True,
     ):
 
         self.cluster_name = name
@@ -57,6 +59,7 @@ class Cluster:
         self.master_addr = None
         self.master_port = None
         self.world_size = self.worker_config.world_size
+        self._resolve_topology = bool(resolve_topology)
 
         self._create_workers()
         self._bind_worker_method()
@@ -65,10 +68,20 @@ class Cluster:
 
         self.rank2worker = {k: self.workers[k] for k in range(len(self.workers))}
         self.worker2rank = {self.workers[k]: k for k in range(len(self.workers))}
-        self.rank2devices = dict(zip(map(lambda worker: self.worker2rank[worker], self.workers),
-                                     ray.get([worker.get_devices_info.remote() for worker in self.workers])))
-        self.worker2nodes = dict(zip(self.workers, ray.get([worker.get_node_ip.remote() for worker in self.workers])))
-        logger.debug(f"{self.cluster_name} rank2devices {self.rank2devices}")
+        if self._resolve_topology:
+            self.rank2devices = dict(
+                zip(
+                    map(lambda worker: self.worker2rank[worker], self.workers),
+                    ray.get([worker.get_devices_info.remote() for worker in self.workers]),
+                )
+            )
+            self.worker2nodes = dict(zip(self.workers, ray.get([worker.get_node_ip.remote() for worker in self.workers])))
+            logger.debug(f"{self.cluster_name} rank2devices {self.rank2devices}")
+        else:
+            # Avoid blocking ray.get() in async actor constructors when topology info is not needed.
+            # Callers that rely on rank2devices/worker2nodes must construct clusters with resolve_topology=True.
+            self.rank2devices = {}
+            self.worker2nodes = {}
         # for cluster object can transfer by ray rpc.
         del self.worker_cls
 
@@ -143,7 +156,7 @@ class Cluster:
             env_vars.setdefault("NUMEXPR_NUM_THREADS", "1")
             env_vars.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-            if rank != 0:
+            if rank != 0 and self._resolve_topology:
                 env_vars["MASTER_ADDR"] = self.master_addr
                 env_vars["MASTER_PORT"] = str(self.master_port)
             if deploy_pg["gpu_rank"] is not None:
@@ -186,7 +199,7 @@ class Cluster:
 
             worker = self.worker_cls.options(**worker_options).remote(worker_config=self.worker_config)
             self.workers.append(worker)
-            if rank == 0:
+            if rank == 0 and self._resolve_topology:
                 self.master_addr, self.master_port = ray.get(worker.get_master_addr_and_port.remote())
 
     def _bind_worker_method(self):

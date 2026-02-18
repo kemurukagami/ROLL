@@ -133,6 +133,12 @@ class TrajEnvManager(BaseEnvManager):
         assert "seed" in data.meta_info
         self.running = True
         self.group_seed = data.meta_info['seed'] + self.env_config['group_seed']
+        if self.env_config["env_id"] == 0:
+            self.logger.info(
+                f"[TrajEnvManager] run_rollout_loop enter tag={self.env_config.get('tag')} "
+                f"group_id={self.env_config.get('group_id')} env_id={self.env_config.get('env_id')} "
+                f"base_seed={data.meta_info.get('seed')} group_seed={self.group_seed}"
+            )
         rollout_cache: RolloutCache = self.reset()
         start_step = self.current_step
 
@@ -176,10 +182,20 @@ class TrajEnvManager(BaseEnvManager):
                                           group_id=self.env_config['group_id'],
                                           tag=self.env_config['tag'])
 
+        if self.env_config["env_id"] == 0:
+            self.logger.info(
+                f"[TrajEnvManager] reset: waiting for episode_id "
+                f"group_id={self.env_config.get('group_id')} env_id={self.env_config.get('env_id')}"
+            )
         self.episode_id = ray.get(self.output_queue.get_episode_id.remote(
             self.env_config['group_id'],
             self.env_config['env_id']
         ))
+        if self.env_config["env_id"] == 0:
+            self.logger.info(
+                f"[TrajEnvManager] reset: got episode_id={self.episode_id} "
+                f"group_id={self.env_config.get('group_id')} env_id={self.env_config.get('env_id')}"
+            )
         if self.episode_id is None:
             assert not self.running
             return None

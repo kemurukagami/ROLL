@@ -14,7 +14,9 @@ exp_name: "pipeline1_sokoban_grpo"
 seed: 42
 logging_dir: ./output/pipeline1/logs
 output_dir: ./output/pipeline1
-render_save_dir: ./output/pipeline1/render
+# render_save_dir: ./output/pipeline1/render
+render_save_dir: /tmp/roll_output/pipeline1/render
+
 
 system_envs:
   NCCL_SHM_DISABLE: "1"
@@ -25,13 +27,16 @@ system_envs:
   ROLL_GPU_REQUEST_TIMEOUT_S: "120"
   ROLL_NOTIFY_READY_TIMEOUT_S: "300"
   ROLL_VERIFY_OFFLOAD_GPU_MEMORY: "1"
-
+  ROLL_SELECTIVE_MODEL_UPDATE_PG_TIMEOUT_S: '150'  # ProcessGroup/NCCL collective watchdog timeout (ms shown in logs).
+  ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S: '180'
+  
 checkpoint_config:
   type: file_system
-  output_dir: ./output/pipeline1/checkpoints
+  # output_dir: ./output/pipeline1/checkpoints
+  output_dir: /tmp/roll_output/pipeline1/checkpoints
 
 num_gpus_per_node: 2
-
+offload_nccl: true 
 max_steps: 3
 save_steps: 10000
 logging_steps: 1
@@ -101,7 +106,7 @@ actor_infer:
     strategy_name: vllm
     strategy_config:
       VLLM_USE_V1: 1
-      gpu_memory_utilization: 0.7
+      gpu_memory_utilization: 0.65 # cannot be too high due to residual memory of megatron
       block_size: 16
       load_format: auto
       tensor_parallel_size: 1

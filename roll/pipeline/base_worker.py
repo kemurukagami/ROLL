@@ -540,7 +540,36 @@ class InferWorker(Worker):
         generation_config["eos_token_id"] = [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]
         generation_config["pad_token_id"] = self.tokenizer.pad_token_id
         data.meta_info["generation_config"] = generation_config
+        request_id = data.meta_info.get("request_id")
+        schedrl_request_id = data.meta_info.get("schedrl_request_id")
+        src_rank = data.meta_info.get("src_rank")
+        global_step = data.meta_info.get("global_step")
+        max_new_tokens = generation_config.get("max_new_tokens")
+
+        t0 = time.time()
+        if getattr(self, "rank_info", None) is not None and int(self.rank_info.tp_rank) == 0 and src_rank == 0:
+            self.logger.info(
+                f"[InferWorker] generate_request enter"
+                f" request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" src_rank={src_rank} global_step={global_step} max_new_tokens={max_new_tokens}"
+            )
+
         data = await self.strategy.generate_request(data=data)
+
+        elapsed_s = time.time() - t0
+        if getattr(self, "rank_info", None) is not None and int(self.rank_info.tp_rank) == 0 and src_rank == 0:
+            if elapsed_s >= 30.0:
+                self.logger.warning(
+                    f"[InferWorker] generate_request slow"
+                    f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                    f" src_rank={src_rank} global_step={global_step}"
+                )
+            else:
+                self.logger.info(
+                    f"[InferWorker] generate_request exit"
+                    f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                    f" src_rank={src_rank} global_step={global_step}"
+                )
         data.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
         data.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
         return data

@@ -14,7 +14,8 @@ exp_name: "pipeline2_sokoban_grpo"
 seed: 42
 logging_dir: ./output/pipeline2/logs
 output_dir: ./output/pipeline2
-render_save_dir: ./output/pipeline2/render
+# render_save_dir: ./output/pipeline2/render
+render_save_dir: /tmp/roll_output/pipeline2/render
 
 system_envs:
   NCCL_SHM_DISABLE: "1"
@@ -25,13 +26,16 @@ system_envs:
   ROLL_GPU_REQUEST_TIMEOUT_S: "120"
   ROLL_NOTIFY_READY_TIMEOUT_S: "300"
   ROLL_VERIFY_OFFLOAD_GPU_MEMORY: "1"
-
+  ROLL_SELECTIVE_MODEL_UPDATE_PG_TIMEOUT_S: '150'  # ProcessGroup/NCCL collective watchdog timeout (ms shown in logs).
+  ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S: '180'
+  
 checkpoint_config:
   type: file_system
-  output_dir: ./output/pipeline2/checkpoints
+  # output_dir: ./output/pipeline2/checkpoints
+  output_dir: /tmp/roll_output/pipeline2/checkpoints
 
 num_gpus_per_node: 2
-
+offload_nccl: true 
 max_steps: 3
 save_steps: 10000
 logging_steps: 1
@@ -40,9 +44,9 @@ resume_from_checkpoint: false
 
 async_generation_ratio: 1
 
-rollout_batch_size: 8
-val_batch_size: 16
-sequence_length: 8192
+rollout_batch_size: 4
+val_batch_size: 4
+sequence_length: 2048
 max_actions_per_traj: 5
 
 advantage_clip: 0.2
@@ -101,7 +105,7 @@ actor_infer:
     strategy_name: vllm
     strategy_config:
       VLLM_USE_V1: 1
-      gpu_memory_utilization: 0.7
+      gpu_memory_utilization: 0.65
       block_size: 16
       load_format: auto
       tensor_parallel_size: 1
@@ -134,18 +138,18 @@ reward_normalization:
 
 train_env_manager:
   format_penalty: -0.15
-  max_env_num_per_worker: 16
+  max_env_num_per_worker: 4
   num_env_groups: 2
-  group_size: 8
+  group_size: 2
   tags: [SimpleSokoban]
   num_groups_partition: [2]
 
 val_env_manager:
-  max_env_num_per_worker: 32
-  num_env_groups: 16
-  group_size: 1
+  max_env_num_per_worker: 4
+  num_env_groups: 2
+  group_size: 2
   tags: [SimpleSokoban]
-  num_groups_partition: [16]
+  num_groups_partition: [2]
 
 max_tokens_per_step: 64
 

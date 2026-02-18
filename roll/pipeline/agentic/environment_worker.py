@@ -96,17 +96,20 @@ class EnvironmentWorker(Worker):
         # Set environment variables for profiler context
         os.environ["roll_EXEC_FUNC_NAME"] = "run_rollout_loop"
         os.environ["WORKER_NAME"] = f"EnvironmentWorker_{self.rank}"
-        
-        loop = asyncio.get_event_loop()
-        pool = ThreadPoolExecutor(max_workers=len(self.env_managers))
-        
         def run_with_profiler(env_manager, data_proto):
             with local_profiler():
                 return env_manager.run_rollout_loop(data_proto)
-        
+
         def run_without_profiler(env_manager, data_proto):
             return env_manager.run_rollout_loop(data_proto)
-        
+
+        # get_running_loop() is correct here: we are inside an async def, so a
+        # running loop always exists. get_event_loop() would create a new loop
+        # when called from a thread context and is deprecated in Python 3.10+.
+        loop = asyncio.get_running_loop()
+        # Guard against max_workers=0 (ThreadPoolExecutor crash) when
+        # env_managers is empty.
+        pool = ThreadPoolExecutor(max_workers=len(self.env_managers) or 1)
         tasks = []
         for env_id, env_manager in self.env_managers.items():
             # Only profile the first env_manager (env_id=0) on rank=0
@@ -114,9 +117,10 @@ class EnvironmentWorker(Worker):
             if self.rank == 0 and env_id == 0:
                 run_func = run_with_profiler
             tasks.append(loop.run_in_executor(pool, run_func, env_manager, DataProto(meta_info={"seed": seed})))
-        
         await asyncio.gather(*tasks)
-        pool.shutdown()
+        # wait=False: threads have already finished by the time gather() returns,
+        # so blocking here is unnecessary and delays the caller.
+        pool.shutdown(wait=False)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, clear_cache=False)
     async def update_step(self, global_step):

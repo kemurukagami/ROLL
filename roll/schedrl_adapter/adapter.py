@@ -186,7 +186,7 @@ class SchedRLAdapter:
         _update_system_envs(getattr(pipeline_config, "train_env_manager", None))
         _update_system_envs(getattr(pipeline_config, "val_env_manager", None))
 
-    async def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
+    def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         """Pipeline-scoped resize for actor_infer (ENG-123).
 
         Contract: exactly one of {dp_ranks_to_remove, dp_ranks_to_add} must be non-empty.
@@ -221,5 +221,5 @@ class SchedRLAdapter:
             dp_ranks_to_remove=list(dp_ranks_to_remove),
             dp_ranks_to_add=list(dp_ranks_to_add),
         )
-        await asyncio.wrap_future(ref.future())
+        ray.get(ref)
         return ActionResponse(success=True)

@@ -2,6 +2,7 @@ import math
 import os
 import random
 import threading
+import time
 from collections import defaultdict
 from contextlib import nullcontext
 from functools import partial
@@ -1292,6 +1293,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         tgt_workers,
         tgt_device_mapping: List[int],
         tgt_num_gpus_per_worker: int,
+        model_update_name: Optional[str] = None,
+        comm_plan: Optional[dict] = None,
+        is_leader: bool = False,
     ) -> None:
         if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
             raise RuntimeError("selective_sync_active_cache is only supported under SchedRL control plane")
@@ -1305,6 +1309,15 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             raise ValueError("tgt_num_gpus_per_worker must be positive int")
         if len(tgt_device_mapping) % int(tgt_num_gpus_per_worker) != 0:
             raise RuntimeError("tgt_device_mapping length must be divisible by tgt_num_gpus_per_worker")
+
+        sync_t0 = time.perf_counter()
+        logger.info(
+            "[schedrl][selective_sync] enter "
+            f"sync_id={sync_id} world_rank={dist.get_rank()} "
+            f"tgt_dp_ranks={tgt_dp_ranks} tgt_num_gpus_per_worker={tgt_num_gpus_per_worker} "
+            f"tgt_device_mapping={list(tgt_device_mapping)} "
+            f"train_device_mapping={list(self.worker_config.device_mapping or [])}"
+        )
 
         def _dp_rank_gpus(dp_rank: int) -> List[int]:
             start = int(dp_rank) * int(tgt_num_gpus_per_worker)
@@ -1320,6 +1333,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             if self._active_cached not in self._cache_map:
                 raise RuntimeError(f"active_cached={self._active_cached} missing from cache_map")
             cached_buckets = list(self._cache_map[self._active_cached])
+            logger.info(
+                "[schedrl][selective_sync] cache "
+                f"sync_id={sync_id} world_rank={world_rank} active_cached={self._active_cached} "
+                f"num_buckets={len(cached_buckets)}"
+            )
 
             train_devices = set(int(x) for x in (self.worker_config.device_mapping or []))
             infer_devices = set(int(x) for x in tgt_device_mapping)
@@ -1333,6 +1351,13 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     ipc_target_dp_ranks.add(int(dp_rank))
                 else:
                     broadcast_target_dp_ranks.add(int(dp_rank))
+
+            logger.info(
+                "[schedrl][selective_sync] targets "
+                f"sync_id={sync_id} world_rank={world_rank} is_colocated={int(is_colocated)} "
+                f"ipc_target_dp_ranks={sorted(ipc_target_dp_ranks)} "
+                f"broadcast_target_dp_ranks={sorted(broadcast_target_dp_ranks)}"
+            )
 
             # IPC path (colocated overlapped workers): reuse upstream Megatron mapping/group behavior.
             if ipc_target_dp_ranks:
@@ -1352,11 +1377,22 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 co_infer_rank = dist.get_rank(self._selective_sync_cpu_group)
                 infer_parallel_size = dist.get_world_size(self._selective_sync_cpu_group)
                 infer_worker_idx = (int(world_rank) + int(device_start_diff)) // int(tgt_num_gpus_per_worker)
+                logger.info(
+                    "[schedrl][selective_sync] ipc "
+                    f"sync_id={sync_id} world_rank={world_rank} co_infer_rank={co_infer_rank} "
+                    f"infer_parallel_size={infer_parallel_size} infer_worker_idx={infer_worker_idx} "
+                    f"device_start_diff={device_start_diff} device_end_diff={device_end_diff}"
+                )
 
                 if 0 <= infer_worker_idx < len(tgt_workers) and infer_worker_idx in ipc_target_dp_ranks:
                     co_infer_worker = tgt_workers[infer_worker_idx]
-                    for serialized_tensors in cached_buckets:
+                    for bucket_idx, serialized_tensors in enumerate(cached_buckets):
                         infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
+                        logger.info(
+                            "[schedrl][selective_sync] ipc_gather_enter "
+                            f"sync_id={sync_id} world_rank={world_rank} bucket_idx={bucket_idx} "
+                            f"serialized_len={len(serialized_tensors) if serialized_tensors is not None else 'None'}"
+                        )
                         dist.gather_object(
                             serialized_tensors,
                             infer_parallel_tensors,
@@ -1364,91 +1400,128 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                             group=self._selective_sync_cpu_group,
                         )
                         if co_infer_rank == 0:
+                            logger.info(
+                                "[schedrl][selective_sync] ipc_apply_enter "
+                                f"sync_id={sync_id} world_rank={world_rank} bucket_idx={bucket_idx}"
+                            )
                             ray.get(
                                 co_infer_worker.update_parameter_in_bucket.remote(
                                     infer_parallel_tensors,
                                     is_lora=is_lora,
                                 )
                             )
+                            logger.info(
+                                "[schedrl][selective_sync] ipc_apply_exit "
+                                f"sync_id={sync_id} world_rank={world_rank} bucket_idx={bucket_idx}"
+                            )
 
-            # Broadcast path (separated workers): subset-scoped ephemeral collective group.
+            # Broadcast path (separated workers): ephemeral collective group managed by ModelUpdateService.
+            # TODO: remove comm_plan is None self-setup path once all callers go through ModelUpdateService.
+            assert comm_plan is not None or not is_leader, (
+                "selective_sync_active_cache: comm_plan must be provided for leader ranks. "
+                "Self-setup (comm_plan is None) is no longer supported; use ModelUpdateService."
+            )
             group_name = None
             broadcast_workers = None
-            try:
-                if broadcast_target_dp_ranks and world_rank == 0:
-                    broadcast_workers = [tgt_workers[r] for r in sorted(broadcast_target_dp_ranks)]
-
-                    infer_device_num = int(tgt_num_gpus_per_worker) * len(broadcast_workers)
-                    master_address, master_port = get_node_ip(), collect_free_port()
-
-                    safe_sync_id = str(sync_id).replace("/", "_")
-                    group_name = f"{safe_sync_id}_broadcast"
-
-                    setup_refs = [
-                        worker.setup_collective_group.remote(
-                            master_address=master_address,
-                            master_port=master_port,
-                            group_name=group_name,
-                            rank_offset=i * int(tgt_num_gpus_per_worker) + 1,
-                            world_size=infer_device_num + 1,
-                        )
-                        for i, worker in enumerate(broadcast_workers)
-                    ]
-                    collective.init_collective_group(
-                        infer_device_num + 1,
-                        0,
-                        group_name=group_name,
-                        master_addr=master_address,
-                        master_port=master_port,
+            if broadcast_target_dp_ranks and comm_plan is not None and bool(is_leader):
+                # ModelUpdateService set up the group ahead of time; retrieve group_name and receivers.
+                model_update_name = str(model_update_name) if model_update_name is not None else str(sync_id)
+                if int(self.worker.rank) not in comm_plan:
+                    raise RuntimeError(
+                        "selective_sync_active_cache comm_plan missing sender rank. "
+                        f"sender_rank={int(self.worker.rank)} keys={sorted(int(k) for k in comm_plan.keys())}"
                     )
-                    ray.get(setup_refs)
+                comm_plan_args = comm_plan[int(self.worker.rank)]
+                group_name = str(comm_plan_args["group_name"])
+                planned_ranks = sorted({int(td["rank"]) for td in comm_plan_args.get("tgt_devices", [])})
+                broadcast_workers = [tgt_workers[r] for r in planned_ranks]
+                logger.info(
+                    "[schedrl][selective_sync] broadcast_setup_from_comm_plan "
+                    f"sync_id={sync_id} model_update_name={model_update_name} group_name={group_name} "
+                    f"broadcast_dp_ranks={planned_ranks}"
+                )
 
-                    for serialized_tensors in cached_buckets:
-                        bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_tensors)
-                        # Cache stores bucket as raw bytes; reconstruct to sender GPU for NCCL broadcast.
-                        bucket_bytes = bucket_with_meta.get("bucket_bytes")
-                        tensors_meta = bucket_with_meta.get("tensors_meta")
-                        if bucket_bytes is None or tensors_meta is None:
-                            raise RuntimeError("selective_sync_active_cache cache missing bucket_bytes/tensors_meta")
-                        bucket_cpu = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8)
-                        bucket = bucket_cpu.to(current_platform.device_type).contiguous()
-                        named_params = named_tensors_from_bucket(bucket=bucket, tensors_meta=tensors_meta)
+                for bucket_idx, serialized_tensors in enumerate(cached_buckets):
+                    bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_tensors)
+                    # Cache stores bucket as raw bytes; reconstruct to sender GPU for NCCL broadcast.
+                    bucket_bytes = bucket_with_meta.get("bucket_bytes")
+                    tensors_meta = bucket_with_meta.get("tensors_meta")
+                    if bucket_bytes is None or tensors_meta is None:
+                        raise RuntimeError("selective_sync_active_cache cache missing bucket_bytes/tensors_meta")
+                    bucket_cpu = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8)
+                    bucket = bucket_cpu.to(current_platform.device_type).contiguous()
+                    named_params = named_tensors_from_bucket(bucket=bucket, tensors_meta=tensors_meta)
 
-                        names = [n for n, _ in named_params]
-                        dtypes = [t.dtype for _, t in named_params]
-                        shapes = [t.shape for _, t in named_params]
+                    names = [n for n, _ in named_params]
+                    dtypes = [t.dtype for _, t in named_params]
+                    shapes = [t.shape for _, t in named_params]
 
-                        recv_refs = [
-                            worker.broadcast_parameter.remote(
+                    logger.info(
+                        "[schedrl][selective_sync] broadcast_bucket_enter "
+                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx} "
+                        f"num_tensors={len(names)}"
+                    )
+                    recv_refs = [
+                        worker.broadcast_parameter.remote(
+                            group_name=group_name,
+                            names=names,
+                            dtypes=dtypes,
+                            shapes=shapes,
+                            is_lora=is_lora,
+                        )
+                        for worker in broadcast_workers
+                    ]
+
+                    handles = []
+                    for _, weight in named_params:
+                        handles.append(
+                            collective.broadcast(
+                                tensor=weight,
+                                src_rank=0,
                                 group_name=group_name,
-                                names=names,
-                                dtypes=dtypes,
-                                shapes=shapes,
-                                is_lora=is_lora,
+                                async_op=True,
                             )
-                            for worker in broadcast_workers
-                        ]
-
-                        handles = []
-                        for _, weight in named_params:
-                            handles.append(
-                                collective.broadcast(
-                                    tensor=weight,
-                                    src_rank=0,
-                                    group_name=group_name,
-                                    async_op=True,
-                                )
-                            )
-                        for handle in handles:
-                            handle.wait()
-                        ray.get(recv_refs)
-            finally:
-                if group_name is not None and broadcast_workers is not None and world_rank == 0:
-                    collective.destroy_collective_group(group_name)
-                    ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
+                        )
+                    logger.info(
+                        "[schedrl][selective_sync] broadcast_wait_enter "
+                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx} "
+                        f"num_handles={len(handles)}"
+                    )
+                    for handle in handles:
+                        handle.wait()
+                    logger.info(
+                        "[schedrl][selective_sync] broadcast_wait_exit "
+                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx}"
+                    )
+                    logger.info(
+                        "[schedrl][selective_sync] broadcast_apply_enter "
+                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx} "
+                        f"num_workers={len(broadcast_workers)}"
+                    )
+                    ray.get(recv_refs)
+                    logger.info(
+                        "[schedrl][selective_sync] broadcast_apply_exit "
+                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx}"
+                    )
+                # Destroy groups before dist.barrier(): ncclCommDestroy blocks if called after barrier.
+                logger.info(
+                    "[schedrl][selective_sync] broadcast_teardown_enter "
+                    f"sync_id={sync_id} group_name={group_name}"
+                )
+                collective.destroy_collective_group(group_name)
+                ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
+                logger.info(
+                    "[schedrl][selective_sync] broadcast_teardown_exit "
+                    f"sync_id={sync_id} group_name={group_name}"
+                )
 
             # Critical: ensure all sender ranks complete this sync before allowing another to start.
+            logger.info("[schedrl][selective_sync] barrier_enter " f"sync_id={sync_id} world_rank={world_rank}")
             dist.barrier()
+            logger.info(
+                "[schedrl][selective_sync] barrier_exit "
+                f"sync_id={sync_id} world_rank={world_rank} elapsed_s={time.perf_counter() - sync_t0:.3f}"
+            )
 
     def load_states(self, include=None, non_blocking=False):
         if include is not None:

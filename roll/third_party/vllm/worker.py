@@ -13,6 +13,7 @@ from roll.platforms import current_platform
 from roll.third_party.vllm.vllm_utils import TensorLoRARequest, patch_vllm_lora_manager
 from roll.utils.collective import collective
 from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
+from roll.utils.functionals import get_dist_info_from_comm_plan
 from roll.utils.logging import get_logger
 from roll.utils.send_recv_utils import monkey_patch_torch_reductions, named_tensors_from_bucket
 
@@ -89,7 +90,10 @@ class WorkerBase:
     def offload_states(self, level):
         assert (self.weight_loaded and self.kv_cache_loaded) or (not self.weight_loaded and not self.kv_cache_loaded)
         if not self.weight_loaded:
+            logger.info("[vllm][offload] already offloaded, skip (level=%s)", level)
             return
+        _desc = "destroy weights+KV" if level == 2 else "swap weights to CPU, discard KV"
+        logger.info("[vllm][offload] sleep(level=%s) start: %s", level, _desc)
         if vllm.__version__ < "0.8.5" and level == 2:
             # https://github.com/vllm-project/vllm/issues/16564
             model = self.model_runner.model
@@ -101,23 +105,89 @@ class WorkerBase:
             self.recv_manager.clear()
         gc.collect()
         current_platform.empty_cache()
+        logger.info("[vllm][offload] sleep(level=%s) done: GPU memory %s", level, "fully freed" if level == 2 else "weights on CPU, KV discarded")
 
-    def setup_collective_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):
-        group_rank = self.rank + rank_offset
+    def setup_collective_group(self, *args, **kwargs):
+        # Dynamic comm_plan based group setup (selective model-update style).
+        if "comm_plan" in kwargs:
+            comm_plan = kwargs["comm_plan"]
+            backend = kwargs["backend"]
+            rank_in_cluster = int(kwargs["rank_in_cluster"])
+            timeout_s = kwargs.get("timeout_s", None)
+
+            group_rank, comm_plan_args = get_dist_info_from_comm_plan(
+                comm_plan, rank_in_cluster=rank_in_cluster, rank_in_worker=int(self.rank)
+            )
+            if group_rank is None:
+                logger.info(
+                    f"[schedrl][vllm][collective] setup_skip "
+                    f"rank_in_cluster={rank_in_cluster} rank_in_worker={int(self.rank)}"
+                )
+                return
+
+            group_name = comm_plan_args["group_name"]
+            master_address = comm_plan_args["master_addr"]
+            master_port = comm_plan_args["master_port"]
+            world_size = int(len(comm_plan_args["tgt_devices"]) + 1)
+            logger.info(
+                f"[schedrl][vllm][collective] setup_enter group_name={group_name} "
+                f"rank={group_rank} world_size={world_size} master={master_address}:{master_port} "
+                f"timeout_s={timeout_s}"
+            )
+            collective.init_collective_group(
+                world_size,
+                rank=int(group_rank),
+                backend=backend,
+                group_name=group_name,
+                master_addr=master_address,
+                master_port=master_port,
+                timeout_s=timeout_s,
+            )
+            collective.allreduce(torch.zeros(1, device=current_platform.device_type), group_name=group_name)
+            logger.info(
+                f"[schedrl][vllm][collective] setup_exit group_name={group_name} "
+                f"rank={group_rank} world_size={world_size}"
+            )
+            return
+
+        # Legacy / persistent broadcast group style.
+        if len(args) < 6:
+            raise TypeError(
+                "setup_collective_group expects either comm_plan kwargs or "
+                "(master_address, master_port, rank_offset, world_size, group_name, backend, timeout_s=?)."
+            )
+        master_address, master_port, rank_offset, world_size, group_name, backend = args[:6]
+        timeout_s = kwargs.get("timeout_s", None)
+        group_rank = int(self.rank) + int(rank_offset)
+        logger.info(
+            f"[schedrl][vllm][collective] setup_enter group_name={group_name} "
+            f"rank={group_rank} world_size={world_size} master={master_address}:{master_port} "
+            f"rank_offset={rank_offset} timeout_s={timeout_s}"
+        )
         collective.init_collective_group(
-            world_size,
+            int(world_size),
             rank=group_rank,
             backend=backend,
             group_name=group_name,
             master_addr=master_address,
-            master_port=master_port,
+            master_port=int(master_port),
+            timeout_s=timeout_s,
         )
-        logger.info(f"setup_collective_group: {group_name} rank: {group_rank} world_size: {world_size}")
+        logger.info(
+            f"[schedrl][vllm][collective] setup_exit group_name={group_name} "
+            f"rank={group_rank} world_size={world_size}"
+        )
 
     def destroy_collective_group(self, group_name: str):
+        logger.info(f"[schedrl][vllm][collective] destroy_enter group_name={group_name}")
         collective.destroy_collective_group(group_name)
+        logger.info(f"[schedrl][vllm][collective] destroy_exit group_name={group_name}")
 
     def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
+        logger.info(
+            f"[schedrl][vllm][broadcast] enter group_name={group_name} "
+            f"num_tensors={len(names)} is_lora={int(bool(is_lora))}"
+        )
         weights_and_handles = []
         for name, dtype, shape in zip(names, dtypes, shapes):
             target_dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
@@ -133,8 +203,10 @@ class WorkerBase:
         if is_lora:
             for name, weight in weights_iter():
                 self.tensor_lora_manager.add_weight(name, weight)
+            logger.info(f"[schedrl][vllm][broadcast] exit group_name={group_name} mode=lora")
             return
         self.load_weights(weights=weights_iter())
+        logger.info(f"[schedrl][vllm][broadcast] exit group_name={group_name} mode=weights")
 
     def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
         monkey_patch_torch_reductions()

@@ -349,13 +349,49 @@ class VllmStrategy(InferenceStrategy):
         current_platform.empty_cache()
     
     def process_weights_after_loading(self,*args, **kwargs):
-        self.model.process_weights_after_loading()
+        # CustomAsyncLLM.process_weights_after_loading is async; return the awaitable so caller can await.
+        return self.model.process_weights_after_loading()
 
     # 参数同步相关接口
-    async def setup_collective_group(self, master_address, master_port, rank_offset, world_size, group_name, backend=None):
-        logger.info(f"setup_collective_group {group_name=}")
-        backend = backend if backend is not None else current_platform.communication_backend
-        await self.model.setup_collective_group(master_address, master_port, rank_offset, world_size, group_name, backend)
+    #
+    # We support two call styles:
+    # 1) Dynamic comm_plan based group setup (selective model-update style):
+    #    setup_collective_group(model_update_name=..., comm_plan=..., backend=?, mode=?, timeout_s=?)
+    # 2) Legacy/persistent broadcast group:
+    #    setup_collective_group(master_address=..., master_port=..., rank_offset=..., world_size=..., group_name=..., backend=?, timeout_s=?)
+    async def setup_collective_group(self, *args, **kwargs):
+        if "comm_plan" in kwargs:
+            backend = kwargs.get("backend", None)
+            timeout_s = kwargs.get("timeout_s", None)
+            comm_plan = kwargs["comm_plan"]
+            backend = backend if backend is not None else current_platform.communication_backend
+            await self.model.setup_collective_group(
+                comm_plan=comm_plan, backend=backend, rank_in_cluster=self.worker.rank, timeout_s=timeout_s
+            )
+            return
+
+        required = {"master_address", "master_port", "rank_offset", "world_size", "group_name"}
+        if required.issubset(kwargs.keys()):
+            backend = kwargs.get("backend", None)
+            timeout_s = kwargs.get("timeout_s", None)
+            backend = backend if backend is not None else current_platform.communication_backend
+            logger.info(f"setup_collective_group group_name={kwargs['group_name']!r}")
+            await self.model.setup_collective_group(
+                kwargs["master_address"],
+                kwargs["master_port"],
+                kwargs["rank_offset"],
+                kwargs["world_size"],
+                kwargs["group_name"],
+                backend,
+                timeout_s=timeout_s,
+            )
+            return
+
+        raise TypeError(
+            "VllmStrategy.setup_collective_group expects either "
+            "(model_update_name=..., comm_plan=..., backend=?, mode=?, timeout_s=?) "
+            "or (master_address=..., master_port=..., rank_offset=..., world_size=..., group_name=..., backend=?, timeout_s=?)."
+        )
 
     async def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
         await self.model.broadcast_parameter(names, dtypes, shapes, group_name, is_lora)
@@ -365,6 +401,11 @@ class VllmStrategy(InferenceStrategy):
 
     async def destroy_collective_group(self, group_name: str):
         await self.model.destroy_collective_group(group_name)
+
+    async def teardown_collective_groups(self, model_update_name: str, group_names: List[str]) -> None:
+        del model_update_name
+        for name in group_names:
+            await self.model.destroy_collective_group(name)
 
     async def add_lora(self, peft_config):
         peft_config["target_modules"] = set(self.worker_config.model_args.lora_target)

@@ -1,9 +1,12 @@
 import logging
 import os
 import socket
+import asyncio
+import inspect
+import threading
 from concurrent import futures
 from dataclasses import dataclass
-from typing import Dict, Optional, List
+from typing import Any, Dict, Optional, List
 
 import ray
 
@@ -174,9 +177,11 @@ class Worker:
             self.logger.warning("worker has not strategy")
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def process_weights_after_loading(self):
+    async def process_weights_after_loading(self):
         if getattr(self, "strategy", None) is not None:
-            self.strategy.process_weights_after_loading()
+            result = self.strategy.process_weights_after_loading()
+            if inspect.isawaitable(result):
+                await result
         
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -197,9 +202,70 @@ class Worker:
 
     def setup_collective_group(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:
-            self.strategy.setup_collective_group(*args, **kwargs)
+            self._maybe_await(self.strategy.setup_collective_group(*args, **kwargs))
         else:
             self.logger.warning("worker has not strategy")
+
+    def teardown_collective_groups(self, model_update_name: str, group_names: List[str]) -> None:
+        if getattr(self, "strategy", None) is None:
+            self.logger.warning("worker has not strategy")
+            return
+        teardown = getattr(self.strategy, "teardown_collective_groups", None)
+        if callable(teardown):
+            self._maybe_await(teardown(model_update_name, group_names))
+            return
+        # Backward compatibility: destroy groups one by one if teardown is not implemented.
+        destroy = getattr(self.strategy, "destroy_collective_group", None)
+        if callable(destroy):
+            for name in group_names:
+                self._maybe_await(destroy(name))
+            return
+        raise RuntimeError(f"{type(self.strategy).__name__} does not support teardown_collective_groups")
+
+    def destroy_collective_group(self, group_name: str) -> None:
+        if getattr(self, "strategy", None) is None:
+            self.logger.warning("worker has not strategy")
+            return
+        destroy = getattr(self.strategy, "destroy_collective_group", None)
+        if callable(destroy):
+            self._maybe_await(destroy(group_name))
+            return
+        # Fail fast: we cannot safely infer model_update_name for bookkeeping cleanup.
+        # Call teardown_collective_groups(model_update_name=..., group_names=...) when that context exists.
+        raise RuntimeError(
+            f"{type(self.strategy).__name__} does not support destroy_collective_group; "
+            "use teardown_collective_groups(model_update_name=..., group_names=...) instead."
+        )
+
+    @staticmethod
+    def _maybe_await(result: Any) -> Any:
+        if not inspect.isawaitable(result):
+            return result
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        if not loop.is_running():
+            return loop.run_until_complete(result)
+
+        out: Dict[str, Any] = {}
+        err: Dict[str, BaseException] = {}
+
+        def runner():
+            try:
+                out["value"] = asyncio.run(result)
+            except BaseException as exc:
+                err["exc"] = exc
+
+        t = threading.Thread(target=runner, daemon=True)
+        t.start()
+        t.join()
+        if err:
+            raise err["exc"]
+        return out.get("value")
 
     def setup_p2p_collective_group(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:
@@ -266,19 +332,31 @@ class Worker:
         tgt_workers,
         tgt_device_mapping,
         tgt_num_gpus_per_worker: int,
+        model_update_name: str | None = None,
+        comm_plan=None,
+        is_leader: bool = False,
     ) -> None:
         if getattr(self, "strategy", None) is None:
             raise RuntimeError("worker has no strategy")
         fn = getattr(self.strategy, "selective_sync_active_cache", None)
         if not callable(fn):
             raise RuntimeError(f"{type(self.strategy).__name__} does not support selective_sync_active_cache")
+        self.logger.info(
+            "[schedrl][selective_sync] worker_call_enter "
+            f"sync_id={sync_id} tgt_dp_ranks={list(tgt_dp_ranks)} "
+            f"tgt_num_gpus_per_worker={tgt_num_gpus_per_worker}"
+        )
         fn(
             sync_id=str(sync_id),
             tgt_dp_ranks=tgt_dp_ranks,
             tgt_workers=tgt_workers,
             tgt_device_mapping=tgt_device_mapping,
             tgt_num_gpus_per_worker=int(tgt_num_gpus_per_worker),
+            model_update_name=model_update_name,
+            comm_plan=comm_plan,
+            is_leader=bool(is_leader),
         )
+        self.logger.info(f"[schedrl][selective_sync] worker_call_exit sync_id={sync_id}")
 
     def add_lora(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:

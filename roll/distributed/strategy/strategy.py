@@ -90,7 +90,13 @@ class InferenceStrategy(ABC):
         raise NotImplementedError
 
     def _setup_collective_group_impl(
-            self, model_update_name, comm_plan, backend, mode
+        self,
+        model_update_name,
+        comm_plan,
+        backend,
+        mode,
+        *,
+        timeout_s: Optional[float] = None,
     ):
         """
         mode:
@@ -124,7 +130,7 @@ class InferenceStrategy(ABC):
 
         collective.init_collective_group(
             world_size, rank, backend=backend, group_name=group_name,
-            master_addr=master_addr, master_port=master_port
+            master_addr=master_addr, master_port=master_port, timeout_s=timeout_s
         )
         collective.allreduce(torch.zeros(1).to(current_platform.device_type), group_name=group_name)
 
@@ -140,11 +146,35 @@ class InferenceStrategy(ABC):
         )
         logger.info(f"warmup setup_collective_group: {group_name} rank: {rank} world_size: {world_size}")
 
-    def setup_collective_group(self, model_update_name, comm_plan, backend=None, mode="receiver"):
+    def setup_collective_group(
+        self,
+        model_update_name,
+        comm_plan,
+        backend=None,
+        mode="receiver",
+        *,
+        timeout_s: Optional[float] = None,
+    ):
         """
         单卡infer strategy可直接复用，多卡infer strategy需要自行管理
         """
-        self._setup_collective_group_impl(model_update_name, comm_plan, backend, mode=mode)
+        self._setup_collective_group_impl(model_update_name, comm_plan, backend, mode=mode, timeout_s=timeout_s)
+
+    def teardown_collective_groups(self, model_update_name: str, group_names: List[str]) -> None:
+        # Best-effort cleanup for dynamic model-update groups.
+        if not group_names:
+            return
+        for name in group_names:
+            collective.destroy_collective_group(name)
+
+        # Remove bookkeeping if it exists.
+        plan = getattr(self, "model_update_comm_plan", None)
+        if isinstance(plan, dict) and model_update_name in plan:
+            for src_pp_rank in list(plan[model_update_name].keys()):
+                if plan[model_update_name][src_pp_rank].get("group_name") in set(group_names):
+                    plan[model_update_name].pop(src_pp_rank, None)
+            if not plan[model_update_name]:
+                plan.pop(model_update_name, None)
 
     # offload/load 相关接口
     def load_states(self, *args, **kwargs):
@@ -439,8 +469,16 @@ class TrainStrategy(InferenceStrategy):
         self.scheduler = None
         self.checkpoint_manager = CheckpointManager(checkpoint_config=self.worker_config.checkpoint_config)
 
-    def setup_collective_group(self, model_update_name, comm_plan, backend=None, mode="sender"):
-        self._setup_collective_group_impl(model_update_name, comm_plan, backend, mode=mode)
+    def setup_collective_group(
+        self,
+        model_update_name,
+        comm_plan,
+        backend=None,
+        mode="sender",
+        *,
+        timeout_s: Optional[float] = None,
+    ):
+        self._setup_collective_group_impl(model_update_name, comm_plan, backend, mode=mode, timeout_s=timeout_s)
 
 
     def setup_p2p_collective_group(self, model_update_name, comm_plan, backend="nccl"):

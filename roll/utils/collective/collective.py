@@ -1,4 +1,5 @@
-from typing import Union, Optional
+from datetime import timedelta
+from typing import Optional, Union
 
 from torch._C._distributed_c10d import ReduceOp
 from torch.distributed import Backend
@@ -21,10 +22,22 @@ class GroupManager:
         self._name_group_map = {}
         self._group_name_map = {}
 
-    def create_collective_group(self, backend, world_size, rank, master_addr: str, master_port: int, group_name, global_ranks=None):
+    def create_collective_group(
+        self,
+        backend,
+        world_size,
+        rank,
+        master_addr: str,
+        master_port: int,
+        group_name,
+        global_ranks=None,
+        timeout_s: Optional[float] = None,
+    ):
+        timeout = None if timeout_s is None else timedelta(seconds=float(timeout_s))
         group = init_custom_process_group(
             backend=backend,
             init_method=f"tcp://{master_addr}:{master_port}",
+            timeout=timeout,
             world_size=world_size,
             rank=rank,
             group_name=group_name,
@@ -40,15 +53,13 @@ class GroupManager:
     def get_group_by_name(self, group_name):
         """Get the collective group handle by its name."""
         if not self.is_group_exist(group_name):
-            logger.warning("The group '{}' is not initialized.".format(group_name))
-            return None
+            raise KeyError("The group '{}' is not initialized.".format(group_name))
         return self._name_group_map[group_name]
 
     def destroy_collective_group(self, group_name):
         """Group destructor."""
         if not self.is_group_exist(group_name):
-            logger.warning("The group '{}' does not exist.".format(group_name))
-            return
+            raise KeyError("The group '{}' does not exist.".format(group_name))
 
         # release the collective group resource
         g = self._name_group_map[group_name]
@@ -72,6 +83,7 @@ def init_collective_group(
     backend: Union[str, Backend] = current_platform.communication_backend,
     group_name: str = "default",
     global_ranks: Optional[list] = None,
+    timeout_s: Optional[float] = None,
 ):
     global _group_mgr
     if not group_name:
@@ -83,7 +95,22 @@ def init_collective_group(
     assert world_size > 0
     assert rank >= 0
     assert rank < world_size
-    _group_mgr.create_collective_group(backend, world_size, rank, master_addr, master_port, group_name, global_ranks=global_ranks)
+    logger.info(
+        "[schedrl][collective] init_enter "
+        f"group_name={group_name} backend={backend} rank={rank}/{world_size} master={master_addr}:{master_port} "
+        f"timeout_s={timeout_s}"
+    )
+    _group_mgr.create_collective_group(
+        backend,
+        world_size,
+        rank,
+        master_addr,
+        master_port,
+        group_name,
+        global_ranks=global_ranks,
+        timeout_s=timeout_s,
+    )
+    logger.info(f"[schedrl][collective] init_exit group_name={group_name} rank={rank}/{world_size}")
 
 
 def allreduce(tensor, group_name: str = "default", op=ReduceOp.SUM):

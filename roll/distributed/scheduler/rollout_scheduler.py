@@ -734,6 +734,10 @@ class RolloutScheduler(RolloutMockMixin):
         ray.get(train_rollout_scheduler.shutdown.remote())
     """
     def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, collator=None):
+        # NOTE: This actor is async. Avoid blocking calls in __init__ and log each construction phase
+        # to pinpoint startup stalls (e.g., placement group allocation, child actor creation).
+        self.logger = logger
+        self.logger.info(f"[RolloutScheduler] __init__ enter mode={mode}")
         self.config = config
         self.env_manager_config = env_manager_config
         self.resource_manager = resource_manager
@@ -765,6 +769,7 @@ class RolloutScheduler(RolloutMockMixin):
         env_vars.update(schedrl_env_vars())
         runtime_env = RuntimeEnv(env_vars=env_vars)
 
+        self.logger.info(f"[RolloutScheduler] creating GroupQueueManager mode={self.mode}")
         self.env_output_queue = GroupQueueManager.options(
             name=(
                 f"{self.pipeline_id}_group_queue_manager_{mode}"
@@ -782,7 +787,9 @@ class RolloutScheduler(RolloutMockMixin):
             self.env_manager_config,
             mode
         )
+        self.logger.info(f"[RolloutScheduler] created GroupQueueManager mode={self.mode}")
 
+        self.logger.info(f"[RolloutScheduler] creating RequestScheduler mode={self.mode}")
         self.generate_scheduler = RequestScheduler.options(
                 name=(
                     f"{self.pipeline_id}_request_scheduler_{mode}"
@@ -797,19 +804,32 @@ class RolloutScheduler(RolloutMockMixin):
                 runtime_env=runtime_env,
                 max_concurrency=env_num + 1,  # reserve extra one for suspend/resume
             ).remote(infer_cluster=self.infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
+        self.logger.info(f"[RolloutScheduler] created RequestScheduler mode={self.mode}")
 
+        self.logger.info(f"[RolloutScheduler] creating env Cluster mode={self.mode} name={self.env_manager_config.name}")
         self.es_manager: Any = Cluster(
             name=self.env_manager_config.name,
             worker_cls=self.env_manager_config.worker_cls,
             resource_manager=self.resource_manager,
             worker_config=self.env_manager_config,
+            resolve_topology=False,
         )
-        self.es_manager.initialize(
+        self.logger.info(f"[RolloutScheduler] created env Cluster mode={self.mode} name={self.env_manager_config.name}")
+        # Do not block with ray.get() inside this async actor's constructor.
+        # We kick off initialization on env workers and await it in get_batch().
+        self.logger.info(f"[RolloutScheduler] submitting env initialize mode={self.mode}")
+        self._es_initialize_refs = self.es_manager.initialize(
             pipeline_config=self.config,
             generate_scheduler=self.generate_scheduler,
             output_queue=self.env_output_queue,
             collator=collator,
             mode=self.mode,
+            blocking=False,
+        )
+        self._es_initialized = False
+        self.logger.info(
+            f"[RolloutScheduler] submitted env initialize mode={self.mode} "
+            f"num_refs={len(self._es_initialize_refs) if self._es_initialize_refs else 0}"
         )
 
         self.rollout_task = None
@@ -819,6 +839,7 @@ class RolloutScheduler(RolloutMockMixin):
 
         # Initialize rollout mock mechanism from mixin
         self._init_rollout_mock()
+        self.logger.info(f"[RolloutScheduler] __init__ exit mode={self.mode}")
 
     async def shutdown(self, timeout: float = 10.0):
         if self.rollout_task is None:
@@ -842,6 +863,7 @@ class RolloutScheduler(RolloutMockMixin):
         await self.generate_scheduler.suspend.remote()
 
     async def _run_rollout_loop(self, seed):
+        self.logger.info(f"[RolloutScheduler] start _run_rollout_loop seed={seed} mode={self.mode}")
         await asyncio.gather(*self.es_manager.run_rollout_loop(seed, blocking=False))
 
     async def _get_batch(self, batch_size, global_step):
@@ -849,26 +871,56 @@ class RolloutScheduler(RolloutMockMixin):
 
     async def get_batch(self, data: DataProto, batch_size):
         global_step = data.meta_info["global_step"]
+        self.logger.info(f"[RolloutScheduler] get_batch enter mode={self.mode} global_step={global_step} batch_size={batch_size}")
 
         # MOCK MODE: Load pre-recorded data, skip rollout (from mixin)
         if self._should_load_mock(global_step):
             return await self._load_mock_batch(global_step)
 
+        if not self._es_initialized:
+            self.logger.info(f"[RolloutScheduler] awaiting env worker initialize mode={self.mode}")
+            init_refs = self._es_initialize_refs or []
+            await asyncio.gather(*init_refs)
+            self._es_initialized = True
+            self.logger.info(f"[RolloutScheduler] env worker initialize done mode={self.mode}")
+
         # start env manager
         if self.rollout_task is None:
             seed = random.randint(0, 1000000) if self.mode == "train" else self.config.seed
             self.rollout_task = asyncio.create_task(self._run_rollout_loop(seed))
+            self.logger.info(f"[RolloutScheduler] created rollout_task seed={seed} mode={self.mode}")
 
+        self.logger.info(f"[RolloutScheduler] update_step start mode={self.mode} global_step={global_step}")
         await asyncio.gather(*self.es_manager.update_step(global_step, blocking=False))
+        self.logger.info(f"[RolloutScheduler] update_step done mode={self.mode} global_step={global_step}")
+
+        self.logger.info(f"[RolloutScheduler] advance_step start mode={self.mode} global_step={global_step}")
         await self.env_output_queue.advance_step.remote(global_step)
+        self.logger.info(f"[RolloutScheduler] advance_step done mode={self.mode} global_step={global_step}")
         if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
             await self.generate_scheduler.resume.remote()
 
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
-        await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)
+        self.logger.info(f"[RolloutScheduler] wait for env_output_queue.get_batch mode={self.mode} global_step={global_step}")
+        wait_timeout_s = float(os.environ.get("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", "1800"))
+        done, _ = await asyncio.wait(
+            {get_task, self.rollout_task},
+            return_when=asyncio.FIRST_COMPLETED,
+            timeout=wait_timeout_s,
+        )
+        if not done:
+            raise RuntimeError(
+                f"[RolloutScheduler] get_batch timed out after {wait_timeout_s}s "
+                f"(mode={self.mode}, global_step={global_step}, batch_size={batch_size}). "
+                f"Likely stuck: env rollout loop not producing rollouts, or GroupQueueManager waiting for episodes."
+            )
         if self.rollout_task.done() and self.rollout_task.exception() is not None:
             await self.rollout_task
         data_batch = await get_task
+        self.logger.info(
+            f"[RolloutScheduler] env_output_queue.get_batch returned mode={self.mode} "
+            f"global_step={global_step} items={len(data_batch) if data_batch else 0}"
+        )
         if batch_size <= 0:
             await self.rollout_task
             self.rollout_task = None
@@ -982,9 +1034,9 @@ class RolloutScheduler(RolloutMockMixin):
 
         return result
 
-    def get_active_dp_ranks(self) -> Set[int]:
+    async def get_active_dp_ranks(self) -> Set[int]:
         """Return the current active DP ranks from the underlying RequestScheduler.
 
         Used for state verification after initialization shrink operations.
         """
-        return ray.get(self.generate_scheduler.get_active_dp_ranks.remote())
+        return await self.generate_scheduler.get_active_dp_ranks.remote()

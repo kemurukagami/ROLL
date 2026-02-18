@@ -1348,11 +1348,16 @@ class RequestScheduler:
         return set(self.active_dp_ranks)
 
     async def generate_one_request(self, data: DataProto):
+        schedrl_request_id = data.meta_info.get("schedrl_request_id")
+        src_rank = data.meta_info.get("src_rank")
+        global_step = data.meta_info.get("global_step")
+        t0 = time.time()
         # NOTE: do not block while holding routing_lock. Re-check suspend after acquiring lock
         # to avoid TOCTOU with shrink-to-zero and concurrent shrink/expand.
         while True:
             await self._check_suspend()
-            src_rank = data.meta_info["src_rank"]
+            if src_rank is None:
+                src_rank = data.meta_info["src_rank"]
             # Atomic routing assignment under lock to prevent TOCTOU race with shrink/expand
             async with self.routing_lock:
                 if self.need_suspend:
@@ -1380,6 +1385,12 @@ class RequestScheduler:
         self.running_requests[dp_rank].add(request_id)
 
         try:
+            logger.info(
+                f"[RequestScheduler] dispatch generate_request"
+                f" request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
+                f" active_dp_ranks={sorted(self.active_dp_ranks)}"
+            )
             response_data = await self.infer_cluster.workers[dp_rank].generate_request.remote(data=data)
         finally:
             self.running_requests[dp_rank].remove(request_id)
@@ -1418,6 +1429,20 @@ class RequestScheduler:
         request_repeat = data.repeat(repeat_times=len(output_tokens))
         output.non_tensor_batch = request_repeat.non_tensor_batch
         output.meta_info = request_repeat.meta_info
+
+        elapsed_s = time.time() - t0
+        if elapsed_s >= 30.0:
+            logger.warning(
+                f"[RequestScheduler] generate_one_request slow"
+                f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
+            )
+        else:
+            logger.info(
+                f"[RequestScheduler] generate_one_request done"
+                f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
+            )
         return output
 
     async def abort_request(self):
@@ -1977,9 +2002,8 @@ class RequestScheduler:
         # in active_dp_ranks (e.g., "restore routing to full set" semantics).
         if not skip_load:
             self._validate_calculated_ranks(load_ranks, mode="expand")
-            load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
-            await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
-
+            # In SchedRL mode, delay vLLM KV cache init until after selective model update completes.
+            # This avoids holding large KV allocations during weight sync (which needs extra headroom).
             if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and load_ranks:
                 pipeline_id = os.environ.get("PIPELINE_ID") or None
                 ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
@@ -1999,6 +2023,15 @@ class RequestScheduler:
                     ) from e
                 ref = model_update_service.sync_selected_workers.remote(load_ranks)
                 await asyncio.wrap_future(ref.future())
+                # vLLM may require post-load processing after weights are updated (e.g., FP8 hooks).
+                process_refs = self.infer_cluster.process_weights_after_loading(blocking=False)
+                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in process_refs])
+                # Now that weights are synced, initialize full infer states (incl. KV cache) for rollout.
+                load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
+            else:
+                load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
 
         # Atomic operation under routing_lock
         async with self.routing_lock:

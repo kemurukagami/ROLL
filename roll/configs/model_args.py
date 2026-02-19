@@ -61,6 +61,10 @@ class ModelArguments(LoraArguments):
             "help": "Path to the model weight or identifier from huggingface.co/models or modelscope.cn/models."
         },
     )
+    adapters: Optional[Dict[str, LoraArguments]] = field(
+        default=None,
+        metadata={"help": "List of LoRA adapter configurations."},
+    )
     adapter_name_or_path: Optional[str] = field(
         default=None,
         metadata={"help": "Path to the adapter weight or identifier from huggingface.co/models."},

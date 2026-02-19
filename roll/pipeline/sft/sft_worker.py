@@ -39,6 +39,22 @@ class SFTWorker(Worker):
         return output
 
     @register(Dispatch.DP_MP_DISPATCH_FIRST, clear_cache=False)
+    def train_step_lora(self, data: DataProto):
+        """Multi-LoRA training step.
+
+        Routes to ``MegatronTrainStrategy.train_step_lora`` which dispatches
+        per-adapter optimizer.step() when ``lora_optimizer_mode='per_adapter'``.
+
+        The microbatch must carry ``non_tensor_batch["domain"]`` (or
+        ``"lora_name"``) to identify which adapter owns the batch.
+        """
+        data = data.to(current_platform.device_type)
+        data = self.strategy.get_data_input(data)
+        metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
+        output = DataProto(meta_info={"metrics": metrics}).to("cpu")
+        return output
+
+    @register(Dispatch.DP_MP_DISPATCH_FIRST, clear_cache=False)
     def val_step(self, data: DataProto):
         data = data.to(current_platform.device_type)
         data.meta_info["micro_batch_size"] = self.worker_config.infer_batch_size
@@ -65,6 +81,29 @@ class SFTWorker(Worker):
         metrics.update({f"{metric_prefix}/{k}": v for k, v in exec_metrics.items()})
         output = DataProto(meta_info={"metrics": metrics})
         return output
+
+    # ------------------------------------------------------------------
+    # Per-adapter LoRA weight management (Phase-1 multi-LoRA port)
+    # ------------------------------------------------------------------
+
+    @register(Dispatch.ONE_TO_ALL)
+    def get_lora_tensors(self, adapter_name: str) -> Dict[str, torch.Tensor]:
+        """Return a CPU copy of all LoRA parameter tensors for *adapter_name*.
+
+        Called on all workers; caller typically uses ``result[0]`` (rank-0)
+        since all DP/TP ranks hold the same LoRA weights.
+        """
+        return self.strategy.get_lora_tensors(adapter_name)
+
+    @register(Dispatch.ONE_TO_ALL)
+    def set_lora_tensors(self, adapter_name: str, tensors: Dict[str, torch.Tensor]) -> int:
+        """Overwrite LoRA parameters for *adapter_name* in-place on all workers."""
+        return self.strategy.set_lora_tensors(adapter_name=adapter_name, tensors=tensors)
+
+    @register(Dispatch.ONE_TO_ALL)
+    def copy_lora_params(self, src_adapter: str, dst_adapter: str) -> int:
+        """Copy LoRA parameters from *src_adapter* to *dst_adapter* on all workers."""
+        return self.strategy.copy_lora_params(src_adapter=src_adapter, dst_adapter=dst_adapter)
 
     def loss_func(self, data: DataProto, output_tensor: torch.Tensor):
         labels = data.batch["labels"]

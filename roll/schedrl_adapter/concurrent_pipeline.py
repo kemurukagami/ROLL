@@ -628,11 +628,6 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                         metrics.update(val_metrics)
                         metrics["time/step_val"] = val_timer.last
 
-                    # Release generation GPUs during training phase (scheduler-driven shrink).
-                    if last_notify_ready_step != global_step:
-                        self._notify_ready_to_release_actor_infer(global_step=global_step)
-                        last_notify_ready_step = global_step
-
                     batch = compute_discounted_returns(
                         batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma
                     )
@@ -977,6 +972,12 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
             self.tracker.log(values=metrics, step=global_step)
 
             logger.info(f"[schedrl][{self._pipeline_id}] pipeline step {global_step} finished")
+
+        # Final cleanup: release the last step's actor_infer allocation.
+        # This matches ROLL_multi_pipeline pattern where notify_ready_to_release is called after the loop.
+        if last_notify_ready_step != self.pipeline_config.max_steps - 1:
+            self._notify_ready_to_release_actor_infer(global_step=self.pipeline_config.max_steps - 1)
+            logger.info(f"[schedrl][{self._pipeline_id}] final notify_ready_to_release for step {self.pipeline_config.max_steps - 1}")
 
         ray.get([self.train_rollout_scheduler.shutdown.remote(), self.val_rollout_scheduler.shutdown.remote()])
         logger.info(f"[schedrl][{self._pipeline_id}] pipeline complete!")

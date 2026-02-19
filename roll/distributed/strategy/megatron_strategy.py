@@ -74,9 +74,9 @@ from roll.utils.dynamic_batching import make_micro_batch_iter_for_dynamic_batchi
 from roll.utils.functionals import append_to_dict, reduce_metrics, adjust_sequence_length
 from roll.utils.collective import collective
 from roll.utils.logging import get_logger
+from roll.utils.lora_routing import resolve_microbatch_lora_name
 from roll.utils.network_utils import collect_free_port, get_node_ip
 from roll.utils.offload_states import OffloadStateType
-from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
 from roll.utils.send_recv_utils import _bucket_named_tensors, named_tensors_from_bucket
 from roll.utils.sequence_packing import make_micro_batch_iter_for_sequence_packing, restore_results_order
 
@@ -1020,12 +1020,27 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         ]
         self.models_unwrapped = self.model.get_models()
         self.model.models = self.models_wrapped
+        self.is_lora = (self.worker_config.model_args.adapters is not None) or \
+                       (getattr(self.worker_config.model_args, "lora_target", None) is not None)
 
         params_dtype = (
             torch.float16
             if self.megatron_train_args.fp16
             else torch.bfloat16 if self.megatron_train_args.bf16 else torch.float32
         )
+
+        # ---- lora_optimizer_mode: 'shared' (default) or 'per_adapter' ----
+        self.lora_optimizer_mode: str = (
+            self.worker_config.strategy_args.strategy_config.get("lora_optimizer_mode", "shared")
+            if self.worker_config.strategy_args and self.worker_config.strategy_args.strategy_config
+            else "shared"
+        )
+        if self.lora_optimizer_mode not in ("shared", "per_adapter"):
+            raise ValueError(
+                f"Unknown lora_optimizer_mode={self.lora_optimizer_mode!r} "
+                "(expected 'shared' | 'per_adapter')"
+            )
+
         optimizer_config = OptimizerConfig(
             optimizer=self.megatron_train_args.optimizer,
             lr=self.megatron_train_args.learning_rate,
@@ -1037,14 +1052,129 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             fp16=self.megatron_train_args.fp16,
             bf16=self.megatron_train_args.bf16,
             params_dtype=params_dtype,
-            use_distributed_optimizer=self.megatron_train_args.use_distributed_optimizer,
+            # per_adapter prototype requires non-distributed optimizer.
+            use_distributed_optimizer=(
+                False
+                if self.lora_optimizer_mode == "per_adapter"
+                else self.megatron_train_args.use_distributed_optimizer
+            ),
             clip_grad=self.megatron_train_args.max_grad_norm,
         )
-        self.optimizer: MegatronOptimizer = get_megatron_optimizer(optimizer_config, self.models_wrapped)
 
-        logger.info(f"megatron optimizer: {self.optimizer}")
+        self.adapter_optimizers: Dict[str, MegatronOptimizer] | None = None
+        self.adapter_schedulers: Dict[str, Any] | None = None
 
-        bind_megatron_offload_states_func(optimizer=self.optimizer)
+        if self.lora_optimizer_mode == "shared":
+            self.optimizer: MegatronOptimizer = get_megatron_optimizer(optimizer_config, self.models_wrapped)
+            logger.info(f"megatron optimizer: {self.optimizer}")
+            bind_megatron_offload_states_func(optimizer=self.optimizer)
+        else:
+            # ---- per_adapter mode: one optimizer + scheduler per adapter ----
+            if self.megatron_train_args.use_distributed_optimizer:
+                raise ValueError(
+                    "lora_optimizer_mode='per_adapter' requires use_distributed_optimizer=False"
+                )
+            if not self.is_lora:
+                raise ValueError(
+                    "lora_optimizer_mode='per_adapter' requires LoRA adapters to be configured"
+                )
+            if getattr(self.worker_config.model_args, "model_type", None) == "trl":
+                raise ValueError(
+                    "lora_optimizer_mode='per_adapter' does not support TRL value-head models "
+                    "(model_type='trl'). Disable value head or use lora_optimizer_mode='shared'."
+                )
+
+            adapter_names = list(self.worker_config.model_args.adapters.keys())
+            if not adapter_names:
+                raise ValueError(
+                    "lora_optimizer_mode='per_adapter' requires at least one adapter"
+                )
+
+            # Verify all trainable params are adapter-scoped (no shared trainables like a value head).
+            name_to_param: Dict[str, torch.nn.Parameter] = dict(
+                self.models_unwrapped[0].named_parameters()
+            )
+            original_requires_grad: Dict[str, bool] = {
+                n: bool(p.requires_grad) for n, p in name_to_param.items()
+            }
+            markers = {a: f".{a}." for a in adapter_names}
+
+            shared_trainables: List[str] = []
+            for name, param in name_to_param.items():
+                if not original_requires_grad[name]:
+                    continue
+                if not any(marker in name for marker in markers.values()):
+                    shared_trainables.append(name)
+            if shared_trainables:
+                preview = ", ".join(repr(n) for n in shared_trainables[:10])
+                likely_value_head = any(
+                    ("v_head" in n or "value_head" in n) for n in shared_trainables
+                )
+                hint = (
+                    " This looks like a value head / TRL wrapper. Set model_type: ~ to disable."
+                    if likely_value_head
+                    else ""
+                )
+                raise ValueError(
+                    "lora_optimizer_mode='per_adapter' requires all trainable parameters to be "
+                    f"adapter-scoped (name must include one of: {sorted(markers.values())}). "
+                    f"Found shared trainables (first 10): {preview}. "
+                    "Either freeze these parameters or use lora_optimizer_mode='shared'."
+                    + hint
+                )
+
+            def _apply_trainability_mask_for_adapter(active_adapter: str) -> None:
+                marker = markers[active_adapter]
+                for n, p in name_to_param.items():
+                    p.requires_grad_(bool(original_requires_grad[n] and (marker in n)))
+
+            self.adapter_optimizers = {}
+            self.adapter_schedulers = {}
+            param_id_to_name = {id(p): n for n, p in name_to_param.items()}
+            seen_param_ids: Set[int] = set()
+            for adapter_name in adapter_names:
+                self.models_unwrapped[0].set_adapter(adapter_name)
+                _apply_trainability_mask_for_adapter(adapter_name)
+                adapter_opt = get_megatron_optimizer(optimizer_config, self.models_wrapped)
+                bind_megatron_offload_states_func(optimizer=adapter_opt)
+
+                # Assert optimizer param ownership is isolated to this adapter.
+                marker = markers[adapter_name]
+                for group in getattr(adapter_opt, "param_groups", []):
+                    for param in group.get("params", []):
+                        pid = id(param)
+                        if pid not in param_id_to_name:
+                            raise RuntimeError(
+                                "Per-adapter optimizer captured an unknown parameter object"
+                            )
+                        pname = param_id_to_name[pid]
+                        if marker not in pname:
+                            raise RuntimeError(
+                                f"Per-adapter optimizer for {adapter_name!r} captured "
+                                f"non-scoped param {pname!r}"
+                            )
+                        if pid in seen_param_ids:
+                            raise RuntimeError(
+                                f"Parameter {pname!r} appears in multiple per-adapter optimizers; "
+                                "expected disjoint param sets"
+                            )
+                        seen_param_ids.add(pid)
+
+                self.adapter_optimizers[adapter_name] = adapter_opt
+                self.adapter_schedulers[adapter_name] = get_megatron_lr_scheduler(
+                    self.megatron_train_args,
+                    self.megatron_train_args.max_steps,
+                    optimizer=adapter_opt,
+                )
+
+            # Restore original trainability.
+            for n, p in name_to_param.items():
+                p.requires_grad_(original_requires_grad[n])
+
+            # Chained optimizer for generic offload/load hooks.
+            from megatron.core.optimizer import ChainedOptimizer
+            self.optimizer = ChainedOptimizer(list(self.adapter_optimizers.values()))
+            bind_megatron_offload_states_func(optimizer=self.optimizer)
 
         self.worker.rank_info.dp_rank = mpu.get_data_parallel_rank()
         self.worker.rank_info.dp_size = mpu.get_data_parallel_world_size()
@@ -1206,6 +1336,387 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
     def model_update(self, model_update_name: str):
         return self.weight_updaters[model_update_name].model_update()
+
+    # ------------------------------------------------------------------
+    # Per-adapter multi-LoRA helpers (Phase 1 port)
+    # ------------------------------------------------------------------
+
+    def zero_grad(self) -> None:
+        """Zero Megatron DDP grad buffers and optimizer grad state."""
+        for model in self.model:
+            model.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+    def forward_backward_only(self, batch: DataProto, loss_func: Callable) -> dict:
+        """
+        Run forward/backward to accumulate gradients but do NOT optimizer.step().
+
+        Supports ``batch.meta_info["num_microbatches_override"]`` to bypass the
+        default ``gradient_accumulation_steps`` check (needed for per-adapter
+        one-microbatch-at-a-time accumulation).
+
+        ``batch.meta_info["grad_accumulation_loss_scale"]`` (optional float) is
+        applied as a pre-multiplier on the loss before backward so that several
+        forward_backward_only calls can be composed into a single effective step.
+        """
+        self.model.train()
+
+        if self.worker_config.use_dynamic_batching_in_train:
+            raise RuntimeError("forward_backward_only does not support dynamic batching in train.")
+
+        mini_batch_size = self.worker_config.training_args.per_device_train_batch_size
+        override = batch.meta_info.get("num_microbatches_override", None) if batch.meta_info else None
+        if override is None:
+            num_microbatches = batch.batch.batch_size[0] // mini_batch_size
+            assert (
+                num_microbatches == self.megatron_train_args.gradient_accumulation_steps
+            ), (
+                f"num_microbatches={num_microbatches} gradient_accumulation_steps="
+                f"{self.megatron_train_args.gradient_accumulation_steps}"
+            )
+            micro_batches_list = batch.chunk(chunks=num_microbatches)
+        else:
+            num_microbatches = int(override)
+            if num_microbatches <= 0:
+                raise ValueError(f"num_microbatches_override must be > 0, got {override!r}")
+            if num_microbatches == 1:
+                micro_batches_list = [batch]
+            else:
+                micro_batches_list = batch.chunk(chunks=num_microbatches)
+
+        if self.use_sequence_packing:
+            mini_batch_size = 1
+            self.max_packed_len = self._get_max_packed_len(micro_batches_list)
+
+        # Optionally populate batch_num_tokens so loss_func can use it.
+        for mb in micro_batches_list:
+            if mb.meta_info is None:
+                mb.meta_info = {}
+            if 'batch_num_tokens' not in mb.meta_info:
+                mb.meta_info['batch_num_tokens'] = self._get_batch_num_tokens(
+                    mb, dp_group=mpu.get_data_parallel_group()
+                )
+
+        loss_scale = (
+            batch.meta_info.get("grad_accumulation_loss_scale", None)
+            if batch.meta_info
+            else None
+        )
+        if loss_scale is not None:
+            loss_scale = float(loss_scale)
+            if loss_scale <= 0:
+                raise ValueError(f"grad_accumulation_loss_scale must be > 0, got {loss_scale}")
+
+            def scaled_loss_func(data: DataProto, output_tensor: torch.Tensor):
+                out = loss_func(data, output_tensor)
+                if not isinstance(out, tuple):
+                    raise TypeError(f"loss_func must return a tuple, got {type(out)}")
+                if len(out) == 2:
+                    raw_loss, metrics = out
+                    return raw_loss * loss_scale, metrics
+                if len(out) == 3:
+                    raw_loss, num_tokens, metrics = out
+                    return raw_loss * loss_scale, num_tokens, metrics
+                raise TypeError(
+                    f"loss_func returned a {len(out)}-tuple; expected 2 or 3 elements"
+                )
+
+            effective_loss_func = scaled_loss_func
+        else:
+            effective_loss_func = loss_func
+
+        data_iterator = [iter(micro_batches_list) for _ in range(len(self.model))]
+        metrics_tensors: List[Dict[str, "torch.Tensor"]] = self.forward_backward_func(
+            forward_step_func=partial(self.inner_forward_step, effective_loss_func),
+            data_iterator=data_iterator,
+            model=self.model.get_models(),
+            num_microbatches=num_microbatches,
+            seq_length=self.seq_length if not self.use_sequence_packing else self.max_packed_len,
+            micro_batch_size=mini_batch_size,
+            forward_only=False,
+        )
+
+        metrics: dict = {}
+        for mini_metrics in metrics_tensors:
+            append_to_dict(metrics, mini_metrics)
+        return metrics
+
+    def optimizer_step_only(
+        self, *, adapter_name: str | None = None, batch_meta: dict | None = None
+    ) -> dict:
+        """
+        Perform optimizer.step() + scheduler.step() + zero_grad assuming gradients are already
+        accumulated via forward_backward_only().
+
+        When ``adapter_name`` is provided (per_adapter mode), only that adapter's
+        optimizer is stepped. Otherwise the shared optimizer is used.
+        """
+        if self.lora_optimizer_mode == "per_adapter" and adapter_name is None:
+            raise RuntimeError(
+                "optimizer_step_only requires adapter_name when lora_optimizer_mode='per_adapter'"
+            )
+        if self.lora_optimizer_mode == "shared" and adapter_name is not None:
+            raise RuntimeError(
+                "optimizer_step_only: adapter_name must be None for lora_optimizer_mode='shared'"
+            )
+
+        is_offload = True
+        if batch_meta is not None:
+            is_offload = bool(batch_meta.get("is_offload_optimizer_states_in_train_step", True))
+
+        if adapter_name is not None:
+            opt = self.adapter_optimizers[adapter_name]
+            sch = self.adapter_schedulers[adapter_name]
+        else:
+            opt = self.optimizer
+            sch = self.scheduler
+
+        self.load_states(include=[OffloadStateType.optimizer_states])
+        grad_norm_unclip = opt.get_grad_norm()
+        update_successful, grad_norm, _num_zeros_in_grad = opt.step()
+        if is_offload:
+            self.offload_states(include=[OffloadStateType.optimizer_states], non_blocking=True)
+
+        if update_successful:
+            sch.step()
+        else:
+            raise NotImplementedError("megatron optimizer step failed!")
+
+        for model in self.model:
+            model.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+        prefix = self.worker_config.name
+        name_prefix = f"{prefix}/{adapter_name}" if adapter_name else prefix
+        return {
+            f"{name_prefix}/grad_norm": grad_norm,
+            f"{name_prefix}/grad_norm_unclip": grad_norm_unclip,
+        }
+
+    def train_step_lora(self, batch_or_microbatches: Any, loss_func: Callable) -> dict:
+        """
+        LoRA training step with two possible modes.
+
+        - ``lora_optimizer_mode='shared'``: accumulate gradients across all
+          microbatches then do one optimizer step (existing shared semantics).
+        - ``lora_optimizer_mode='per_adapter'``: per-adapter optimizer + scheduler
+          state; one optimizer step per adapter that appears in this call.
+          A single call with N domains is equivalent to N separate single-domain
+          calls — the key correctness claim of adapter isolation.
+
+        Adapter routing uses ``non_tensor_batch["domain"]`` (ROLL_schedrl
+        convention) or ``non_tensor_batch["lora_name"]`` as fallback.
+        """
+        if not self.is_lora:
+            raise RuntimeError(
+                "train_step_lora called but LoRA is not enabled for this strategy."
+            )
+
+        # ----------------------------------------------------------------
+        # Shared mode: forward existing train_step logic via forward/backward
+        # ----------------------------------------------------------------
+        if self.lora_optimizer_mode == "shared":
+            if isinstance(batch_or_microbatches, list):
+                if len(batch_or_microbatches) == 0:
+                    raise ValueError("train_step_lora(shared) received empty microbatch list")
+                self.zero_grad()
+                loss_scale = 1.0 / len(batch_or_microbatches)
+                metrics: Dict[str, Any] = {}
+                for mb in batch_or_microbatches:
+                    if mb.meta_info is None:
+                        mb.meta_info = {}
+                    mb.meta_info.setdefault("num_microbatches_override", 1)
+                    mb.meta_info.setdefault("grad_accumulation_loss_scale", loss_scale)
+                    append_to_dict(metrics, self.forward_backward_only(mb, loss_func))
+                append_to_dict(
+                    metrics,
+                    self.optimizer_step_only(batch_meta=batch_or_microbatches[0].meta_info),
+                )
+                return metrics
+            self.zero_grad()
+            metrics = self.forward_backward_only(batch_or_microbatches, loss_func)
+            append_to_dict(
+                metrics,
+                self.optimizer_step_only(batch_meta=batch_or_microbatches.meta_info),
+            )
+            return metrics
+
+        # ----------------------------------------------------------------
+        # Per-adapter mode
+        # ----------------------------------------------------------------
+        if self.adapter_optimizers is None or self.adapter_schedulers is None:
+            raise RuntimeError(
+                "train_step_lora(per_adapter) requires adapter_optimizers/adapter_schedulers "
+                "to be initialized"
+            )
+
+        if isinstance(batch_or_microbatches, list):
+            microbatches = batch_or_microbatches
+        else:
+            if self.worker_config.use_dynamic_batching_in_train:
+                raise RuntimeError(
+                    "train_step_lora(per_adapter) does not support dynamic batching in train."
+                )
+            micro_batch_size = self.worker_config.training_args.per_device_train_batch_size
+            if batch_or_microbatches.batch.batch_size[0] % micro_batch_size != 0:
+                raise RuntimeError(
+                    f"batch_size {batch_or_microbatches.batch.batch_size[0]} must be divisible "
+                    f"by micro_batch_size {micro_batch_size}"
+                )
+            num_microbatches = batch_or_microbatches.batch.batch_size[0] // micro_batch_size
+            microbatches = batch_or_microbatches.chunk(chunks=num_microbatches)
+
+        first_meta = (
+            microbatches[0].meta_info if microbatches and microbatches[0].meta_info else {}
+        )
+        is_offload_optimizer_states_in_train_step = bool(
+            first_meta.get("is_offload_optimizer_states_in_train_step", True)
+        )
+
+        # Determine the order of adapters and per-adapter microbatch counts.
+        adapters_in_order: List[str] = []
+        microbatch_counts: Dict[str, int] = {}
+        microbatch_adapters: List[str] = []
+        for mb in microbatches:
+            routing = resolve_microbatch_lora_name(mb.non_tensor_batch)
+            adapter_name = routing.lora_name
+            microbatch_adapters.append(adapter_name)
+            microbatch_counts[adapter_name] = microbatch_counts.get(adapter_name, 0) + 1
+            if adapter_name not in adapters_in_order:
+                adapters_in_order.append(adapter_name)
+
+        metrics: Dict[str, Any] = {}
+
+        # (1) Forward/backward accumulation across all microbatches (no optimizer step yet).
+        self.zero_grad()
+        for mb, adapter_name in zip(microbatches, microbatch_adapters):
+            if mb.meta_info is None:
+                mb.meta_info = {}
+            mb.meta_info["num_microbatches_override"] = 1
+            mb.meta_info["grad_accumulation_loss_scale"] = (
+                1.0 / float(microbatch_counts[adapter_name])
+            )
+            append_to_dict(metrics, self.forward_backward_only(mb, loss_func))
+
+        # (2) Step once per adapter that participated in this call.
+        self.load_states(include=[OffloadStateType.optimizer_states])
+        for adapter_name in adapters_in_order:
+            opt = self.adapter_optimizers.get(adapter_name)
+            sch = self.adapter_schedulers.get(adapter_name)
+            if opt is None or sch is None:
+                raise RuntimeError(
+                    f"Missing optimizer/scheduler for adapter {adapter_name!r}"
+                )
+            grad_norm_unclip = opt.get_grad_norm()
+            update_successful, grad_norm, _ = opt.step()
+            if update_successful:
+                sch.step()
+            else:
+                raise NotImplementedError("megatron optimizer step failed!")
+
+            append_to_dict(
+                metrics,
+                {
+                    f"{self.worker_config.name}/{adapter_name}/grad_norm": grad_norm,
+                    f"{self.worker_config.name}/{adapter_name}/grad_norm_unclip": grad_norm_unclip,
+                },
+            )
+
+        if is_offload_optimizer_states_in_train_step:
+            self.offload_states(include=[OffloadStateType.optimizer_states], non_blocking=True)
+
+        # Reset Megatron DDP grad buffers and optimizer grad state.
+        for model in self.model:
+            model.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+        # Restore all adapters active (PEFT sometimes expects list of active adapters).
+        active_adapters = list(self.worker_config.model_args.adapters.keys())
+        for model in self.models_unwrapped:
+            model.base_model.set_adapter(active_adapters)
+
+        return metrics
+
+    def get_lora_tensors(self, adapter_name: str) -> Dict[str, torch.Tensor]:
+        """Return a CPU copy of all LoRA parameter tensors for *adapter_name*."""
+        if not self.is_lora:
+            raise RuntimeError(
+                "get_lora_tensors called but LoRA is not enabled for this strategy."
+            )
+        marker = f".{adapter_name}."
+        tensors: Dict[str, torch.Tensor] = {}
+        for name, param in self.models_unwrapped[0].named_parameters():
+            if "lora_" not in name:
+                continue
+            if marker not in name:
+                continue
+            tensors[name] = param.detach().cpu().clone()
+        if not tensors:
+            raise RuntimeError(
+                f"No LoRA tensors found for adapter {adapter_name!r}; check adapter naming."
+            )
+        return tensors
+
+    def set_lora_tensors(
+        self, *, adapter_name: str, tensors: Dict[str, torch.Tensor]
+    ) -> int:
+        """Overwrite the LoRA parameters for *adapter_name* with *tensors* (in-place)."""
+        if not self.is_lora:
+            raise RuntimeError(
+                "set_lora_tensors called but LoRA is not enabled for this strategy."
+            )
+        marker = f".{adapter_name}."
+        name_to_param = dict(self.models_unwrapped[0].named_parameters())
+        copied = 0
+        for name, value in tensors.items():
+            if "lora_" not in name:
+                continue
+            if marker not in name:
+                continue
+            if name not in name_to_param:
+                raise KeyError(
+                    f"Unknown LoRA param name {name!r} when setting adapter {adapter_name!r}"
+                )
+            param = name_to_param[name]
+            src = value.detach()
+            if src.device != param.device or src.dtype != param.dtype:
+                src = src.to(device=param.device, dtype=param.dtype)
+            param.data.copy_(src)
+            copied += 1
+        if copied == 0:
+            raise RuntimeError(
+                f"No LoRA tensors applied for adapter {adapter_name!r}; "
+                "check naming and tensor keys."
+            )
+        return copied
+
+    def copy_lora_params(self, *, src_adapter: str, dst_adapter: str) -> int:
+        """Copy LoRA parameters in-place from *src_adapter* to *dst_adapter*."""
+        if not self.is_lora:
+            raise RuntimeError(
+                "copy_lora_params called but LoRA is not enabled for this strategy."
+            )
+        src_marker = f".{src_adapter}."
+        dst_marker = f".{dst_adapter}."
+        name_to_param = dict(self.models_unwrapped[0].named_parameters())
+        copied = 0
+        for name, param in name_to_param.items():
+            if "lora_" not in name:
+                continue
+            if src_marker not in name:
+                continue
+            dst_name = name.replace(src_marker, dst_marker)
+            if dst_name not in name_to_param:
+                raise KeyError(
+                    f"Expected destination param {dst_name!r} for source {name!r}"
+                )
+            name_to_param[dst_name].data.copy_(param.data)
+            copied += 1
+        if copied == 0:
+            raise RuntimeError(
+                "No LoRA parameters copied; check adapter naming and parameter patterns."
+            )
+        return copied
 
     def _ensure_selective_sync_cpu_group(self, *, infer_tp_size: int) -> None:
         if self._selective_sync_cpu_group is not None and self._selective_sync_cpu_group_size == int(infer_tp_size):
@@ -1524,6 +2035,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             )
 
     def load_states(self, include=None, non_blocking=False):
+        # per_adapter mode: optimizer states are kept resident; only reload model params.
+        if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
+            if include is None or OffloadStateType.model_params in include:
+                reload_megatron_no_grad_module(model_chunks=self.model.get_models())
+            return
+
         if include is not None:
             include_states = []
             if OffloadStateType.model_params in include:
@@ -1537,17 +2054,31 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.optimizer.reload_states(include=include, non_blocking=non_blocking)
 
     def offload_states(self, include=None, non_blocking=False, pin_memory=True):
+        # per_adapter mode: only offload model params (optimizer states stay on GPU).
+        if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
+            if include is None or OffloadStateType.model_params in include:
+                offload_megatron_no_grad_module(
+                    model_chunks=self.model.get_models(), pin_memory=pin_memory
+                )
+            RotaryEmbedding.forward.cache_clear()
+            current_platform.empty_cache()
+            return
+
         if include is not None:
             include_states = []
             if OffloadStateType.model_params in include:
-                offload_megatron_no_grad_module(model_chunks=self.model.get_models(), pin_memory=pin_memory)
+                offload_megatron_no_grad_module(
+                    model_chunks=self.model.get_models(), pin_memory=pin_memory
+                )
                 include_states.append(MegatronOffloadStateType.model_params)
             if OffloadStateType.other_params in include:
                 include_states.append(MegatronOffloadStateType.other_params)
             if OffloadStateType.optimizer_states in include:
                 include_states.append(MegatronOffloadStateType.optimizer_states)
             include = include_states
-        self.optimizer.offload_states(include=include, non_blocking=non_blocking, pin_memory=pin_memory)
+        self.optimizer.offload_states(
+            include=include, non_blocking=non_blocking, pin_memory=pin_memory
+        )
         RotaryEmbedding.forward.cache_clear()
         current_platform.empty_cache()
 

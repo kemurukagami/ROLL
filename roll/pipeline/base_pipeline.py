@@ -85,6 +85,14 @@ class BasePipeline:
             model_update_group.tgt_cluster.process_weights_after_loading()
         return metrics
 
+    def model_update_lora_subset(self, global_step: int, *, adapters_to_update: set[str] | None = None) -> dict:
+        """Adapter-subset model update helper for multi-LoRA pipelines."""
+        metrics: dict = {}
+        for model_update_group in self.model_update_groups:
+            metrics.update(model_update_group.model_update(step=global_step, adapters_to_update=adapters_to_update))
+            model_update_group.tgt_cluster.process_weights_after_loading()
+        return metrics
+
     def do_checkpoint(self, global_step, is_last_step=None):
         if is_last_step is None:
             is_last_step = global_step == self.pipeline_config.max_steps - 1

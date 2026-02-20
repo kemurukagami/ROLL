@@ -28,13 +28,17 @@ class ModelUpdateGroup:
             ]
         )
 
-    def model_update(self, step=None):
+    def model_update(self, step=None, adapters_to_update: set[str] | None = None):
         if step % self.frequency != 0:
             return {}
 
+        kwargs = {"model_update_name": self.model_update_name}
+        if adapters_to_update is not None:
+            kwargs["adapters_to_update"] = sorted(adapters_to_update)
+
         dataprotos: list[DataProto] = ray.get(
             [
-                train_worker.start_model_update.remote(model_update_name=self.model_update_name)
+                train_worker.start_model_update.remote(**kwargs)
                 for train_worker in self.src_cluster.workers
             ]
         )

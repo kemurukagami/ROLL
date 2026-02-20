@@ -129,9 +129,16 @@ class SchedRLAdapter:
         if self._coordinator is not None:
             return self._coordinator
 
-        from roll.schedrl_adapter.concurrent_pipeline import SchedRLConcurrentPipeline
+        adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
+        adapters = getattr(adapters, "adapters", None) if adapters is not None else None
+        if adapters:
+            from roll.schedrl_adapter.multi_lora_pipeline import SchedRLMultiLoraPipeline
+            PipelineClass = SchedRLMultiLoraPipeline
+        else:
+            from roll.schedrl_adapter.concurrent_pipeline import SchedRLConcurrentPipeline
+            PipelineClass = SchedRLConcurrentPipeline
 
-        Coordinator = ray.remote(SchedRLConcurrentPipeline)
+        Coordinator = ray.remote(PipelineClass)
         # Safety: always inject env vars before constructing the coordinator, so callers can't
         # accidentally create a pipeline with missing system_envs.
         self._inject_pipeline_env_vars(pipeline_config=pipeline_config)

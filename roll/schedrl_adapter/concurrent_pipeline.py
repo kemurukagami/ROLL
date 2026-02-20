@@ -175,6 +175,37 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                     resource_manager=self.resource_manager,
                 )
 
+            # shared RequestScheduler (named actor).
+            request_scheduler_name = f"RequestScheduler-{self._pipeline_id}"
+            # Standard control-plane env vars for RequestScheduler (same as RolloutScheduler uses internally)
+            control_env_vars = {
+                "TORCH_COMPILE_DISABLE": "1",
+                "TORCHINDUCTOR_COMPILE_THREADS": "1",
+                "RAY_num_server_call_thread": "1",
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "OPENBLAS_NUM_THREADS": "1",
+                "NUMEXPR_NUM_THREADS": "1",
+                "TOKENIZERS_PARALLELISM": "false",
+            }
+            control_env_vars.update(schedrl_env_vars())
+
+            self.generate_scheduler = RequestScheduler.options(
+                name=request_scheduler_name,
+                namespace=RAY_NAMESPACE,
+                get_if_exists=True,
+                runtime_env={"env_vars": control_env_vars},
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ray.get_runtime_context().get_node_id(),
+                    soft=False,
+                ),
+                max_concurrency=1024, # Large enough for shared use
+            ).remote(
+                infer_cluster=self.actor_infer,
+                pipeline_config=self.pipeline_config,
+                resource_manager=self.resource_manager,
+            )
+
             # Rollout schedulers (named actors).
             self.train_rollout_scheduler = ray.remote(RolloutScheduler).options(
                 name=f"RolloutScheduler-{self._pipeline_id}-train",
@@ -190,6 +221,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="train",
+                request_scheduler=self.generate_scheduler,
             )
             self.val_rollout_scheduler = ray.remote(RolloutScheduler).options(
                 name=f"RolloutScheduler-{self._pipeline_id}-val",
@@ -205,6 +237,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                 resource_manager=self.resource_manager,
                 infer_cluster=self.actor_infer,
                 mode="val",
+                request_scheduler=self.generate_scheduler,
             )
 
             # Create val dataset manager as in AgenticPipeline.
@@ -405,6 +438,39 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
 
             self._initialized = True
             return ActionResponse(success=True)
+
+    def _shrink_workers(self, *, dp_ranks_to_remove: List[int]) -> Dict[str, Any]:
+        """Pipeline-local shrink helper (ENG-123).
+
+        In SchedRL mode with shared RequestScheduler, a single call performs:
+        - routing-only shrink (updates shared active_dp_ranks)
+        - physical offload (skip_offload=False)
+        """
+        if not isinstance(dp_ranks_to_remove, list) or not dp_ranks_to_remove:
+            raise ValueError("dp_ranks_to_remove must be a non-empty list[int]")
+        with self._infer_resize_lock:
+            # Both train and val share self.generate_scheduler.
+            # One call with skip_offload=False is sufficient.
+            return ray.get(
+                self.train_rollout_scheduler.shrink_sampler.remote(dp_ranks_to_remove, skip_offload=False)
+            )
+
+    def _expand_workers(self, *, dp_ranks_to_add: List[int], train_skip_load: bool) -> Dict[str, Any]:
+        """Pipeline-local expand helper (ENG-123).
+
+        In SchedRL mode with shared RequestScheduler, a single call performs:
+        - weight load (skip_load=train_skip_load)
+        - routing-only expand (updates shared active_dp_ranks)
+        """
+        if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
+            raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
+        with self._infer_resize_lock:
+            # Both train and val share self.generate_scheduler.
+            return ray.get(
+                self.train_rollout_scheduler.expand_sampler.remote(
+                    dp_ranks_to_add, skip_load=bool(train_skip_load)
+                )
+            )
 
     def _ensure_initialized(self) -> None:
         if not self._initialized:

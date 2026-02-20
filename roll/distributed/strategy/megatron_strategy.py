@@ -123,6 +123,7 @@ class MegatronInferStrategy(InferenceStrategy):
         self.forward_backward_func = get_forward_backward_func()
 
         self.seq_length = self.worker.pipeline_config.sequence_length
+        self.is_lora = self.worker_config.model_args.adapters is not None
 
         self.worker.rank_info.dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
         self.worker.rank_info.dp_size = mpu.get_data_parallel_world_size(with_context_parallel=False)
@@ -412,6 +413,10 @@ class MegatronInferStrategy(InferenceStrategy):
 
     def inner_forward_step(self, loss_func, data_iterator: Iterator[DataProto], model):
         data = next(data_iterator)
+        if self.is_lora:
+            routing = resolve_microbatch_lora_name(data.non_tensor_batch)
+            for m in self.models_unwrapped:
+                m.set_adapter(routing.lora_name)
         input_ids = data.batch["input_ids"]
         attention_mask = data.batch["attention_mask"]
         labels = data.batch["labels"] if "labels" in data.batch else None  # labels is only used for sft
@@ -985,6 +990,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self._selective_sync_cpu_group = None
         self._selective_sync_cpu_group_size: Optional[int] = None
 
+        # Per-adapter versioned cache (multi-LoRA selective sync)
+        self._adapter_cache_map: Dict[str, Dict[Tuple[int, int], List[Any]]] = {}
+        self._latest_adapter_cached: Dict[str, Optional[Tuple[int, int]]] = {}
+        self._active_adapter_cached: Dict[str, Optional[Tuple[int, int]]] = {}
+
     def initialize(self, model_provider):
         self.seq_length = self.worker.pipeline_config.sequence_length
         self.weight_updaters: dict[str, MegatronWeightUpdater] = {}
@@ -1074,6 +1084,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 raise ValueError(
                     "lora_optimizer_mode='per_adapter' requires use_distributed_optimizer=False"
                 )
+            if self.megatron_train_args.overlap_grad_reduce:
+                raise ValueError(
+                    "lora_optimizer_mode='per_adapter' requires overlap_grad_reduce=False. "
+                    "With overlap_grad_reduce=True, idle adapters' DDP backward hooks never fire "
+                    "during another adapter's sequential pass, causing a hang in finish_grad_sync()."
+                )
             if not self.is_lora:
                 raise ValueError(
                     "lora_optimizer_mode='per_adapter' requires LoRA adapters to be configured"
@@ -1121,6 +1137,24 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     f"Found shared trainables (first 10): {preview}. "
                     "Either freeze these parameters or use lora_optimizer_mode='shared'."
                     + hint
+                )
+
+            # Check that BN/LN running-stats buffers are adapter-scoped (plan item 16).
+            # These buffers have requires_grad=False so they are NOT caught by the param check above.
+            _NORM_BUFFER_TAGS = ("running_mean", "running_var", "num_batches_tracked")
+            shared_norm_buffers: List[str] = [
+                name
+                for name, _ in self.models_unwrapped[0].named_buffers()
+                if any(tag in name for tag in _NORM_BUFFER_TAGS)
+                and not any(marker in name for marker in markers.values())
+            ]
+            if shared_norm_buffers:
+                preview = ", ".join(repr(n) for n in shared_norm_buffers[:10])
+                raise ValueError(
+                    "lora_optimizer_mode='per_adapter' requires BN/LN running-stats buffers to be "
+                    f"adapter-scoped (name must include one of: {sorted(markers.values())}). "
+                    f"Found shared norm buffers (first 10): {preview}. "
+                    "Wrap BN/LN layers in nn.ModuleDict keyed by adapter name."
                 )
 
             def _apply_trainability_mask_for_adapter(active_adapter: str) -> None:
@@ -1175,6 +1209,18 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             from megatron.core.optimizer import ChainedOptimizer
             self.optimizer = ChainedOptimizer(list(self.adapter_optimizers.values()))
             bind_megatron_offload_states_func(optimizer=self.optimizer)
+
+            # Initialize per-adapter RNG states for sequential training (plan item 15).
+            # Each adapter starts from the current global RNG state; they diverge as training progresses.
+            self.adapter_rng_states: Dict[str, Dict[str, Any]] = {
+                name: {
+                    "cpu": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state(),
+                    "python": random.getstate(),
+                    "numpy": np.random.get_state(),
+                }
+                for name in adapter_names
+            }
 
         self.worker.rank_info.dp_rank = mpu.get_data_parallel_rank()
         self.worker.rank_info.dp_size = mpu.get_data_parallel_world_size()
@@ -1573,46 +1619,73 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             first_meta.get("is_offload_optimizer_states_in_train_step", True)
         )
 
-        # Determine the order of adapters and per-adapter microbatch counts.
+        # Group microbatches by adapter (preserve encounter order for adapter ordering).
         adapters_in_order: List[str] = []
-        microbatch_counts: Dict[str, int] = {}
-        microbatch_adapters: List[str] = []
+        adapter_to_mbs: Dict[str, List] = {}
         for mb in microbatches:
             routing = resolve_microbatch_lora_name(mb.non_tensor_batch)
             adapter_name = routing.lora_name
-            microbatch_adapters.append(adapter_name)
-            microbatch_counts[adapter_name] = microbatch_counts.get(adapter_name, 0) + 1
-            if adapter_name not in adapters_in_order:
+            if adapter_name not in adapter_to_mbs:
                 adapters_in_order.append(adapter_name)
+                adapter_to_mbs[adapter_name] = []
+            adapter_to_mbs[adapter_name].append(mb)
 
         metrics: Dict[str, Any] = {}
 
-        # (1) Forward/backward accumulation across all microbatches (no optimizer step yet).
-        self.zero_grad()
-        for mb, adapter_name in zip(microbatches, microbatch_adapters):
-            if mb.meta_info is None:
-                mb.meta_info = {}
-            mb.meta_info["num_microbatches_override"] = 1
-            mb.meta_info["grad_accumulation_loss_scale"] = (
-                1.0 / float(microbatch_counts[adapter_name])
-            )
-            append_to_dict(metrics, self.forward_backward_only(mb, loss_func))
-
-        # (2) Step once per adapter that participated in this call.
+        # Sequential per-adapter loop (plan item 15): for each adapter, restore its RNG state,
+        # run forward/backward for its microbatches, save its RNG state, then step its optimizer.
+        # This guarantees RNG isolation between adapters (dropout masks are deterministic per-adapter).
+        # Requires overlap_grad_reduce=False (checked at init): finalize_model_grads() does a
+        # synchronous all-reduce that safely handles zero grads for idle adapters — no DDP hang.
         self.load_states(include=[OffloadStateType.optimizer_states])
         for adapter_name in adapters_in_order:
             opt = self.adapter_optimizers.get(adapter_name)
             sch = self.adapter_schedulers.get(adapter_name)
             if opt is None or sch is None:
-                raise RuntimeError(
-                    f"Missing optimizer/scheduler for adapter {adapter_name!r}"
-                )
+                raise RuntimeError(f"Missing optimizer/scheduler for adapter {adapter_name!r}")
+
+            # Restore this adapter's RNG state before forward passes.
+            rng = self.adapter_rng_states[adapter_name]
+            torch.set_rng_state(rng["cpu"])
+            torch.cuda.set_rng_state(rng["cuda"])
+            random.setstate(rng["python"])
+            np.random.set_state(rng["numpy"])
+
+            # Forward/backward for this adapter's microbatches only.
+            self.zero_grad()
+            adapter_mbs = adapter_to_mbs[adapter_name]
+            count = len(adapter_mbs)
+            for mb in adapter_mbs:
+                if mb.meta_info is None:
+                    mb.meta_info = {}
+                mb.meta_info["num_microbatches_override"] = 1
+                mb.meta_info["grad_accumulation_loss_scale"] = 1.0 / float(count)
+                append_to_dict(metrics, self.forward_backward_only(mb, loss_func))
+
+            # Save this adapter's RNG state after its forward passes.
+            self.adapter_rng_states[adapter_name] = {
+                "cpu": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state(),
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+            }
+
             grad_norm_unclip = opt.get_grad_norm()
             update_successful, grad_norm, _ = opt.step()
             if update_successful:
                 sch.step()
             else:
                 raise NotImplementedError("megatron optimizer step failed!")
+
+            # Mirror train_step (lines 1337-1341): clear bucket caches after each adapter step.
+            # Offload/reload does not update cached_param_buffer_shard_list/cached_grad_buffer_shard_list;
+            # stale caches cause wrong params in start_param_sync (relevant when use_distributed_optimizer=True).
+            for m in self.model:
+                for bucket_group in m.bucket_groups + m.expert_parallel_bucket_groups:
+                    if hasattr(bucket_group, "cached_param_buffer_shard_list"):
+                        bucket_group.cached_param_buffer_shard_list = [None] * len(bucket_group.buckets)
+                    if hasattr(bucket_group, "cached_grad_buffer_shard_list"):
+                        bucket_group.cached_grad_buffer_shard_list = [None] * len(bucket_group.buckets)
 
             append_to_dict(
                 metrics,
@@ -1624,11 +1697,6 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         if is_offload_optimizer_states_in_train_step:
             self.offload_states(include=[OffloadStateType.optimizer_states], non_blocking=True)
-
-        # Reset Megatron DDP grad buffers and optimizer grad state.
-        for model in self.model:
-            model.zero_grad_buffer()
-        self.optimizer.zero_grad()
 
         # Restore all adapters active (PEFT sometimes expects list of active adapters).
         active_adapters = list(self.worker_config.model_args.adapters.keys())
@@ -1742,7 +1810,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             raise RuntimeError("Failed to resolve selective_sync cpu group for this rank")
         self._selective_sync_cpu_group_size = infer_tp_size
 
-    def _build_latest_bucket_cache(self, *, checkpoint_version: int, global_step: int) -> None:
+    def _build_latest_bucket_cache(
+        self, *, checkpoint_version: int, global_step: int, adapter_name: Optional[str] = None
+    ) -> None:
         buffer_size = int(self.worker.pipeline_config.model_update_buffer_size_mb) * 1024 * 1024
         cache_key = (int(checkpoint_version), int(global_step))
 
@@ -1755,6 +1825,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 self.models_unwrapped,
                 buffer_size=buffer_size,
                 weights_meta=self._selective_update_weights_meta,
+                adapter_name=adapter_name,
             ):
                 # Important: cache must be CPU-resident and must not pickle torch Tensors.
                 #
@@ -1774,8 +1845,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     )
                 )
 
-            self._cache_map[cache_key] = cached_buckets
-            self._latest_cached = cache_key
+            if adapter_name is not None:
+                self._adapter_cache_map.setdefault(adapter_name, {})[cache_key] = cached_buckets
+                self._latest_adapter_cached[adapter_name] = cache_key
+            else:
+                self._cache_map[cache_key] = cached_buckets
+                self._latest_cached = cache_key
 
     def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
         if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
@@ -1796,6 +1871,24 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 if key not in keep:
                     del self._cache_map[key]
 
+    def promote_active_adapter_checkpoint(
+        self, adapter_name: str, checkpoint_version: int, global_step: int
+    ) -> None:
+        cache_key = (int(checkpoint_version), int(global_step))
+        with self._cache_lock:
+            if cache_key not in self._adapter_cache_map.get(adapter_name, {}):
+                raise RuntimeError(
+                    f"promote_active_adapter_checkpoint missing cache for adapter={adapter_name!r} key={cache_key}"
+                )
+            self._active_adapter_cached[adapter_name] = cache_key
+            keep: Set[Tuple[int, int]] = set()
+            if self._latest_adapter_cached.get(adapter_name) is not None:
+                keep.add(self._latest_adapter_cached[adapter_name])
+            keep.add(self._active_adapter_cached[adapter_name])
+            for key in list(self._adapter_cache_map[adapter_name].keys()):
+                if key not in keep:
+                    del self._adapter_cache_map[adapter_name][key]
+
     def selective_sync_active_cache(
         self,
         *,
@@ -1807,6 +1900,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         model_update_name: Optional[str] = None,
         comm_plan: Optional[dict] = None,
         is_leader: bool = False,
+        adapters_to_sync: Optional[List[str]] = None,
     ) -> None:
         if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
             raise RuntimeError("selective_sync_active_cache is only supported under SchedRL control plane")
@@ -1835,19 +1929,41 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             end = start + int(tgt_num_gpus_per_worker)
             return [int(x) for x in tgt_device_mapping[start:end]]
 
-        is_lora = self.worker_config.model_args.lora_target is not None
         world_rank = dist.get_rank()
 
         with self._cache_lock:
-            if self._active_cached is None:
-                raise RuntimeError("selective_sync_active_cache requires an active promoted cache (active_cached is unset)")
-            if self._active_cached not in self._cache_map:
-                raise RuntimeError(f"active_cached={self._active_cached} missing from cache_map")
-            cached_buckets = list(self._cache_map[self._active_cached])
+            if adapters_to_sync is not None:
+                # Sync specified adapters using their active versions
+                missing = [a for a in adapters_to_sync if self._active_adapter_cached.get(a) is None]
+                if missing:
+                    raise RuntimeError(f"selective_sync_active_cache: no active version for adapters {missing}")
+                cached_buckets = []
+                for a in adapters_to_sync:
+                    key = self._active_adapter_cached[a]
+                    cached_buckets.extend(self._adapter_cache_map[a][key])
+            elif self.is_lora:
+                # adapters_to_sync=None + LoRA mode: sync ALL active adapters (expand path)
+                active_entries = {a: k for a, k in self._active_adapter_cached.items() if k is not None}
+                if not active_entries:
+                    raise RuntimeError(
+                        "selective_sync_active_cache(is_lora, adapters_to_sync=None): no active adapter caches promoted yet"
+                    )
+                cached_buckets = []
+                for a, key in active_entries.items():
+                    cached_buckets.extend(self._adapter_cache_map[a][key])
+            else:
+                # Full fine-tune path (unchanged)
+                if self._active_cached is None:
+                    raise RuntimeError(
+                        "selective_sync_active_cache requires an active promoted cache (active_cached is unset)"
+                    )
+                if self._active_cached not in self._cache_map:
+                    raise RuntimeError(f"active_cached={self._active_cached} missing from cache_map")
+                cached_buckets = list(self._cache_map[self._active_cached])
             logger.info(
                 "[schedrl][selective_sync] cache "
                 f"sync_id={sync_id} world_rank={world_rank} active_cached={self._active_cached} "
-                f"num_buckets={len(cached_buckets)}"
+                f"adapters_to_sync={adapters_to_sync} num_buckets={len(cached_buckets)}"
             )
 
             train_devices = set(int(x) for x in (self.worker_config.device_mapping or []))
@@ -1918,7 +2034,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                             ray.get(
                                 co_infer_worker.update_parameter_in_bucket.remote(
                                     infer_parallel_tensors,
-                                    is_lora=is_lora,
+                                    is_lora=self.is_lora,
                                 )
                             )
                             logger.info(
@@ -1978,7 +2094,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                             names=names,
                             dtypes=dtypes,
                             shapes=shapes,
-                            is_lora=is_lora,
+                            is_lora=self.is_lora,
                         )
                         for worker in broadcast_workers
                     ]
@@ -2144,7 +2260,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         # save lr_scheduler
         if dist.get_rank() == 0:
-            torch.save(self.scheduler.state_dict(), os.path.join(save_dir, SCHEDULER_NAME))
+            if self.adapter_schedulers is not None:
+                scheduler_state = {
+                    "mode": "per_adapter",
+                    "schedulers": {k: v.state_dict() for k, v in self.adapter_schedulers.items()},
+                }
+            else:
+                scheduler_state = self.scheduler.state_dict()
+            torch.save(scheduler_state, os.path.join(save_dir, SCHEDULER_NAME))
 
         # save rng state
         rng_states = {
@@ -2154,6 +2277,8 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             "cuda_rng_state": current_platform.get_rng_state(),
             "rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states(),
         }
+        if getattr(self, "adapter_rng_states", None) is not None:
+            rng_states["adapter_rng_states"] = self.adapter_rng_states
         rgn_path = os.path.join(save_dir, RNG_STATE_DIR, f"rng_state_{dist.get_rank()}.pth")
         os.makedirs(os.path.dirname(rgn_path), exist_ok=True)
         torch.save(rng_states, rgn_path)
@@ -2201,7 +2326,23 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.optimizer.load_state_dict(state_dict)
 
         # load lr_scheduler
-        self.scheduler.load_state_dict(torch.load(os.path.join(load_dir, SCHEDULER_NAME)))
+        scheduler_state = torch.load(os.path.join(load_dir, SCHEDULER_NAME), weights_only=False)
+        if isinstance(scheduler_state, dict) and scheduler_state.get("mode") == "per_adapter":
+            if self.adapter_schedulers is None:
+                raise RuntimeError(
+                    "Checkpoint was saved in per_adapter scheduler mode but current strategy "
+                    "has no adapter_schedulers (lora_optimizer_mode mismatch)."
+                )
+            for adapter_name, state in scheduler_state["schedulers"].items():
+                if adapter_name not in self.adapter_schedulers:
+                    raise RuntimeError(
+                        f"Checkpoint contains scheduler state for adapter {adapter_name!r} "
+                        "but this adapter is not registered in the current strategy."
+                    )
+                self.adapter_schedulers[adapter_name].load_state_dict(state)
+            logger.info(f"Loaded per-adapter scheduler states for: {sorted(scheduler_state['schedulers'].keys())}")
+        else:
+            self.scheduler.load_state_dict(scheduler_state)
 
         # load model state dict
         state_dict = load_state_dict_from_checkpoint(load_dir)
@@ -2223,6 +2364,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             if not checkpoint_rng_state["rng_tracker_states"]:
                 raise KeyError
             tensor_parallel.get_cuda_rng_tracker().set_states(checkpoint_rng_state["rng_tracker_states"])
+            if "adapter_rng_states" in checkpoint_rng_state and getattr(self, "adapter_rng_states", None) is not None:
+                self.adapter_rng_states.update(checkpoint_rng_state["adapter_rng_states"])
+                logger.info(f"Loaded adapter RNG states for: {sorted(checkpoint_rng_state['adapter_rng_states'].keys())}")
         else:
             logger.info(f"not load rng state, not found file: {rng_file}")
 

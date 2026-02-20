@@ -303,7 +303,9 @@ class Worker:
         else:
             self.logger.warning("worker has not strategy")
 
-    def build_latest_bucket_cache(self, checkpoint_version: int, global_step: int) -> None:
+    def build_latest_bucket_cache(
+        self, checkpoint_version: int, global_step: int, adapter_name: str | None = None
+    ) -> None:
         """
         Build a sender-side CPU bucket cache for selective sync under SchedRL.
 
@@ -314,7 +316,7 @@ class Worker:
         fn = getattr(self.strategy, "_build_latest_bucket_cache", None)
         if not callable(fn):
             raise RuntimeError(f"{type(self.strategy).__name__} does not support build_latest_bucket_cache")
-        fn(checkpoint_version=int(checkpoint_version), global_step=int(global_step))
+        fn(checkpoint_version=int(checkpoint_version), global_step=int(global_step), adapter_name=adapter_name)
 
     def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
         if getattr(self, "strategy", None) is None:
@@ -323,6 +325,17 @@ class Worker:
         if not callable(promote):
             raise RuntimeError(f"{type(self.strategy).__name__} does not support promote_active_checkpoint")
         promote(checkpoint_version=int(checkpoint_version), global_step=int(global_step))
+
+    def promote_active_adapter_checkpoint(
+        self, adapter_name: str, checkpoint_version: int, global_step: int
+    ) -> None:
+        """Promote a per-adapter cache version as active. Thin wrapper around strategy implementation."""
+        if getattr(self, "strategy", None) is None:
+            raise RuntimeError("worker has no strategy")
+        fn = getattr(self.strategy, "promote_active_adapter_checkpoint", None)
+        if not callable(fn):
+            raise RuntimeError(f"{type(self.strategy).__name__} does not support promote_active_adapter_checkpoint")
+        fn(str(adapter_name), int(checkpoint_version), int(global_step))
 
     def selective_sync_active_cache(
         self,
@@ -335,6 +348,7 @@ class Worker:
         model_update_name: str | None = None,
         comm_plan=None,
         is_leader: bool = False,
+        adapters_to_sync: list[str] | None = None,
     ) -> None:
         if getattr(self, "strategy", None) is None:
             raise RuntimeError("worker has no strategy")
@@ -355,6 +369,7 @@ class Worker:
             model_update_name=model_update_name,
             comm_plan=comm_plan,
             is_leader=bool(is_leader),
+            adapters_to_sync=adapters_to_sync,
         )
         self.logger.info(f"[schedrl][selective_sync] worker_call_exit sync_id={sync_id}")
 

@@ -125,7 +125,7 @@ class ModelUpdateService:
         comm_plan = {src_rank: comm_plan_args}
         return comm_plan, group_name, sorted(tgt_ranks_in_group)
 
-    def sync_selected_workers(self, tgt_dp_ranks: List[int]) -> None:
+    def sync_selected_workers(self, tgt_dp_ranks: List[int], adapters_to_sync: list[str] | None = None) -> None:
         tgt_dp_ranks = sorted(set(int(r) for r in tgt_dp_ranks))
         if not tgt_dp_ranks:
             raise ValueError("tgt_dp_ranks must be non-empty")
@@ -225,6 +225,7 @@ class ModelUpdateService:
                         tgt_workers=self.tgt_cluster.workers,
                         tgt_device_mapping=tgt_device_mapping,
                         tgt_num_gpus_per_worker=int(tgt_num_gpus_per_worker),
+                        adapters_to_sync=adapters_to_sync,
                     )
                 )
             self._ray_get_with_timeout(

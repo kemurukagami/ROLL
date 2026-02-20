@@ -110,6 +110,19 @@ class ActorWorker(Worker):
         output = DataProto(meta_info={"metrics": metrics})
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def train_step_lora(self, data: DataProto):
+        """Multi-LoRA training step.
+
+        Routes per-adapter microbatches via ``non_tensor_batch["domain"]`` to
+        ``MegatronTrainStrategy.train_step_lora`` with ``lora_optimizer_mode="per_adapter"``.
+        """
+        data = data.to(current_platform.device_type)
+        data = self.strategy.get_data_input(data)
+        metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
+        output = DataProto(meta_info={"metrics": metrics}).to("cpu")
+        return output
+
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def compute_log_probs(self, data: DataProto):
         """

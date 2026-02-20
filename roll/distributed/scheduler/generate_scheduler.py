@@ -1339,6 +1339,7 @@ class RequestScheduler:
         # Active DP ranks for request routing
         self.active_dp_ranks: Set[int] = set(range(self.infer_cluster.world_size))  # All ranks initially active
         self.routing_lock = asyncio.Lock()  # Protect routing updates
+        self._op_lock = asyncio.Lock()  # Serializes scheduling ops (shrink/expand) with adapter sync
 
     def get_active_dp_ranks(self) -> Set[int]:
         """Return a copy of the current active DP ranks set.
@@ -1930,27 +1931,28 @@ class RequestScheduler:
             - Clears src_rank mappings for remapped environments
             - Offloads model states from shrinking workers to CPU
         """
-        start_time = time.time()
-        offload_ranks = self._validate_dp_ranks_input(dp_ranks, mode="shrink")
+        async with self._op_lock:
+            start_time = time.time()
+            offload_ranks = self._validate_dp_ranks_input(dp_ranks, mode="shrink")
 
-        # VAL: VAL_NON_EMPTY, state consistency check
-        self._validate_calculated_ranks(offload_ranks, mode="shrink")
+            # VAL: VAL_NON_EMPTY, state consistency check
+            self._validate_calculated_ranks(offload_ranks, mode="shrink")
 
-        # Atomic routing update under routing_lock
-        async with self.routing_lock:
-            # Rebalance (abort + update active_dp_ranks)
-            result = await self.rebalance_on_shrink(offload_ranks)
+            # Atomic routing update under routing_lock
+            async with self.routing_lock:
+                # Rebalance (abort + update active_dp_ranks)
+                result = await self.rebalance_on_shrink(offload_ranks)
 
-        if not bool(skip_offload):
-            # Offload states from target workers
-            offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
-            await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
+            if not bool(skip_offload):
+                # Offload states from target workers
+                offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
+                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
 
-        return {
-            **result,
-            "shrink_duration_ms": (time.time() - start_time) * 1000,
-            "offload_ranks": offload_ranks,
-        }
+            return {
+                **result,
+                "shrink_duration_ms": (time.time() - start_time) * 1000,
+                "offload_ranks": offload_ranks,
+            }
 
     async def expand_workers(self, dp_ranks: List[int], skip_load: bool = False) -> Dict[str, Any]:
         """Complete atomic expand operation: validate → load → rebalance → update routing.
@@ -1995,51 +1997,87 @@ class RequestScheduler:
             - Aborts some requests from old workers for proportional rebalancing
             - Clears src_rank mappings for rebalanced environments (will route to new workers)
         """
-        start_time = time.time()
-        load_ranks = self._validate_dp_ranks_input(dp_ranks, mode="expand")
+        async with self._op_lock:
+            start_time = time.time()
+            load_ranks = self._validate_dp_ranks_input(dp_ranks, mode="expand")
 
-        # Skip validation when skip_load=True because callers may pass ranks that are already active
-        # in active_dp_ranks (e.g., "restore routing to full set" semantics).
-        if not skip_load:
-            self._validate_calculated_ranks(load_ranks, mode="expand")
-            # In SchedRL mode, delay vLLM KV cache init until after selective model update completes.
-            # This avoids holding large KV allocations during weight sync (which needs extra headroom).
-            if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and load_ranks:
-                pipeline_id = os.environ.get("PIPELINE_ID") or None
-                ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
-                if not pipeline_id:
-                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
-                if not ray_namespace:
-                    raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
-                try:
-                    model_update_service = ray.get_actor(
-                        f"{pipeline_id}_model_update_service",
-                        namespace=ray_namespace,
-                    )
-                except Exception as e:
-                    raise RuntimeError(
-                        f"Failed to resolve ModelUpdateService for pipeline_id={pipeline_id!r} "
-                        f"(expected name={pipeline_id}_model_update_service in namespace={ray_namespace!r})"
-                    ) from e
-                ref = model_update_service.sync_selected_workers.remote(load_ranks)
-                await asyncio.wrap_future(ref.future())
-                # vLLM may require post-load processing after weights are updated (e.g., FP8 hooks).
-                process_refs = self.infer_cluster.process_weights_after_loading(blocking=False)
-                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in process_refs])
-                # Now that weights are synced, initialize full infer states (incl. KV cache) for rollout.
-                load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
-                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
-            else:
-                load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
-                await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
+            # Skip validation when skip_load=True because callers may pass ranks that are already active
+            # in active_dp_ranks (e.g., "restore routing to full set" semantics).
+            if not skip_load:
+                self._validate_calculated_ranks(load_ranks, mode="expand")
+                # In SchedRL mode, delay vLLM KV cache init until after selective model update completes.
+                # This avoids holding large KV allocations during weight sync (which needs extra headroom).
+                if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and load_ranks:
+                    pipeline_id = os.environ.get("PIPELINE_ID") or None
+                    ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
+                    if not pipeline_id:
+                        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+                    if not ray_namespace:
+                        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+                    try:
+                        model_update_service = ray.get_actor(
+                            f"{pipeline_id}_model_update_service",
+                            namespace=ray_namespace,
+                        )
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"Failed to resolve ModelUpdateService for pipeline_id={pipeline_id!r} "
+                            f"(expected name={pipeline_id}_model_update_service in namespace={ray_namespace!r})"
+                        ) from e
+                    ref = model_update_service.sync_selected_workers.remote(load_ranks)
+                    await asyncio.wrap_future(ref.future())
+                    # vLLM may require post-load processing after weights are updated (e.g., FP8 hooks).
+                    process_refs = self.infer_cluster.process_weights_after_loading(blocking=False)
+                    await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in process_refs])
+                    # Now that weights are synced, initialize full infer states (incl. KV cache) for rollout.
+                    load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+                    await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
+                else:
+                    load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+                    await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
 
-        # Atomic operation under routing_lock
-        async with self.routing_lock:
-            # Rebalance (update active_dp_ranks + conditional abort)
-            result = await self.rebalance_on_expand(load_ranks)
+            # Atomic operation under routing_lock
+            async with self.routing_lock:
+                # Rebalance (update active_dp_ranks + conditional abort)
+                result = await self.rebalance_on_expand(load_ranks)
 
-        return {
-            **result,
-            "expand_duration_ms": (time.time() - start_time) * 1000,
-            "load_ranks": load_ranks,
-        }
+            return {
+                **result,
+                "expand_duration_ms": (time.time() - start_time) * 1000,
+                "load_ranks": load_ranks,
+            }
+
+    async def notify_adapter_updated(self, adapters_to_sync: list) -> None:
+        """Sync newly trained adapters to all currently active rollout workers.
+
+        Strictly serialized with shrink/expand scheduling loops via _op_lock.
+        TODO: fuse with scheduling loop in a future implementation.
+        """
+        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+            return
+
+        async with self._op_lock:
+            async with self.routing_lock:
+                active_ranks = sorted(self.active_dp_ranks)
+            if not active_ranks:
+                return
+
+            pipeline_id = os.environ.get("PIPELINE_ID") or None
+            ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
+            if not pipeline_id:
+                raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+            if not ray_namespace:
+                raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+            try:
+                model_update_service = ray.get_actor(
+                    f"{pipeline_id}_model_update_service", namespace=ray_namespace
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to resolve ModelUpdateService for pipeline_id={pipeline_id!r}"
+                ) from e
+            await asyncio.wrap_future(
+                model_update_service.sync_selected_workers.remote(
+                    active_ranks, adapters_to_sync=list(adapters_to_sync)
+                ).future()
+            )

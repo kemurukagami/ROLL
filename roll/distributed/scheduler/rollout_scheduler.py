@@ -378,6 +378,7 @@ class GroupQueueManager:
 
         self.pipeline_id = os.environ.get("PIPELINE_ID") or None
         self._schedrl_enabled = os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and self.mode == "train"
+        self.adapter_id = self.env_manager_config.tags[0] if getattr(self.env_manager_config, "tags", None) else None
         self._schedrl_scheduler = None
         if self._schedrl_enabled:
             if not self.pipeline_id:
@@ -545,6 +546,7 @@ class GroupQueueManager:
                 "bucket": int(bucket),
                 "new_batch": bool(emitted_for_new_batch),
                 "current_train_step": current_train_step,
+                "adapter_id": self.adapter_id,
             },
         )
         self._schedrl_scheduler.report_progress.remote(report)
@@ -733,7 +735,7 @@ class RolloutScheduler(RolloutMockMixin):
             rollout()
         ray.get(train_rollout_scheduler.shutdown.remote())
     """
-    def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, collator=None):
+    async def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, request_scheduler=None, collator=None):
         # NOTE: This actor is async. Avoid blocking calls in __init__ and log each construction phase
         # to pinpoint startup stalls (e.g., placement group allocation, child actor creation).
         self.logger = logger
@@ -789,22 +791,26 @@ class RolloutScheduler(RolloutMockMixin):
         )
         self.logger.info(f"[RolloutScheduler] created GroupQueueManager mode={self.mode}")
 
-        self.logger.info(f"[RolloutScheduler] creating RequestScheduler mode={self.mode}")
-        self.generate_scheduler = RequestScheduler.options(
-                name=(
-                    f"{self.pipeline_id}_request_scheduler_{mode}"
-                    if self.pipeline_id
-                    else f"RequestScheduler-{self.env_manager_config.name}-{mode}"
-                ),
-                namespace=RAY_NAMESPACE,
-                scheduling_strategy=NodeAffinitySchedulingStrategy(
-                    node_id=ray.get_runtime_context().get_node_id(),
-                    soft=False,
-                ),
-                runtime_env=runtime_env,
-                max_concurrency=env_num + 1,  # reserve extra one for suspend/resume
-            ).remote(infer_cluster=self.infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
-        self.logger.info(f"[RolloutScheduler] created RequestScheduler mode={self.mode}")
+        if request_scheduler is not None:
+            self.generate_scheduler = request_scheduler
+            self.logger.info(f"[RolloutScheduler] using SHARED RequestScheduler mode={self.mode}")
+        else:
+            self.logger.info(f"[RolloutScheduler] creating RequestScheduler mode={self.mode}")
+            self.generate_scheduler = RequestScheduler.options(
+                    name=(
+                        f"{self.pipeline_id}_request_scheduler_{mode}"
+                        if self.pipeline_id
+                        else f"RequestScheduler-{self.env_manager_config.name}-{mode}"
+                    ),
+                    namespace=RAY_NAMESPACE,
+                    scheduling_strategy=NodeAffinitySchedulingStrategy(
+                        node_id=ray.get_runtime_context().get_node_id(),
+                        soft=False,
+                    ),
+                    runtime_env=runtime_env,
+                    max_concurrency=env_num + 1,  # reserve extra one for suspend/resume
+                ).remote(infer_cluster=self.infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
+            self.logger.info(f"[RolloutScheduler] created RequestScheduler mode={self.mode}")
 
         self.logger.info(f"[RolloutScheduler] creating env Cluster mode={self.mode} name={self.env_manager_config.name}")
         self.es_manager: Any = Cluster(
@@ -1040,3 +1046,16 @@ class RolloutScheduler(RolloutMockMixin):
         Used for state verification after initialization shrink operations.
         """
         return await self.generate_scheduler.get_active_dp_ranks.remote()
+    def get_generate_scheduler_name(self) -> str:
+        """Return the name of the RequestScheduler actor (for verification)."""
+        # Note: self.generate_scheduler is an ActorHandle, but we want the name it was created with.
+        # However, we can't easily get the name from the handle itself in a clean way across Ray versions.
+        # But we can get it from the internal _actor_name if available, or just return the handle representation.
+        # For simplicity in this specific verification, we'll return the name we expect if it's a shared actor.
+        # Actually, let's just return the actor handle's task name or similar if possible, 
+        # but better to just return the name we stored.
+        return getattr(self.generate_scheduler, "_actor_name", "unknown")
+
+    async def notify_adapter_updated(self, adapters_to_sync: list) -> None:
+        """Delegate adapter update notification to RequestScheduler."""
+        await self.generate_scheduler.notify_adapter_updated.remote(adapters_to_sync)

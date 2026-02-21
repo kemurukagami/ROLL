@@ -26,12 +26,15 @@ Assertion
 
 Test matrix
 -----------
-| TC | dp | tp | Adapters | GPUs needed |
-|----|----|----|----------|-------------|
-|  1 |  1 |  1 | a, b     | 1 (dp*tp)   |
-|  2 |  2 |  1 | a, b, c  | 2 (dp*tp)   |
-|  3 |  1 |  2 | a, b, c  | 2 (dp*tp)   |
-|  4 |  2 |  2 | a, b, c  | 4 (dp*tp)   |
+| TC | dp | tp | pp | Adapters | GPUs needed   |
+|----|----|----|----|----------|---------------|
+|  1 |  1 |  1 |  1 | a, b     | 1 (dp*tp*pp)  |
+|  2 |  2 |  1 |  1 | a, b, c  | 2 (dp*tp*pp)  |
+|  3 |  1 |  2 |  1 | a, b, c  | 2 (dp*tp*pp)  |
+|  4 |  2 |  2 |  1 | a, b, c  | 4 (dp*tp*pp)  |
+|  5 |  1 |  1 |  2 | a, b, c  | 2 (dp*tp*pp)  |
+|  6 |  1 |  2 |  2 | a, b, c  | 4 (dp*tp*pp)  |
+|  7 |  2 |  1 |  2 | a, b, c  | 4 (dp*tp*pp)  |
 
 Determinism contract
 --------------------
@@ -795,6 +798,84 @@ def test_tc5_per_adapter_single_lora_step_dp1_tp1_pp2():
             model_dir=model_dir,
             resource_manager=resource_manager,
             pipeline_config=pipeline_config,
-            n_steps=1,
+            n_steps=3,
+            phase1_order=order,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TC-6: dp=1, tp=2, pp=2, adapters=[a, b, c]  — needs 4 GPUs
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 4,
+    reason="TC-6 requires >= 4 CUDA devices (dp=1, tp=2, pp=2).",
+)
+def test_tc6_per_adapter_single_lora_step_dp1_tp2_pp2():
+    """
+    TC-6  dp=1, tp=2, pp=2, adapters=[a, b, c], n_steps=1.
+
+    Exercises both Phase-1 orderings under combined tensor + pipeline parallelism.
+    GPU budget: 4 (clusters run sequentially).
+    """
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_dir = _download_model(model_id)
+
+    os.environ.setdefault("roll_RPC_TIMEOUT", "600")
+    _ray_init()
+
+    dp, tp, pp = 1, 2, 2
+    resource_manager = ResourceManager(num_nodes=1, num_gpus_per_node=torch.cuda.device_count())
+    pipeline_config = _make_pipeline_config(seed=42, sequence_length=64)
+
+    for order in ("sequential", "interleaved"):
+        _run_equivalence_test(
+            adapter_names=["adapter_a", "adapter_b", "adapter_c"],
+            dp=dp,
+            tp=tp,
+            pp=pp,
+            model_dir=model_dir,
+            resource_manager=resource_manager,
+            pipeline_config=pipeline_config,
+            n_steps=3,
+            phase1_order=order,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TC-7: dp=2, tp=1, pp=2, adapters=[a, b, c]  — needs 4 GPUs
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 4,
+    reason="TC-7 requires >= 4 CUDA devices (dp=2, tp=1, pp=2).",
+)
+def test_tc7_per_adapter_single_lora_step_dp2_tp1_pp2():
+    """
+    TC-7  dp=2, tp=1, pp=2, adapters=[a, b, c], n_steps=1.
+
+    Exercises both Phase-1 orderings under combined data + pipeline parallelism.
+    GPU budget: 4 (clusters run sequentially).
+    """
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_dir = _download_model(model_id)
+
+    os.environ.setdefault("roll_RPC_TIMEOUT", "600")
+    _ray_init()
+
+    dp, tp, pp = 2, 1, 2
+    resource_manager = ResourceManager(num_nodes=1, num_gpus_per_node=torch.cuda.device_count())
+    pipeline_config = _make_pipeline_config(seed=42, sequence_length=64)
+
+    for order in ("sequential", "interleaved"):
+        _run_equivalence_test(
+            adapter_names=["adapter_a", "adapter_b", "adapter_c"],
+            dp=dp,
+            tp=tp,
+            pp=pp,
+            model_dir=model_dir,
+            resource_manager=resource_manager,
+            pipeline_config=pipeline_config,
+            n_steps=3,
             phase1_order=order,
         )

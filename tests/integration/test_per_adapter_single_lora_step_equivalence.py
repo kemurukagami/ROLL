@@ -70,6 +70,7 @@ Phase 1 dependencies (must be ported into ROLL_schedrl before tests pass):
 """
 import os
 import random
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,11 +100,16 @@ _ZERO_DROPOUT_MODEL_CONFIG_KWARGS: dict = {
     "attention_dropout": 0.0,
     "hidden_dropout": 0.0,
 }
+_LORA_TARGETS = "all-linear,all-router"
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+def _unique_cluster_name(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
 
 def _ensure_shared_storage() -> None:
     try:
@@ -145,21 +151,17 @@ def _make_pipeline_config(*, seed: int = 42, sequence_length: int = 64) -> Simpl
     )
 
 
-def _find_modelscope_cached_model_dir(model_id: str) -> str | None:
-    if "/" not in model_id:
-        return None
-    org, name = model_id.split("/", 1)
-    hub_root = Path.home() / ".cache" / "modelscope" / "hub" / "models"
-    for candidate in [hub_root / org / name.replace(".", "___"), hub_root / org / name]:
-        if candidate.is_dir():
-            return str(candidate)
-    return None
+def _download_model(model_id: str) -> str:
+    """Download model from Hugging Face and return the local snapshot path."""
+    from huggingface_hub import snapshot_download
+
+    return snapshot_download(repo_id=model_id)
 
 
 def _system_envs() -> dict:
     root = Path(__file__).resolve().parents[2]
     pythonpath = os.pathsep.join([str(root), str(root / "mcore_adapter" / "src")])
-    return {"MODEL_DOWNLOAD_TYPE": "MODELSCOPE", "USE_MODELSCOPE": "1", "PYTHONPATH": pythonpath}
+    return {"PYTHONPATH": pythonpath}
 
 
 def _per_adapter_worker_config(
@@ -168,6 +170,8 @@ def _per_adapter_worker_config(
     model_dir: str,
     dp: int,
     tp: int,
+    pp: int = 1,
+    gradient_accumulation_steps: int = 1,
 ) -> WorkerConfig:
     """WorkerConfig for the per_adapter multi-LoRA cluster.
 
@@ -177,7 +181,7 @@ def _per_adapter_worker_config(
       so frozen base-model activations are deterministic regardless of RNG state.
     """
     adapters = {
-        name: LoraArguments(lora_rank=8, lora_alpha=16, lora_dropout=0.0, lora_target="all-linear")
+        name: LoraArguments(lora_rank=8, lora_alpha=16, lora_dropout=0.0, lora_target=_LORA_TARGETS)
         for name in adapter_names
     }
     return WorkerConfig(
@@ -192,7 +196,7 @@ def _per_adapter_worker_config(
         training_args=TrainingArguments(
             max_steps=999,           # effectively unlimited; we drive steps externally
             per_device_train_batch_size=1,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             learning_rate=1e-4,
             weight_decay=0.0,
         ),
@@ -200,14 +204,15 @@ def _per_adapter_worker_config(
             strategy_name="megatron_train",
             strategy_config={
                 "tensor_model_parallel_size": tp,
-                "pipeline_model_parallel_size": 1,
+                "pipeline_model_parallel_size": pp,
                 "expert_model_parallel_size": 1,
                 "context_parallel_size": 1,
+                "overlap_p2p_comm": False,
                 "use_distributed_optimizer": False,   # required by per_adapter prototype
                 "lora_optimizer_mode": "per_adapter",
             },
         ),
-        device_mapping=f"list(range(0, {dp * tp}))",
+        device_mapping=f"list(range(0, {dp * tp * pp}))",
         infer_batch_size=1,
         system_envs=_system_envs(),
     )
@@ -219,6 +224,8 @@ def _reference_worker_config(
     model_dir: str,
     dp: int,
     tp: int,
+    pp: int = 1,
+    gradient_accumulation_steps: int = 1,
 ) -> WorkerConfig:
     """WorkerConfig for an upstream single-LoRA reference cluster.
 
@@ -228,7 +235,7 @@ def _reference_worker_config(
     as the per_adapter cluster so both phases are identically dropout-free.
     """
     adapters = {
-        adapter_name: LoraArguments(lora_rank=8, lora_alpha=16, lora_dropout=0.0, lora_target="all-linear")
+        adapter_name: LoraArguments(lora_rank=8, lora_alpha=16, lora_dropout=0.0, lora_target=_LORA_TARGETS)
     }
     return WorkerConfig(
         name=_WORKER_NAME,
@@ -242,7 +249,7 @@ def _reference_worker_config(
         training_args=TrainingArguments(
             max_steps=999,
             per_device_train_batch_size=1,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             learning_rate=1e-4,
             weight_decay=0.0,
         ),
@@ -250,13 +257,14 @@ def _reference_worker_config(
             strategy_name="megatron_train",
             strategy_config={
                 "tensor_model_parallel_size": tp,
-                "pipeline_model_parallel_size": 1,
+                "pipeline_model_parallel_size": pp,
                 "expert_model_parallel_size": 1,
                 "context_parallel_size": 1,
+                "overlap_p2p_comm": False,
                 "use_distributed_optimizer": False,
             },
         ),
-        device_mapping=f"list(range(0, {dp * tp}))",
+        device_mapping=f"list(range(0, {dp * tp * pp}))",
         infer_batch_size=1,
         system_envs=_system_envs(),
     )
@@ -276,9 +284,11 @@ def _make_microbatch(input_ids: torch.Tensor, adapter_name: str, global_step: in
     mb = DataProto.from_single_dict(
         {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels}
     )
-    mb.non_tensor_batch["domain"] = np.array([adapter_name] * input_ids.shape[0], dtype=object)
+    mb.non_tensor_batch["lora_name"] = np.array([adapter_name] * input_ids.shape[0], dtype=object)
     mb.meta_info = {
+        "lora_name": adapter_name,
         "global_step": global_step,
+        "_broadcast_non_tensor_batch": True,
         # Disable async optimizer-state offload to remove a potential source of
         # timing-dependent numerical non-determinism between the two phases.
         "is_offload_optimizer_states_in_train_step": False,
@@ -315,6 +325,11 @@ def _shutdown(cluster: Cluster) -> None:
         cluster.execute_all_sync("shutdown")
     except Exception:
         pass
+    for worker in getattr(cluster, "workers", []):
+        try:
+            ray.kill(worker, no_restart=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +341,7 @@ def _run_equivalence_test(
     adapter_names: list[str],
     dp: int,
     tp: int,
+    pp: int = 1,
     model_dir: str,
     resource_manager: ResourceManager,
     pipeline_config: SimpleNamespace,
@@ -383,6 +399,8 @@ def _run_equivalence_test(
     - Driver-side RNG is reset via ``_seed_driver(seed)`` before both phases.
     - Both clusters use the same ``pipeline_config.seed`` (worker-side Megatron RNG).
     """
+    debug_trace = os.environ.get("SCHEDRL_DEBUG_PER_ADAPTER", "") not in ("", "0", "false", "False")
+
     # Fixed token sequences, one per step (different steps → different data,
     # making the multi-step comparison more discriminating).
     # These are generated with a deterministic formula so they don't depend on
@@ -390,8 +408,15 @@ def _run_equivalence_test(
     # Replicate batch across dp-ranks so dispatch_dp_mp_dispatch_first can chunk
     # the batch evenly (batch_size must be >= dp).  Each dp rank receives an
     # identical row so the per-rank loss equals the single-rank reference loss.
+    # Megatron PP with non-interleaved schedule needs >=2 microbatches in practice.
+    # Keep GA=1 for non-PP tests, and GA=2 for PP tests to avoid PP stalls.
+    ga_steps = 2 if pp > 1 else 1
+    token_width = int(pipeline_config.sequence_length) if pp > 1 else 8
     step_input_ids: list[torch.Tensor] = [
-        torch.tensor([[((step * 7 + i) % 29) + 1 for i in range(8)]] * dp, dtype=torch.long)
+        torch.tensor(
+            [[((step * 7 + i) % 29) + 1 for i in range(token_width)]] * (dp * ga_steps),
+            dtype=torch.long,
+        )
         for step in range(n_steps)
     ]
 
@@ -405,9 +430,11 @@ def _run_equivalence_test(
         model_dir=model_dir,
         dp=dp,
         tp=tp,
+        pp=pp,
+        gradient_accumulation_steps=ga_steps,
     )
     pa_cluster = Cluster(
-        name="multi_lora_per_adapter",
+        name=_unique_cluster_name("multi_lora_per_adapter"),
         worker_cls=pa_cfg.worker_cls,
         resource_manager=resource_manager,
         worker_config=pa_cfg,
@@ -418,15 +445,25 @@ def _run_equivalence_test(
     first = adapter_names[0]
     for other in adapter_names[1:]:
         pa_cluster.copy_lora_params(src_adapter=first, dst_adapter=other)
+    # For non-PP runs, normalize DP rank drift at init.
+    # PP runs shard LoRA tensors by stage, so rank-0 tensors cannot be broadcast
+    # to every rank.
+    if pp == 1:
+        for name in adapter_names:
+            pa_cluster.set_lora_tensors(name, pa_cluster.get_lora_tensors(name)[0])
 
-    # Save initial weights for each adapter (list[dict] per DP rank; rank-0 is sufficient).
-    init_weights: dict[str, dict[str, torch.Tensor]] = {
-        name: pa_cluster.get_lora_tensors(name)[0]   # [0] = rank-0 result
-        for name in adapter_names
-    }
+    init_weights: dict[str, dict[str, torch.Tensor]] | None = None
+    if pp == 1:
+        init_weights = {
+            name: pa_cluster.get_lora_tensors(name)[0]
+            for name in adapter_names
+        }
 
     # Train all adapters for n_steps steps under the requested ordering.
     per_adapter_losses: dict[str, list[float]] = {name: [] for name in adapter_names}
+    per_adapter_lora_trace: dict[str, list[dict[str, torch.Tensor]]] = {
+        name: [] for name in adapter_names
+    }
 
     if phase1_order == "sequential":
         # All steps for adapter A, then all steps for adapter B, ...
@@ -436,6 +473,8 @@ def _run_equivalence_test(
                 mb = _make_microbatch(step_input_ids[step], name, global_step=step)
                 result = pa_cluster.train_step_lora(mb)
                 per_adapter_losses[name].append(_extract_loss(result))
+                if debug_trace:
+                    per_adapter_lora_trace[name].append(pa_cluster.get_lora_tensors(name)[0])
 
     elif phase1_order == "interleaved":
         # Round-robin: one step per adapter per outer iteration.
@@ -450,6 +489,8 @@ def _run_equivalence_test(
                 mb = _make_microbatch(step_input_ids[s], name, global_step=s)
                 result = pa_cluster.train_step_lora(mb)
                 per_adapter_losses[name].append(_extract_loss(result))
+                if debug_trace:
+                    per_adapter_lora_trace[name].append(pa_cluster.get_lora_tensors(name)[0])
                 adapter_step[name] += 1
 
     else:
@@ -466,6 +507,9 @@ def _run_equivalence_test(
     # -----------------------------------------------------------------------
     _seed_driver(seed)
     reference_losses: dict[str, list[float]] = {}
+    reference_lora_trace: dict[str, list[dict[str, torch.Tensor]]] = {
+        name: [] for name in adapter_names
+    }
 
     for name in adapter_names:
         ref_cfg = _reference_worker_config(
@@ -473,9 +517,11 @@ def _run_equivalence_test(
             model_dir=model_dir,
             dp=dp,
             tp=tp,
+            pp=pp,
+            gradient_accumulation_steps=ga_steps,
         )
         ref_cluster = Cluster(
-            name=f"ref_{name}",
+            name=_unique_cluster_name(f"ref_{name}"),
             worker_cls=ref_cfg.worker_cls,
             resource_manager=resource_manager,
             worker_config=ref_cfg,
@@ -483,16 +529,54 @@ def _run_equivalence_test(
         ref_cluster.initialize(pipeline_config=pipeline_config, blocking=True)
 
         # Restore initial weights from Phase 1 so both runs start identically.
-        ref_cluster.set_lora_tensors(name, init_weights[name])
+        # PP runs keep LoRA tensors sharded by stage; this helper applies one
+        # tensor dict to all ranks, so only restore in non-PP mode.
+        if init_weights is not None:
+            ref_cluster.set_lora_tensors(name, init_weights[name])
 
         step_losses: list[float] = []
         for step in range(n_steps):
             mb = _make_microbatch(step_input_ids[step], name, global_step=step)
             result = ref_cluster.train_step(mb)
             step_losses.append(_extract_loss(result))
+            if debug_trace:
+                reference_lora_trace[name].append(ref_cluster.get_lora_tensors(name)[0])
 
         _shutdown(ref_cluster)
         reference_losses[name] = step_losses
+
+    if debug_trace:
+        # Lightweight diff report to bisect divergence between per_adapter and reference runs.
+        for name in adapter_names:
+            if init_weights is None:
+                continue
+            init_tensors = init_weights[name]
+            for step in range(n_steps):
+                pa_tensors = per_adapter_lora_trace[name][step]
+                ref_tensors = reference_lora_trace[name][step]
+                max_diff = 0.0
+                max_key = None
+                max_pa_delta = 0.0
+                max_ref_delta = 0.0
+                for k, pa_v in pa_tensors.items():
+                    ref_v = ref_tensors.get(k)
+                    if ref_v is None:
+                        raise KeyError(f"[debug] Missing tensor {k!r} in reference trace for {name!r}")
+                    d = (pa_v.float() - ref_v.float()).abs().max().item()
+                    if d > max_diff:
+                        max_diff = d
+                        max_key = k
+                    init_v = init_tensors.get(k)
+                    if init_v is None:
+                        raise KeyError(f"[debug] Missing tensor {k!r} in init trace for {name!r}")
+                    pa_d = (pa_v.float() - init_v.float()).abs().max().item()
+                    ref_d = (ref_v.float() - init_v.float()).abs().max().item()
+                    if pa_d > max_pa_delta:
+                        max_pa_delta = pa_d
+                    if ref_d > max_ref_delta:
+                        max_ref_delta = ref_d
+                print(f"[debug] adapter={name} step={step} max_lora_param_abs_diff={max_diff:.6e} key={max_key}")
+                print(f"[debug] adapter={name} step={step} max_abs_delta_vs_init: per_adapter={max_pa_delta:.6e} reference={max_ref_delta:.6e}")
 
     # -----------------------------------------------------------------------
     # Assert: per_adapter loss == reference loss at every (adapter, step)
@@ -513,7 +597,7 @@ def _run_equivalence_test(
                 atol=1e-6,
                 msg=(
                     f"Loss mismatch at adapter={name!r} step={step} "
-                    f"[dp={dp}, tp={tp}]: "
+                    f"[dp={dp}, tp={tp}, pp={pp}]: "
                     f"per_adapter={pa_loss:.8f}, reference={ref_loss:.8f}"
                 ),
             )
@@ -539,12 +623,8 @@ def test_tc1_per_adapter_single_lora_step_dp1_tp1():
     GPU budget: 1 (clusters run sequentially on the same GPU).
     """
     model_id = "Qwen/Qwen2.5-0.5B-Instruct"
-    model_dir = _find_modelscope_cached_model_dir(model_id)
-    if model_dir is None:
-        pytest.skip(f"ModelScope cache missing for {model_id!r} under ~/.cache/modelscope/hub/models/.")
+    model_dir = _download_model(model_id)
 
-    os.environ.setdefault("MODEL_DOWNLOAD_TYPE", "MODELSCOPE")
-    os.environ.setdefault("USE_MODELSCOPE", "1")
     os.environ.setdefault("roll_RPC_TIMEOUT", "600")
     _ray_init()
 
@@ -581,12 +661,8 @@ def test_tc2_per_adapter_single_lora_step_dp2_tp1():
     GPU budget: 2 (clusters run sequentially).
     """
     model_id = "Qwen/Qwen2.5-0.5B-Instruct"
-    model_dir = _find_modelscope_cached_model_dir(model_id)
-    if model_dir is None:
-        pytest.skip(f"ModelScope cache missing for {model_id!r} under ~/.cache/modelscope/hub/models/.")
+    model_dir = _download_model(model_id)
 
-    os.environ.setdefault("MODEL_DOWNLOAD_TYPE", "MODELSCOPE")
-    os.environ.setdefault("USE_MODELSCOPE", "1")
     os.environ.setdefault("roll_RPC_TIMEOUT", "600")
     _ray_init()
 
@@ -623,12 +699,8 @@ def test_tc3_per_adapter_single_lora_step_dp1_tp2():
     GPU budget: 2 (clusters run sequentially).
     """
     model_id = "Qwen/Qwen2.5-0.5B-Instruct"
-    model_dir = _find_modelscope_cached_model_dir(model_id)
-    if model_dir is None:
-        pytest.skip(f"ModelScope cache missing for {model_id!r} under ~/.cache/modelscope/hub/models/.")
+    model_dir = _download_model(model_id)
 
-    os.environ.setdefault("MODEL_DOWNLOAD_TYPE", "MODELSCOPE")
-    os.environ.setdefault("USE_MODELSCOPE", "1")
     os.environ.setdefault("roll_RPC_TIMEOUT", "600")
     _ray_init()
 
@@ -665,12 +737,8 @@ def test_tc4_per_adapter_single_lora_step_dp2_tp2():
     GPU budget: 4 (clusters run sequentially).
     """
     model_id = "Qwen/Qwen2.5-0.5B-Instruct"
-    model_dir = _find_modelscope_cached_model_dir(model_id)
-    if model_dir is None:
-        pytest.skip(f"ModelScope cache missing for {model_id!r} under ~/.cache/modelscope/hub/models/.")
+    model_dir = _download_model(model_id)
 
-    os.environ.setdefault("MODEL_DOWNLOAD_TYPE", "MODELSCOPE")
-    os.environ.setdefault("USE_MODELSCOPE", "1")
     os.environ.setdefault("roll_RPC_TIMEOUT", "600")
     _ray_init()
 
@@ -683,9 +751,49 @@ def test_tc4_per_adapter_single_lora_step_dp2_tp2():
             adapter_names=["adapter_a", "adapter_b", "adapter_c"],
             dp=dp,
             tp=tp,
+            pp=1,
             model_dir=model_dir,
             resource_manager=resource_manager,
             pipeline_config=pipeline_config,
             n_steps=3,
+            phase1_order=order,
+        )
+
+
+# ---------------------------------------------------------------------------
+# TC-5: dp=1, tp=1, pp=2, adapters=[a, b, c]  — needs 2 GPUs
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2,
+    reason="TC-5 requires >= 2 CUDA devices (dp=1, tp=1, pp=2).",
+)
+def test_tc5_per_adapter_single_lora_step_dp1_tp1_pp2():
+    """
+    TC-5  dp=1, tp=1, pp=2, adapters=[a, b, c], n_steps=1.
+
+    Exercises both Phase-1 orderings under pipeline parallelism.
+    GPU budget: 2 (clusters run sequentially).
+    """
+    model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_dir = _download_model(model_id)
+
+    os.environ.setdefault("roll_RPC_TIMEOUT", "600")
+    _ray_init()
+
+    dp, tp, pp = 1, 1, 2
+    resource_manager = ResourceManager(num_nodes=1, num_gpus_per_node=torch.cuda.device_count())
+    pipeline_config = _make_pipeline_config(seed=42, sequence_length=64)
+
+    for order in ("sequential", "interleaved"):
+        _run_equivalence_test(
+            adapter_names=["adapter_a", "adapter_b", "adapter_c"],
+            dp=dp,
+            tp=tp,
+            pp=pp,
+            model_dir=model_dir,
+            resource_manager=resource_manager,
+            pipeline_config=pipeline_config,
+            n_steps=1,
             phase1_order=order,
         )

@@ -87,6 +87,18 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
+def _safe_dist_barrier(group=None):
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    kwargs = {}
+    if dist.get_backend() == "nccl" and current_platform.is_available():
+        kwargs["device_ids"] = [current_platform.current_device()]
+    if group is None:
+        dist.barrier(**kwargs)
+    else:
+        dist.barrier(group=group, **kwargs)
+
+
 class MegatronInferStrategy(InferenceStrategy):
     strategy_name = "megatron_infer"
 
@@ -100,6 +112,11 @@ class MegatronInferStrategy(InferenceStrategy):
         # maybe put max_grad_norm into training_args as transformers do, rather
         # than in pipeline_config (PPOConfig)
         config_dict.update({"max_grad_norm": self.worker.pipeline_config.max_grad_norm})
+        supported_keys = set(TrainingArguments.__dataclass_fields__.keys())
+        dropped_keys = [k for k in config_dict if k not in supported_keys]
+        if dropped_keys:
+            logger.warn(f"Ignore non-TrainingArguments keys: {dropped_keys}")
+            config_dict = {k: v for k, v in config_dict.items() if k in supported_keys}
         logger.info(f"training_args: {config_dict}")
         self.megatron_train_args = TrainingArguments(**config_dict)
         self.model = None
@@ -139,7 +156,7 @@ class MegatronInferStrategy(InferenceStrategy):
             logger.info("Set variable_seq_lengths to True when use dynamic batching and pipeline parallel.")
 
         logger.info(f"{self.model.get_models()}")
-        dist.barrier()
+        _safe_dist_barrier()
 
     def get_data_input(self, batch: DataProto):
         def broadcast_obj(obj, group):
@@ -413,27 +430,31 @@ class MegatronInferStrategy(InferenceStrategy):
 
     def inner_forward_step(self, loss_func, data_iterator: Iterator[DataProto], model):
         data = next(data_iterator)
+        logger.info(f"inner_forward_step enter rank={self.worker.rank_info.rank}")
         if self.is_lora:
             routing = resolve_microbatch_lora_name(data.non_tensor_batch)
             for m in self.models_unwrapped:
                 m.set_adapter(routing.lora_name)
-        input_ids = data.batch["input_ids"]
-        attention_mask = data.batch["attention_mask"]
-        labels = data.batch["labels"] if "labels" in data.batch else None  # labels is only used for sft
+        is_pp_first = mpu.is_pipeline_first_stage()
+        is_pp_last = mpu.is_pipeline_last_stage()
+
+        input_ids = data.batch["input_ids"] if is_pp_first else None
+        attention_mask = data.batch["attention_mask"] if is_pp_first else None
+        labels = data.batch["labels"] if (is_pp_last and "labels" in data.batch) else None  # labels is only used for sft
         packed_seq_params = None
 
-        if self.use_sequence_packing:
+        if self.use_sequence_packing and is_pp_first:
             input_ids, packed_seq_params, cu_seqlens, cu_seqlens_padded = self._pack_sequences(
                 input_ids, attention_mask,
             )
             if labels is not None:
                 labels, _, _, _ = self._pack_sequences(labels, attention_mask, pad_val=IGNORE_INDEX)
             attention_mask = None
-        else:
+        elif is_pp_first:
             input_ids = self._get_feature_on_this_cp_rank(input_ids, "input_ids")
             attention_mask = self._get_feature_on_this_cp_rank(attention_mask, "attention_mask")
-            if labels is not None:
-                labels = self._get_feature_on_this_cp_rank(labels, "labels")
+        if labels is not None:
+            labels = self._get_feature_on_this_cp_rank(labels, "labels")
         position_ids = None
         # attention_mask: SelfAttention defalt to te DotProductAttention with
         # AttnMaskType.causal in which attention_mask would not be used, pass
@@ -443,7 +464,7 @@ class MegatronInferStrategy(InferenceStrategy):
         # attention_mask and position_ids would be chunked for cp with dim 2 as
         # seq dim in it if they are provided
         forward_args = data.meta_info.get("forward_args", {})
-        if "position_ids" in data.batch.keys() and data.batch["position_ids"].dim() == 3:  # qwen2vl mrope
+        if is_pp_first and "position_ids" in data.batch.keys() and data.batch["position_ids"].dim() == 3:  # qwen2vl mrope
             # not support MoE VLM, not used temperarily
             attention_mask = None
             position_ids = data.batch["position_ids"]
@@ -461,20 +482,24 @@ class MegatronInferStrategy(InferenceStrategy):
             for key in multi_modal_data.keys():
                 assert key not in forward_args
                 # DataProto.to('cuda') in upper frame not work for non_tensor_batch
-                forward_args[key] = torch.concat(multi_modal_data[key], dim=0).to(input_ids.device)
+                target_device = input_ids.device if input_ids is not None else labels.device
+                forward_args[key] = torch.concat(multi_modal_data[key], dim=0).to(target_device)
             forward_args.update({"force_vit_image": True})
 
         # megatron_llama_core need loss_mask to compute aux loss
         if "loss_mask" not in forward_args:
             if labels is not None:
                 forward_args["loss_mask"] = (labels != IGNORE_INDEX).float()
-            else:
+            elif input_ids is not None:
                 forward_args["loss_mask"] = torch.ones_like(input_ids)
+            else:
+                forward_args["loss_mask"] = None
 
         output_tensor = model(
             input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels,
             packed_seq_params=packed_seq_params, **forward_args
         )
+        logger.info(f"inner_forward_step model_done rank={self.worker.rank_info.rank}")
 
         if self.use_sequence_packing:
             cp_size = mpu.get_context_parallel_world_size()
@@ -1106,6 +1131,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     "lora_optimizer_mode='per_adapter' requires at least one adapter"
                 )
 
+            # PEFT activates trainability only for the currently active adapter.
+            # For per-adapter optimizer construction we need a stable snapshot where
+            # *all* adapters' LoRA params are considered trainable.
+            for model in self.models_unwrapped:
+                base_model = getattr(model, "base_model", None)
+                if base_model is not None and hasattr(base_model, "set_adapter"):
+                    base_model.set_adapter(adapter_names)
+
             # Verify all trainable params are adapter-scoped (no shared trainables like a value head).
             name_to_param: Dict[str, torch.nn.Parameter] = dict(
                 self.models_unwrapped[0].named_parameters()
@@ -1177,11 +1210,13 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 for group in getattr(adapter_opt, "param_groups", []):
                     for param in group.get("params", []):
                         pid = id(param)
-                        if pid not in param_id_to_name:
-                            raise RuntimeError(
-                                "Per-adapter optimizer captured an unknown parameter object"
-                            )
-                        pname = param_id_to_name[pid]
+                        pname = param_id_to_name.get(pid)
+                        if pname is None:
+                            # Megatron optimizers may create FP32 "main params" (new Parameter
+                            # objects) for FP16/BF16 model params. Those parameters are not
+                            # present in model.named_parameters(), so we cannot verify their
+                            # adapter ownership here.
+                            continue
                         if marker not in pname:
                             raise RuntimeError(
                                 f"Per-adapter optimizer for {adapter_name!r} captured "
@@ -1238,6 +1273,18 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.megatron_train_args.max_steps = self.worker_config.training_args.max_steps
         logger.info(f"max steps worker train {self.worker_config.training_args.max_steps}")
 
+        # Per-adapter schedulers must use DP-adjusted max_steps. They were initially
+        # created before dp_size was known, so rebuild here with the final step budget.
+        if self.lora_optimizer_mode == "per_adapter" and self.adapter_optimizers:
+            self.adapter_schedulers = {
+                adapter_name: get_megatron_lr_scheduler(
+                    self.megatron_train_args,
+                    self.megatron_train_args.max_steps,
+                    optimizer=adapter_opt,
+                )
+                for adapter_name, adapter_opt in self.adapter_optimizers.items()
+            }
+
         self.scheduler = get_megatron_lr_scheduler(
             self.megatron_train_args, self.megatron_train_args.max_steps, optimizer=self.optimizer
         )
@@ -1269,10 +1316,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             logger.info("Set variable_seq_lengths to True when use dynamic batching and pipeline parallel.")
 
         logger.info(f"{self.model.get_models()}")
-        dist.barrier()
+        _safe_dist_barrier()
 
     def train_step(self, batch: DataProto, loss_func: Callable):
         self.model.train()
+        logger.info(f"train_step start rank={self.worker.rank_info.rank} pp={self.worker.rank_info.pp_size}")
 
         global_step = batch.meta_info.get("global_step", 0)
         is_offload_optimizer_states_in_train_step = batch.meta_info.get("is_offload_optimizer_states_in_train_step", True)
@@ -1305,6 +1353,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         for micro_batch in micro_batches_list:
             micro_batch.meta_info['loss_scale'] = num_microbatches * mpu.get_data_parallel_world_size()
             micro_batch.meta_info['micro_batch_size'] = micro_batch.batch.batch_size[0]
+        logger.info(
+            f"train_step before fwd_bwd rank={self.worker.rank_info.rank} num_microbatches={num_microbatches}"
+        )
 
         data_iterator = [iter(micro_batches_list) for _ in range(len(self.model))]
 
@@ -1317,6 +1368,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             micro_batch_size=mini_batch_size,
             forward_only=False,
         )
+        logger.info(f"train_step after fwd_bwd rank={self.worker.rank_info.rank}")
 
         # 只有step的时候需要load optimizer states
         self.load_states(include=[OffloadStateType.optimizer_states])
@@ -1409,6 +1461,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         if self.worker_config.use_dynamic_batching_in_train:
             raise RuntimeError("forward_backward_only does not support dynamic batching in train.")
+        if batch.meta_info is None:
+            batch.meta_info = {}
+        batch.meta_info.setdefault(
+            "batch_num_tokens", self._get_batch_num_tokens(batch, dp_group=mpu.get_data_parallel_group())
+        )
+        batch.meta_info.setdefault(
+            "global_valid_samples", self._get_global_valid_samples(batch, dp_group=mpu.get_data_parallel_group())
+        )
 
         mini_batch_size = self.worker_config.training_args.per_device_train_batch_size
         override = batch.meta_info.get("num_microbatches_override", None) if batch.meta_info else None
@@ -1438,10 +1498,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         for mb in micro_batches_list:
             if mb.meta_info is None:
                 mb.meta_info = {}
-            if 'batch_num_tokens' not in mb.meta_info:
-                mb.meta_info['batch_num_tokens'] = self._get_batch_num_tokens(
-                    mb, dp_group=mpu.get_data_parallel_group()
-                )
+            mb.meta_info.setdefault(
+                "loss_scale", num_microbatches * mpu.get_data_parallel_world_size()
+            )
+            mb.meta_info.setdefault("micro_batch_size", mb.batch.batch_size[0])
+            mb.meta_info.setdefault("batch_num_tokens", batch.meta_info["batch_num_tokens"])
+            mb.meta_info.setdefault("global_valid_samples", batch.meta_info["global_valid_samples"])
 
         loss_scale = (
             batch.meta_info.get("grad_accumulation_loss_scale", None)
@@ -1558,6 +1620,16 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 "train_step_lora called but LoRA is not enabled for this strategy."
             )
 
+        def _merge_metrics(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
+            # Keep train_step_lora metric shapes consistent with train_step: values are flat lists.
+            for key, val in src.items():
+                if key not in dst:
+                    dst[key] = []
+                if isinstance(val, list):
+                    dst[key].extend(val)
+                else:
+                    dst[key].append(val)
+
         # ----------------------------------------------------------------
         # Shared mode: forward existing train_step logic via forward/backward
         # ----------------------------------------------------------------
@@ -1573,18 +1645,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                         mb.meta_info = {}
                     mb.meta_info.setdefault("num_microbatches_override", 1)
                     mb.meta_info.setdefault("grad_accumulation_loss_scale", loss_scale)
-                    append_to_dict(metrics, self.forward_backward_only(mb, loss_func))
-                append_to_dict(
-                    metrics,
-                    self.optimizer_step_only(batch_meta=batch_or_microbatches[0].meta_info),
+                    _merge_metrics(metrics, self.forward_backward_only(mb, loss_func))
+                _merge_metrics(
+                    metrics, self.optimizer_step_only(batch_meta=batch_or_microbatches[0].meta_info)
                 )
                 return metrics
             self.zero_grad()
             metrics = self.forward_backward_only(batch_or_microbatches, loss_func)
-            append_to_dict(
-                metrics,
-                self.optimizer_step_only(batch_meta=batch_or_microbatches.meta_info),
-            )
+            _merge_metrics(metrics, self.optimizer_step_only(batch_meta=batch_or_microbatches.meta_info))
             return metrics
 
         # ----------------------------------------------------------------
@@ -1623,8 +1691,16 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         adapters_in_order: List[str] = []
         adapter_to_mbs: Dict[str, List] = {}
         for mb in microbatches:
-            routing = resolve_microbatch_lora_name(mb.non_tensor_batch)
-            adapter_name = routing.lora_name
+            if mb.non_tensor_batch:
+                routing = resolve_microbatch_lora_name(mb.non_tensor_batch)
+                adapter_name = routing.lora_name
+            else:
+                adapter_name = mb.meta_info.get("lora_name") if mb.meta_info is not None else None
+                if not isinstance(adapter_name, str) or not adapter_name:
+                    raise RuntimeError(
+                        "Missing LoRA routing key for microbatch. "
+                        "Expected non_tensor_batch['lora_name'] or meta_info['lora_name']."
+                    )
             if adapter_name not in adapter_to_mbs:
                 adapters_in_order.append(adapter_name)
                 adapter_to_mbs[adapter_name] = []
@@ -1655,12 +1731,28 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             self.zero_grad()
             adapter_mbs = adapter_to_mbs[adapter_name]
             count = len(adapter_mbs)
-            for mb in adapter_mbs:
-                if mb.meta_info is None:
-                    mb.meta_info = {}
-                mb.meta_info["num_microbatches_override"] = 1
-                mb.meta_info["grad_accumulation_loss_scale"] = 1.0 / float(count)
-                append_to_dict(metrics, self.forward_backward_only(mb, loss_func))
+            logger.info(
+                f"train_step_lora(per_adapter) adapter={adapter_name} microbatches={count} "
+                f"pp={self.worker.rank_info.pp_size} rank={self.worker.rank_info.rank}"
+            )
+            if self.worker.rank_info.pp_size > 1 and count > 1:
+                merged = DataProto.concat(adapter_mbs)
+                if merged.meta_info is None:
+                    merged.meta_info = {}
+                merged.meta_info["num_microbatches_override"] = count
+                merged.meta_info["grad_accumulation_loss_scale"] = 1.0 / float(count)
+                _merge_metrics(metrics, self.forward_backward_only(merged, loss_func))
+            else:
+                for mb in adapter_mbs:
+                    if mb.meta_info is None:
+                        mb.meta_info = {}
+                    mb.meta_info["num_microbatches_override"] = 1
+                    mb.meta_info["grad_accumulation_loss_scale"] = 1.0 / float(count)
+                    _merge_metrics(metrics, self.forward_backward_only(mb, loss_func))
+            logger.info(
+                f"train_step_lora(per_adapter) adapter={adapter_name} forward_backward_done "
+                f"rank={self.worker.rank_info.rank}"
+            )
 
             # Save this adapter's RNG state after its forward passes.
             self.adapter_rng_states[adapter_name] = {
@@ -1676,6 +1768,10 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 sch.step()
             else:
                 raise NotImplementedError("megatron optimizer step failed!")
+            logger.info(
+                f"train_step_lora(per_adapter) adapter={adapter_name} optimizer_step_done "
+                f"rank={self.worker.rank_info.rank}"
+            )
 
             # Mirror train_step (lines 1337-1341): clear bucket caches after each adapter step.
             # Offload/reload does not update cached_param_buffer_shard_list/cached_grad_buffer_shard_list;
@@ -1687,7 +1783,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     if hasattr(bucket_group, "cached_grad_buffer_shard_list"):
                         bucket_group.cached_grad_buffer_shard_list = [None] * len(bucket_group.buckets)
 
-            append_to_dict(
+            _merge_metrics(
                 metrics,
                 {
                     f"{self.worker_config.name}/{adapter_name}/grad_norm": grad_norm,
@@ -1751,11 +1847,21 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 src = src.to(device=param.device, dtype=param.dtype)
             param.data.copy_(src)
             copied += 1
-        if copied == 0:
+        copied_total = copied
+        if dist.is_initialized():
+            copied_total_tensor = torch.tensor([copied], dtype=torch.int64, device=current_platform.current_device())
+            dist.all_reduce(copied_total_tensor, op=dist.ReduceOp.SUM)
+            copied_total = int(copied_total_tensor.item())
+        if copied_total == 0:
             raise RuntimeError(
                 f"No LoRA tensors applied for adapter {adapter_name!r}; "
                 "check naming and tensor keys."
             )
+
+        # Megatron mixed-precision optimizers keep FP32 "main params" copies of BF16/FP16
+        # model weights. Since we just mutated model params in-place, refresh the main params
+        # so the next optimizer.step() starts from the updated weights.
+        self.optimizer.reload_model_params()
         return copied
 
     def copy_lora_params(self, *, src_adapter: str, dst_adapter: str) -> int:
@@ -1784,6 +1890,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             raise RuntimeError(
                 "No LoRA parameters copied; check adapter naming and parameter patterns."
             )
+
+        # Keep optimizer FP32 main params in sync with the mutated model params.
+        self.optimizer.reload_model_params()
         return copied
 
     def _ensure_selective_sync_cpu_group(self, *, infer_tp_size: int) -> None:
@@ -2144,7 +2253,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
             # Critical: ensure all sender ranks complete this sync before allowing another to start.
             logger.info("[schedrl][selective_sync] barrier_enter " f"sync_id={sync_id} world_rank={world_rank}")
-            dist.barrier()
+            _safe_dist_barrier()
             logger.info(
                 "[schedrl][selective_sync] barrier_exit "
                 f"sync_id={sync_id} world_rank={world_rank} elapsed_s={time.perf_counter() - sync_t0:.3f}"
@@ -2256,7 +2365,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             logger.info(f"Saving optimizer state to {os.path.join(checkpoint_dir, OPTIMIZER_NAME)}")
 
         if dist.is_initialized():
-            dist.barrier()
+            _safe_dist_barrier()
 
         # save lr_scheduler
         if dist.get_rank() == 0:

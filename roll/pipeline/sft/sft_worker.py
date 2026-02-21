@@ -30,6 +30,9 @@ class SFTWorker(Worker):
 
     @register(Dispatch.DP_MP_DISPATCH_FIRST, clear_cache=False)
     def train_step(self, data: DataProto):
+        if data.meta_info is None:
+            data.meta_info = {}
+        data.meta_info.setdefault("_broadcast_non_tensor_batch", True)
         data = self.strategy.get_data_input(data)
         data = data.to(current_platform.device_type)
 
@@ -48,6 +51,9 @@ class SFTWorker(Worker):
         The microbatch must carry ``non_tensor_batch["domain"]`` (or
         ``"lora_name"``) to identify which adapter owns the batch.
         """
+        if data.meta_info is None:
+            data.meta_info = {}
+        data.meta_info.setdefault("_broadcast_non_tensor_batch", True)
         data = self.strategy.get_data_input(data)
         data = data.to(current_platform.device_type)
         metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)

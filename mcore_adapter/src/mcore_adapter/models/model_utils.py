@@ -112,7 +112,8 @@ class RMSNorm(nn.Module):
 class _McaLoraLogitsHelper(torch.autograd.Function):
     @staticmethod
     def forward(ctx, logits: "torch.Tensor"):
-        return logits
+        # Return a fresh tensor so downstream inplace ops do not invalidate this custom backward.
+        return logits.clone()
 
     @staticmethod
     def backward(ctx, grad_output: "torch.Tensor"):

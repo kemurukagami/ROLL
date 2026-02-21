@@ -7,6 +7,7 @@ import torch
 from megatron.core import mpu, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
+    HAVE_TE,
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -330,9 +331,19 @@ class McaGPTModel(GPTModel, PretrainedModel):
         if self.post_process or self.mtp_process:
             self.output_layer.register_forward_hook(mca_lora_logits_postprocess_hook)
 
+    def _should_use_transformer_engine(self, config: "McaModelConfig") -> bool:
+        use_te = config.transformer_impl == "transformer_engine"
+        if use_te and not HAVE_TE:
+            logger.warning(
+                "Transformer Engine is requested but unavailable; falling back to local transformer implementation."
+            )
+            config.transformer_impl = "local"
+            return False
+        return use_te
+
     def _get_transformer_layer_spec(self, config: Optional["McaModelConfig"] = None):
         config = config or self.config
-        use_te = config.transformer_impl == "transformer_engine"
+        use_te = self._should_use_transformer_engine(config)
         if config.num_moe_experts:
             transformer_block_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=use_te, vp_stage=self.vp_stage)
             if not use_te and config.normalization == "RMSNorm":
@@ -363,7 +374,7 @@ class McaGPTModel(GPTModel, PretrainedModel):
         config = config or self.config
         if config.mtp_num_layers and config.mtp_num_layers > 0:
             transformer_layer_spec = self._get_transformer_layer_spec(config)
-            use_te = config.transformer_impl == "transformer_engine"
+            use_te = self._should_use_transformer_engine(config)
             spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, use_te, vp_stage=vp_stage)
             return spec
         else:

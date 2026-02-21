@@ -453,8 +453,10 @@ class MegatronInferStrategy(InferenceStrategy):
         elif is_pp_first:
             input_ids = self._get_feature_on_this_cp_rank(input_ids, "input_ids")
             attention_mask = self._get_feature_on_this_cp_rank(attention_mask, "attention_mask")
-        if labels is not None:
-            labels = self._get_feature_on_this_cp_rank(labels, "labels")
+            if labels is not None:
+                labels = self._get_feature_on_this_cp_rank(labels, "labels")
+        if attention_mask is not None and attention_mask.dtype != torch.bool and not torch.is_floating_point(attention_mask):
+            attention_mask = attention_mask.bool()
         position_ids = None
         # attention_mask: SelfAttention defalt to te DotProductAttention with
         # AttnMaskType.causal in which attention_mask would not be used, pass

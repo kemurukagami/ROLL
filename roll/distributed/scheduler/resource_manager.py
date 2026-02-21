@@ -62,7 +62,10 @@ class ResourceManager:
                 bundles.append({ray_device_key: self.gpu_per_node, "CPU": max(node_cpu / 2, 1)})
 
             self.placement_groups = [
-                ray.util.placement_group([bundle], name=f"{self._pg_name_prefix}{i}" if self._pg_name_prefix else None)
+                ray.util.placement_group(
+                    [bundle],
+                    **({"name": f"{self._pg_name_prefix}{i}"} if self._pg_name_prefix else {}),
+                )
                 for i, bundle in enumerate(bundles)
             ]
             ray.get([pg.ready() for pg in self.placement_groups])
@@ -91,7 +94,10 @@ class ResourceManager:
             node_cpu = int(node["Resources"]["CPU"])
             bundles = [{"CPU": node_cpu}] * self.num_nodes
             self.placement_groups = [
-                ray.util.placement_group([bundle], name=f"{self._pg_name_prefix}cpu:{i}" if self._pg_name_prefix else None)
+                ray.util.placement_group(
+                    [bundle],
+                    **({"name": f"{self._pg_name_prefix}cpu:{i}"} if self._pg_name_prefix else {}),
+                )
                 for i, bundle in enumerate(bundles)
             ]
             ray.get([pg.ready() for pg in self.placement_groups])

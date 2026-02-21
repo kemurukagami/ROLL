@@ -53,6 +53,7 @@ def _initialize_distributed(args: "TrainingArguments"):
             rank=int(os.getenv("RANK", "0")),
             world_size=int(os.getenv("WORLD_SIZE", "1")),
             timeout=args.ddp_timeout_delta,
+            device_id=torch.device(args.device),
         )
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.

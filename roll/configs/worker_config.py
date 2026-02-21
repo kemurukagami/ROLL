@@ -241,7 +241,16 @@ class WorkerConfig:
                 )
 
         if self.device_mapping is not None:
-            self.device_mapping = ast.literal_eval(self.device_mapping)
+            if isinstance(self.device_mapping, str):
+                try:
+                    self.device_mapping = ast.literal_eval(self.device_mapping)
+                except (ValueError, SyntaxError):
+                    # Backward compatibility: many configs use "list(range(...))".
+                    self.device_mapping = eval(
+                        self.device_mapping,
+                        {"__builtins__": {}},
+                        {"list": list, "range": range},
+                    )
             assert (
                 len(self.device_mapping) % self.num_gpus_per_worker == 0
             ), f"len(device_mapping)={len(self.device_mapping)} must be divisible by num_gpus_per_worker={self.num_gpus_per_worker}."

@@ -26,6 +26,7 @@ from roll.utils.constants import EpisodeStopReason, GenerateStopReason, RAY_NAME
 from roll.utils.env_action_limiter import get_global_limiter
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.logging import get_logger
+from roll.utils.lora_routing import normalize_domain
 
 
 class VLTrajEnvManager(TrajEnvManager):
@@ -407,6 +408,20 @@ class VLTrajEnvManager(TrajEnvManager):
                 f"extra_suffix_length={history.history[-1]['extra_suffix_length']}"
             )
 
+        # Inject lora_name for inference routing; single-adapter uses sole key, multi-adapter validates normalized tag.
+        if self.pipeline_config.actor_infer.model_args.adapters is not None:
+            adapters = self.pipeline_config.actor_infer.model_args.adapters
+            if len(adapters) == 1:
+                lm_input.non_tensor_batch["lora_name"] = np.array([next(iter(adapters.keys()))], dtype=object)
+            else:
+                normalized = normalize_domain(self.rollout_cache.tag)
+                valid_adapters = set(adapters.keys())
+                if normalized not in valid_adapters:
+                    raise RuntimeError(
+                        f"Env tag {self.rollout_cache.tag!r} normalizes to {normalized!r} "
+                        f"which is not in configured adapters: {sorted(valid_adapters)}"
+                    )
+                lm_input.non_tensor_batch["lora_name"] = np.array([normalized], dtype=object)
         return lm_input, messages
 
     def formulate_rollouts(self, rollout_cache: RolloutCache):
@@ -478,11 +493,27 @@ class VLTrajEnvManager(TrajEnvManager):
             "prompt_mask": prompt_mask,
             "scores": score_tensor,
         })
+        # Compute lora_name for training routing; single-adapter uses sole key, multi-adapter validates normalized tag.
+        if self.pipeline_config.actor_train.model_args.adapters is not None:
+            adapters = self.pipeline_config.actor_train.model_args.adapters
+            if len(adapters) == 1:
+                _lora_name = next(iter(adapters.keys()))
+            else:
+                _lora_name = normalize_domain(self.rollout_cache.tag)
+                _valid = set(adapters.keys())
+                if _lora_name not in _valid:
+                    raise RuntimeError(
+                        f"Env tag {self.rollout_cache.tag!r} normalizes to {_lora_name!r} "
+                        f"which is not in configured adapters: {sorted(_valid)}"
+                    )
+        else:
+            _lora_name = self.rollout_cache.tag
         lm_input.non_tensor_batch.update({
             "env_ids": np.array([self.rollout_cache.env_id], dtype=object),
             "group_ids": np.array([self.rollout_cache.group_id], dtype=object),
             "messages_list": np.array([messages], dtype=object),
             "tags": np.array([self.rollout_cache.tag], dtype=object),
+            "lora_name": np.array([_lora_name], dtype=object),
             "step_scores": np.array([scores], dtype=object),
             "episode_scores": np.array([episode_score], dtype=object),
         })

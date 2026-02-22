@@ -25,6 +25,7 @@ from roll.pipeline.agentic.agentic_config import EnvManagerConfig, AgenticConfig
 from roll.utils.constants import GenerateStopReason
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.logging import get_logger
+from roll.utils.lora_routing import normalize_domain
 from roll.utils.str_utils import contains_renderable_field
 
 
@@ -330,6 +331,20 @@ class TrajEnvManager(BaseEnvManager):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
         }, batch_size=input_ids.shape[0])
+        # Inject lora_name for inference routing; single-adapter uses sole key, multi-adapter validates normalized tag.
+        if self.pipeline_config.actor_infer.model_args.adapters is not None:
+            adapters = self.pipeline_config.actor_infer.model_args.adapters
+            if len(adapters) == 1:
+                lm_input.non_tensor_batch["lora_name"] = np.array([next(iter(adapters.keys()))], dtype=object)
+            else:
+                normalized = normalize_domain(self.rollout_cache.tag)
+                valid_adapters = set(adapters.keys())
+                if normalized not in valid_adapters:
+                    raise RuntimeError(
+                        f"Env tag {self.rollout_cache.tag!r} normalizes to {normalized!r} "
+                        f"which is not in configured adapters: {sorted(valid_adapters)}"
+                    )
+                lm_input.non_tensor_batch["lora_name"] = np.array([normalized], dtype=object)
         content["prompt_ids"] = prompt_ids
         content["messages"] = messages
         return lm_input
@@ -407,10 +422,26 @@ class TrajEnvManager(BaseEnvManager):
             infer_logprobs = pad_to_length(infer_logprobs, length=self.pipeline_config.sequence_length, pad_value=0)
             lm_input.batch["infer_logprobs"] = infer_logprobs[:, 1:]
 
+        # Compute lora_name for training routing; single-adapter uses sole key, multi-adapter validates normalized tag.
+        if self.pipeline_config.actor_train.model_args.adapters is not None:
+            adapters = self.pipeline_config.actor_train.model_args.adapters
+            if len(adapters) == 1:
+                _lora_name = next(iter(adapters.keys()))
+            else:
+                _lora_name = normalize_domain(self.rollout_cache.tag)
+                _valid = set(adapters.keys())
+                if _lora_name not in _valid:
+                    raise RuntimeError(
+                        f"Env tag {self.rollout_cache.tag!r} normalizes to {_lora_name!r} "
+                        f"which is not in configured adapters: {sorted(_valid)}"
+                    )
+        else:
+            _lora_name = self.rollout_cache.tag
         lm_input.non_tensor_batch.update({
             "env_ids": np.array([self.rollout_cache.env_id], dtype=object),
             "group_ids": np.array([self.rollout_cache.group_id], dtype=object),
             "tags": np.array([self.rollout_cache.tag], dtype=object),
+            "lora_name": np.array([_lora_name], dtype=object),
             "step_scores": np.array([scores], dtype=object),
             "episode_scores": np.array([episode_score], dtype=object),
         })

@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 from tensordict import TensorDict
 
@@ -6,6 +7,7 @@ from roll.pipeline.agentic.env_manager.token_mask_utils import custom_apply_chat
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.env_manager.step_env_manager import StepEnvManager
 from roll.utils.hash_utils import compute_object_hash
+from roll.utils.lora_routing import normalize_domain
 from roll.utils.str_utils import contains_renderable_field
 
 
@@ -44,6 +46,20 @@ class StepConcatEnvManager(StepEnvManager):
             "attention_mask": attention_mask,
             "position_ids": position_ids,
         }, batch_size=input_ids.shape[0])
+        # Inject lora_name for inference routing; single-adapter uses sole key, multi-adapter validates normalized tag.
+        if self.pipeline_config.actor_infer.model_args.adapters is not None:
+            adapters = self.pipeline_config.actor_infer.model_args.adapters
+            if len(adapters) == 1:
+                lm_input.non_tensor_batch["lora_name"] = np.array([next(iter(adapters.keys()))], dtype=object)
+            else:
+                normalized = normalize_domain(self.rollout_cache.tag)
+                valid_adapters = set(adapters.keys())
+                if normalized not in valid_adapters:
+                    raise RuntimeError(
+                        f"Env tag {self.rollout_cache.tag!r} normalizes to {normalized!r} "
+                        f"which is not in configured adapters: {sorted(valid_adapters)}"
+                    )
+                lm_input.non_tensor_batch["lora_name"] = np.array([normalized], dtype=object)
         current_cache["prompt_ids"] = prompt_ids
         current_cache['state_hash'] = compute_object_hash(current_observation)
         current_cache['messages'] = messages

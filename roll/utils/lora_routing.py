@@ -1,13 +1,8 @@
 """LoRA routing utilities for multi-LoRA microbatch dispatch.
 
-Ported from ROLL_multi_lora with one key adaptation:
-  ROLL_schedrl uses ``non_tensor_batch["domain"]`` as the routing key
-  (consistent with the existing SchedRL pipeline conventions), while
-  ROLL_multi_lora uses ``non_tensor_batch["lora_name"]``.
-
-``resolve_microbatch_lora_name`` therefore checks ``domain`` first and
-falls back to ``lora_name`` so that tests or pipelines which use either
-convention are both supported.
+The canonical routing key is ``non_tensor_batch["lora_name"]``.
+Multi-adapter callers must inject this key before routing.
+Single-adapter callers can use ``ensure_lora_name_in_batch`` to auto-fill.
 """
 from __future__ import annotations
 
@@ -43,26 +38,56 @@ def _require_str(val: Any, *, where: str) -> str:
     return val
 
 
-def _get_lora_name_array(non_tensor_batch: Mapping[str, Any]) -> np.ndarray:
-    """Return the per-sample lora/domain name array.
+def get_lora_name_array(non_tensor_batch: Mapping[str, Any]) -> np.ndarray:
+    """Return the per-sample LoRA name array from ``non_tensor_batch["lora_name"]``."""
+    if "lora_name" not in non_tensor_batch:
+        raise RuntimeError(
+            'Missing `non_tensor_batch["lora_name"]` (required for multi-LoRA routing). '
+            f"Available keys={sorted(non_tensor_batch.keys())}"
+        )
+    lora_name = non_tensor_batch["lora_name"]
+    if not isinstance(lora_name, np.ndarray) or lora_name.dtype != object:
+        raise TypeError(
+            f'Expected `non_tensor_batch["lora_name"]` to be np.ndarray(dtype=object), '
+            f"got {type(lora_name)} dtype={getattr(lora_name, 'dtype', None)} "
+            f"shape={getattr(lora_name, 'shape', None)}"
+        )
+    return lora_name
 
-    Checks ``domain`` first (ROLL_schedrl convention), then falls back to
-    ``lora_name`` (ROLL_multi_lora convention).
-    """
-    for key in ("domain", "lora_name"):
-        if key in non_tensor_batch:
-            val = non_tensor_batch[key]
-            if not isinstance(val, np.ndarray) or val.dtype != object:
-                raise TypeError(
-                    f'Expected `non_tensor_batch["{key}"]` to be np.ndarray(dtype=object), '
-                    f"got {type(val)} dtype={getattr(val, 'dtype', None)} "
-                    f"shape={getattr(val, 'shape', None)}"
+
+def ensure_lora_name_in_batch(
+    non_tensor_batch: dict,
+    *,
+    adapters: Mapping[str, Any] | None,
+    batch_size: int | None = None,
+) -> None:
+    """Ensure ``non_tensor_batch["lora_name"]`` exists using strict single-vs-multi policy."""
+    if "lora_name" in non_tensor_batch:
+        return
+    if not adapters:
+        return
+    if len(adapters) == 1:
+        only_key = next(iter(adapters.keys()))
+        # Keep this strict: infer shape or fail so callers fix producer contract early.
+        if batch_size is None:
+            if not non_tensor_batch:
+                raise RuntimeError(
+                    "ensure_lora_name_in_batch: cannot auto-fill lora_name in single-adapter "
+                    "mode with empty non_tensor_batch and no batch_size provided."
                 )
-            return val
+            batch_size = len(next(iter(non_tensor_batch.values())))
+        non_tensor_batch["lora_name"] = np.full(batch_size, only_key, dtype=object)
+        return
     raise RuntimeError(
-        'Missing `non_tensor_batch["domain"]` (or "lora_name") required for multi-LoRA routing. '
-        f"Available keys={sorted(non_tensor_batch.keys())}"
+        "Missing non_tensor_batch['lora_name'] in multi-adapter mode. "
+        f"Configured adapters: {sorted(adapters.keys())}. "
+        "Producers must inject lora_name."
     )
+
+
+def _get_lora_name_array(non_tensor_batch: Mapping[str, Any]) -> np.ndarray:
+    """Return per-sample LoRA name array. Requires ``non_tensor_batch['lora_name']``."""
+    return get_lora_name_array(non_tensor_batch)
 
 
 def resolve_microbatch_lora_name(non_tensor_batch: Mapping[str, Any]) -> LoraNameRouting:

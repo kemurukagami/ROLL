@@ -24,24 +24,31 @@ class TensorLoraManager:
     def __init__(self):
         self.lora_params = OrderedDict()
         self.add_lora_count = 0
+        self._lora_names: dict[str, int] = {}  # Track adapter_name -> lora_int_id for routing lookups.
+
+    def get_lora_id(self, adapter_name: str) -> int | None:
+        # Return None when adapter has not been registered on this worker yet.
+        return self._lora_names.get(adapter_name, None)
 
     def add_weight(self, name: str, weight: torch.Tensor):
         self.lora_params[name] = weight
 
-    def build_request(self, peft_config: dict) -> TensorLoRARequest:
+    def build_request(self, adapter_name: str, peft_config: dict) -> TensorLoRARequest:
         """
-        Generate a unique LoRA ID based on the PEFT configuration rather than
-        using a timestamp to assert all tp-ranks get the same LoRA ID.
+        Generate a unique LoRA ID based on adapter name + PEFT config so every
+        rank computes the same id for the same adapter registration.
         """
         self.add_lora_count += 1
+        peft_config["adapter_name"] = adapter_name
         peft_config["add_lora_count"] = self.add_lora_count
         peft_config_str = json.dumps(peft_config, sort_keys=True)
         hash_obj = hashlib.sha256(peft_config_str.encode("utf-8"))
         hex_dig = hash_obj.hexdigest()
         lora_int_id = int(hex_dig, 16) % 0x7FFFFFFF
+        self._lora_names[adapter_name] = lora_int_id
 
         lora_request = TensorLoRARequest(
-            lora_name=f"{lora_int_id}",
+            lora_name=adapter_name,
             lora_int_id=lora_int_id,
             lora_path="dummy_lora_path",
             peft_config=peft_config,
@@ -59,6 +66,37 @@ class WorkerBase:
         self.buffers = None
         self.buffer_cache = None
         self.tensor_lora_manager = TensorLoraManager()
+
+    # Use custom prefix because worker_extension_cls can not have conflicting method names with vllm worker.
+    def custom_add_lora(self, adapter_name: str, peft_config: dict) -> bool:
+        # Build request with adapter name so routing can map name -> id consistently.
+        lora_request = self.tensor_lora_manager.build_request(adapter_name, peft_config)
+        self.reload_model()
+        add_lora = getattr(getattr(self, "model_runner", None), "add_lora", None)
+        if not callable(add_lora):
+            raise NotImplementedError(
+                "vLLM worker does not expose model_runner.add_lora; "
+                "ensure the configured vLLM version supports runtime LoRA registration."
+            )
+        try:
+            ok = add_lora(lora_request)
+        except Exception:
+            # Roll back local mapping so we do not keep a phantom adapter id.
+            self.tensor_lora_manager._lora_names.pop(adapter_name, None)
+            raise
+        if ok is False:
+            # Roll back local mapping so verification sees only successfully-added adapters.
+            self.tensor_lora_manager._lora_names.pop(adapter_name, None)
+            raise RuntimeError(f"vLLM add_lora returned False for adapter={adapter_name!r}")
+        return True
+
+    def custom_list_loras(self) -> list[int]:
+        # Return unique ids to keep parity across ranks when strategy normalizes results.
+        return sorted(set(self.tensor_lora_manager._lora_names.values()))
+
+    def custom_get_lora_id(self, adapter_name: str) -> int | None:
+        # Strategy uses this to resolve adapter name into vLLM integer adapter id.
+        return self.tensor_lora_manager.get_lora_id(adapter_name)
 
     def reload_model(self):
         if not self.weight_loaded:
@@ -253,9 +291,4 @@ class WorkerV1(WorkerBase):
         super().custom_init_worker(*args, **kwargs)
         patch_vllm_lora_manager()
 
-    # Use custom prefix because worker_extension_cls can not has
-    # conflicting method name with vllm worker.
-    def custom_add_lora(self, peft_config) -> bool:
-        lora_request = self.tensor_lora_manager.build_request(peft_config)
-        super().reload_model()
-        return self.model_runner.add_lora(lora_request)
+    # custom_add_lora is inherited from WorkerBase so all worker variants share adapter-name logic.

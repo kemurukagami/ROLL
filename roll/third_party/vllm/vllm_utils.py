@@ -54,6 +54,14 @@ class TensorLoRARequest(LoRARequest):
 
 
 def patch_vllm_lora_manager():
+    # vLLM 0.8.4 compatibility: some builds call LoRALRUCache._LRUCache__update(),
+    # while the installed LRUCache implementation exposes _LRUCache__touch().
+    # Provide an alias so LoRA adapter activation does not crash during engine profiling.
+    from vllm.lora.models import LoRALRUCache
+    from vllm.utils import LRUCache
+    if not hasattr(LoRALRUCache, "_LRUCache__update") and hasattr(LRUCache, "_LRUCache__touch"):
+        setattr(LoRALRUCache, "_LRUCache__update", LRUCache._LRUCache__touch)
+
     def load_adapter(self, lora_request: TensorLoRARequest) -> LoRAModel:
         """
         based on vllm.lora.worker_manager.WorkerLoRAManager._load_adapter, support load adapter with lora tensors

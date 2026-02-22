@@ -13,6 +13,13 @@ from vllm.v1.engine.output_processor import OutputProcessor
 
 from roll.third_party.vllm.async_llm import CustomAsyncLLM
 
+# vLLM 0.8.4 compatibility: some builds call LoRALRUCache._LRUCache__update(),
+# while others only provide LRUCache._LRUCache__touch(); add alias for subprocess engine path.
+from vllm.lora.models import LoRALRUCache as _LoRALRUCache
+from vllm.utils import LRUCache as _LRUCache
+if not hasattr(_LoRALRUCache, "_LRUCache__update") and hasattr(_LRUCache, "_LRUCache__touch"):
+    setattr(_LoRALRUCache, "_LRUCache__update", _LRUCache._LRUCache__touch)
+
 # Patch vLLM v1 dummy profiling run to avoid indexing with a NumPy int64 array.
 #
 # vllm==0.8.4 builds `logit_indices` as a NumPy array and uses it to index a torch.Tensor

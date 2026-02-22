@@ -27,5 +27,13 @@ class CustomAsyncLLM(AsyncLLM):
     async def add_lora(self, *args, **kwargs):
         await self.engine_core.collective_rpc_async(method="custom_add_lora", args=args, kwargs=kwargs)
 
+    async def get_lora_id(self, *args, **kwargs):
+        # Keep adapter-id lookup on the same collective RPC path as add_lora.
+        return await self.engine_core.collective_rpc_async(method="custom_get_lora_id", args=args, kwargs=kwargs)
+
+    async def list_loras(self) -> list[int]:
+        # Expose loaded adapter ids so strategy can verify routing readiness.
+        return await self.engine_core.collective_rpc_async(method="custom_list_loras")
+
     async def process_weights_after_loading(self):
         await self.engine_core.collective_rpc_async(method="process_weights_after_loading")

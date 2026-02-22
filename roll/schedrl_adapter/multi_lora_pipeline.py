@@ -522,13 +522,23 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                             metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
                             checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
 
-                            # Determine which adapters were trained from batch domains.
-                            domain_tags = set(batch.non_tensor_batch.get("domain", []))
+                            # Determine trained adapters from canonical lora_name and fail fast on missing/unknown values.
+                            if "lora_name" not in batch.non_tensor_batch:
+                                raise RuntimeError(
+                                    "multi_lora_pipeline.run(): missing non_tensor_batch['lora_name']. "
+                                    "Env managers must inject lora_name before the training step."
+                                )
+                            lora_name_arr = batch.non_tensor_batch["lora_name"]
+                            valid_adapter_names = set(self._tag_to_adapter.values())
                             trained_adapters = list(dict.fromkeys(
-                                self._tag_to_adapter[tag]
-                                for tag in domain_tags
-                                if tag in self._tag_to_adapter
+                                str(name) for name in lora_name_arr.tolist() if str(name) in valid_adapter_names
                             ))
+                            if not trained_adapters:
+                                raise RuntimeError(
+                                    "multi_lora_pipeline.run(): no recognized adapters in lora_name. "
+                                    f"lora_name values={lora_name_arr.tolist()!r} "
+                                    f"valid_adapters={sorted(valid_adapter_names)!r}"
+                                )
 
                             # Build per-adapter CPU bucket caches (BEFORE offload_states — needs GPU).
                             for adapter_name in trained_adapters:

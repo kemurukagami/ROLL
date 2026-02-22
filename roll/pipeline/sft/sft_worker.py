@@ -11,6 +11,7 @@ from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.strategy.factory import create_strategy
 from roll.distributed.strategy.strategy import InferenceStrategy, TrainStrategy
 from roll.utils.functionals import reduce_metrics
+from roll.utils.lora_routing import ensure_lora_name_in_batch
 from roll.models.model_providers import default_actor_model_provider
 from roll.platforms import current_platform
 
@@ -48,11 +49,19 @@ class SFTWorker(Worker):
         Routes to ``MegatronTrainStrategy.train_step_lora`` which dispatches
         per-adapter optimizer.step() when ``lora_optimizer_mode='per_adapter'``.
 
-        The microbatch must carry ``non_tensor_batch["domain"]`` (or
-        ``"lora_name"``) to identify which adapter owns the batch.
+        The microbatch must carry ``non_tensor_batch["lora_name"]`` to
+        identify which adapter owns the batch.
         """
         if data.meta_info is None:
             data.meta_info = {}
+        # Auto-fill lora_name for single-adapter legacy producers and fail-fast for multi-adapter missing metadata.
+        _bs = data.batch.batch_size[0] if data.batch is not None else None
+        ensure_lora_name_in_batch(
+            data.non_tensor_batch,
+            adapters=self.worker_config.model_args.adapters,
+            batch_size=_bs,
+        )
+        # Ensure non-tensor adapter routing keys are broadcast to all Megatron ranks.
         data.meta_info.setdefault("_broadcast_non_tensor_batch", True)
         data = self.strategy.get_data_input(data)
         data = data.to(current_platform.device_type)

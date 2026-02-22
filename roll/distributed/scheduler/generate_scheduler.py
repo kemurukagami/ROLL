@@ -1477,6 +1477,39 @@ class RequestScheduler:
         self.need_suspend = False
         self.suspend_notifier.set()
 
+    def get_inflight_counts(self, dp_ranks: List[int]) -> Dict[int, int]:
+        # Report per-rank in-flight counts so pipeline can wait for safe offload barriers.
+        ranks = self._validate_dp_ranks_input(dp_ranks, mode="get_inflight_counts")
+        return {int(rank): len(self.running_requests[int(rank)]) for rank in ranks}
+
+    def get_offload_ranks_for_target_gpus(self, target_gpus: List[int]) -> List[int]:
+        # Translate target GPU IDs into DP ranks that currently overlap those devices.
+        self._validate_target_gpus(target_gpus, mode="shrink")
+        target_gpus_set = set(target_gpus)
+        offload_ranks = [
+            dp_rank
+            for dp_rank in range(self.infer_cluster.world_size)
+            if set(self._get_gpus_for_dp_rank(dp_rank)).intersection(target_gpus_set)
+        ]
+        self._validate_calculated_ranks(offload_ranks, mode="shrink")
+        return offload_ranks
+
+    async def offload_dp_ranks(self, dp_ranks: List[int]) -> Dict[str, Any]:
+        # Physical offload happens only after all schedulers stop routing and drain in-flight requests.
+        offload_ranks = self._validate_dp_ranks_input(dp_ranks, mode="offload_dp_ranks")
+        start_time = time.time()
+        async with self.routing_lock:
+            # Re-check under routing_lock so shrink/expand cannot race this active-state validation.
+            for rank in offload_ranks:
+                if rank in self.active_dp_ranks:
+                    raise ValueError(
+                        f"offload_dp_ranks: dp_rank {rank} is still active; "
+                        "call shrink_workers(..., skip_offload=True) first"
+                    )
+            offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
+            await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
+        return {"offload_duration_ms": (time.time() - start_time) * 1000, "offload_ranks": offload_ranks}
+
     def _get_gpus_for_dp_rank(self, dp_rank: int) -> List[int]:
         """Map DP rank to GPU IDs using cluster's device info.
 

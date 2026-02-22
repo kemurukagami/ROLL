@@ -26,6 +26,7 @@ from roll.utils.checkpoint_manager import download_model
 from roll.utils.context_managers import state_offload_manger, log_gpu_memory_usage
 from roll.utils.dynamic_batching import make_mini_batch_iter_for_dynamic_batching
 from roll.utils.functionals import agg_loss, append_to_dict, compute_approx_kl, masked_mean, postprocess_generate, reduce_metrics
+from roll.utils.lora_routing import ensure_lora_name_in_batch
 from roll.utils.offload_nccl import reload_process_groups
 from roll.utils.offload_states import OffloadStateType
 
@@ -114,9 +115,21 @@ class ActorWorker(Worker):
     def train_step_lora(self, data: DataProto):
         """Multi-LoRA training step.
 
-        Routes per-adapter microbatches via ``non_tensor_batch["domain"]`` to
+        Routes per-adapter microbatches via ``non_tensor_batch["lora_name"]`` to
         ``MegatronTrainStrategy.train_step_lora`` with ``lora_optimizer_mode="per_adapter"``.
         """
+        # Auto-fill lora_name for single-adapter legacy producers and fail-fast for multi-adapter missing metadata.
+        _bs = data.batch.batch_size[0] if data.batch is not None else None
+        ensure_lora_name_in_batch(
+            data.non_tensor_batch,
+            adapters=self.worker_config.model_args.adapters,
+            batch_size=_bs,
+        )
+        # Ensure non-tensor adapter routing keys are broadcast to all Megatron ranks.
+        if self.worker_config.model_args.adapters is not None:
+            if data.meta_info is None:
+                data.meta_info = {}
+            data.meta_info["_broadcast_non_tensor_batch"] = True
         data = data.to(current_platform.device_type)
         data = self.strategy.get_data_input(data)
         metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
@@ -483,6 +496,18 @@ class InferWorker(Worker):
 
     async def add_lora(self, *args, **kwargs):
         await self.strategy.add_lora(*args, **kwargs)
+
+    async def get_lora_id(self, adapter_name: str):
+        # Delegate to strategy adapter-id lookup for multi-LoRA model-update verification.
+        return await self.strategy.get_lora_id(adapter_name)
+
+    async def list_loras(self):
+        # Delegate loaded-adapter-id listing for multi-LoRA readiness checks.
+        return await self.strategy.list_loras()
+
+    async def wait_loras_ready(self, adapter_names: list[str], timeout_s: float):
+        # Delegate per-adapter readiness polling to strategy implementation.
+        await self.strategy.wait_loras_ready(adapter_names, timeout_s=timeout_s)
 
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE)
     async def generate(self, data: DataProto):

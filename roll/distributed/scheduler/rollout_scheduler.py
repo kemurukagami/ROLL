@@ -774,9 +774,10 @@ class RolloutScheduler(RolloutMockMixin):
         self.logger.info(f"[RolloutScheduler] creating GroupQueueManager mode={self.mode}")
         self.env_output_queue = GroupQueueManager.options(
             name=(
-                f"{self.pipeline_id}_group_queue_manager_{mode}"
+                # Include env-manager name so multiple train schedulers (one per tag) do not collide on actor name.
+                f"{self.pipeline_id}_group_queue_manager_{self.env_manager_config.name}_{mode}"
                 if self.pipeline_id
-                else f"GroupQueueManager-{mode}"
+                else f"GroupQueueManager-{self.env_manager_config.name}-{mode}"
             ),
             namespace=RAY_NAMESPACE,
             scheduling_strategy=NodeAffinitySchedulingStrategy(
@@ -867,6 +868,22 @@ class RolloutScheduler(RolloutMockMixin):
 
     async def suspend(self):
         await self.generate_scheduler.suspend.remote()
+
+    async def resume(self):
+        # Delegate resume so partial-GPU pipeline can re-enable request dispatch after expand.
+        await self.generate_scheduler.resume.remote()
+
+    async def get_inflight_counts(self, dp_ranks: List[int]) -> Dict[int, int]:
+        # Delegate to RequestScheduler so caller observes in-flight state from routing owner.
+        return await self.generate_scheduler.get_inflight_counts.remote(dp_ranks)
+
+    async def get_offload_ranks_for_target_gpus(self, target_gpus: List[int]) -> List[int]:
+        # Delegate rank-mapping logic to RequestScheduler for consistency with shrink/expand semantics.
+        return await self.generate_scheduler.get_offload_ranks_for_target_gpus.remote(target_gpus)
+
+    async def offload_dp_ranks(self, dp_ranks: List[int]) -> Dict[str, Any]:
+        # Delegate physical offload to RequestScheduler to keep model-state transitions centralized.
+        return await self.generate_scheduler.offload_dp_ranks.remote(dp_ranks)
 
     async def _run_rollout_loop(self, seed):
         self.logger.info(f"[RolloutScheduler] start _run_rollout_loop seed={seed} mode={self.mode}")

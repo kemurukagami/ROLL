@@ -1434,8 +1434,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             self.promote_active_checkpoint(checkpoint_version=checkpoint_version, global_step=int(global_step))
         return metrics
 
-    def model_update(self, model_update_name: str):
-        return self.weight_updaters[model_update_name].model_update()
+    def model_update(self, model_update_name: str, adapters_to_update: list[str] | None = None):
+        # Forward optional adapter subset to weight updater for multi-LoRA selective sync.
+        return self.weight_updaters[model_update_name].model_update(adapters_to_update=adapters_to_update)
 
     # ------------------------------------------------------------------
     # Per-adapter multi-LoRA helpers (Phase 1 port)
@@ -1611,11 +1612,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
           microbatches then do one optimizer step (existing shared semantics).
         - ``lora_optimizer_mode='per_adapter'``: per-adapter optimizer + scheduler
           state; one optimizer step per adapter that appears in this call.
-          A single call with N domains is equivalent to N separate single-domain
+          A single call with N adapters is equivalent to N separate single-adapter
           calls — the key correctness claim of adapter isolation.
 
-        Adapter routing uses ``non_tensor_batch["domain"]`` (ROLL_schedrl
-        convention) or ``non_tensor_batch["lora_name"]`` as fallback.
+        Adapter routing requires ``non_tensor_batch["lora_name"]`` as the
+        canonical key; the legacy ``domain`` fallback is removed.
         """
         if not self.is_lora:
             raise RuntimeError(

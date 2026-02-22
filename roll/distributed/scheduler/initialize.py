@@ -53,6 +53,12 @@ def start_ray_cluster():
     logger.info(f"Starting ray cluster: {cmd}")
     ret = subprocess.run(cmd, shell=True, capture_output=True)
     if ret.returncode != 0:
+        # In some Ray builds, CLI bootstrap crashes on a Click/Sentinel deepcopy bug.
+        # Fall back to python `ray.init()` startup path so single-node runs can proceed.
+        stderr_text = ret.stderr.decode("utf-8", errors="ignore")
+        if rank == 0 and "is not a valid Sentinel" in stderr_text:
+            logger.warning("Ray CLI failed with Sentinel bug; falling back to in-process ray.init startup")
+            return False
         logger.error(f"Failed to start ray cluster: {cmd}")
         logger.error(f"ret.stdout: {ret.stdout}")
         logger.error(f"ret.stderr: {ret.stderr}")

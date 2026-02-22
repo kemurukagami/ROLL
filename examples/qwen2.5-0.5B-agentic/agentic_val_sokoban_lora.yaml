@@ -29,26 +29,27 @@ system_envs:
 #    - roll
 #    - baseline
 
-track_with: tensorboard
+track_with: stdout # Disable TensorBoard in smoke run to bypass SummaryWriter type constraints.
 tracker_kwargs:
-  log_dir: /data/oss_bucket_0/yali/llm/tensorboard/roll_exp/agentic_sokoban
+  log_dir: ./output/tensorboard/agentic_sokoban_lora_smoke # Use local path so smoke test does not depend on external mount.
 
 
 checkpoint_config:
   type: file_system
-  output_dir: /data/cpfs_0/rl_examples/models/${exp_name}
+  output_dir: /tmp/roll_output/agentic_sokoban_lora_smoke # Keep checkpoint path local for a portable smoke run.
 
-num_gpus_per_node: 8
+num_gpus_per_node: 4 # Fit smoke test to a 4-GPU node.
 
-max_steps: 1024
+max_steps: 3 # Minimal training smoke: one training step is enough to verify end-to-end path.
 save_steps: 10000
 logging_steps: 1
-eval_steps: 10
+eval_steps: 0 # Disable eval loop for faster smoke validation.
 resume_from_checkpoint: false
+async_generation_ratio: 1 # Required by partial_gpu_mode validation in agentic_pipeline.
 
-rollout_batch_size: 1024
-val_batch_size: 1024
-sequence_length: 8192
+rollout_batch_size: 4 # Keep rollout tiny to reduce runtime/memory.
+val_batch_size: 4
+sequence_length: 2048 # Reduce memory pressure while preserving normal train path.
 
 advantage_clip: 0.2
 ppo_epochs: 1
@@ -75,9 +76,9 @@ actor_train:
   training_args:
     learning_rate: 2.0e-5
     weight_decay: 0
-    per_device_train_batch_size: 2
-    gradient_accumulation_steps: 64
-    warmup_steps: 10
+    per_device_train_batch_size: 1 # Minimal micro-batch for smoke stability.
+    gradient_accumulation_steps: 2
+    warmup_steps: 1
     lr_scheduler_type: cosine
   data_args:
     template: qwen2_5
@@ -91,7 +92,7 @@ actor_train:
       expert_model_parallel_size: 1
       use_distributed_optimizer: true
       recompute_granularity: full
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(0,2)) # Constrain actor_train to 4 GPUs for this smoke profile.
   infer_batch_size: 2
 
 actor_infer:
@@ -102,11 +103,11 @@ actor_infer:
     lora_rank: 32
     lora_alpha: 32
   generating_args:
-    max_new_tokens: 128 # single-turn response length
-    top_p: 0.99
-    top_k: 100
+    max_new_tokens: 64 # Shorter generation keeps smoke test fast.
+    top_p: 1
+    top_k: 3
     num_beams: 1
-    temperature: 0.99
+    temperature: 0.0
     num_return_sequences: 1
   data_args:
     template: qwen2_5
@@ -116,7 +117,7 @@ actor_infer:
       gpu_memory_utilization: 0.8
       block_size: 16
       load_format: auto
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(0,4)) # Constrain actor_infer to same 4-GPU pool.
 
 reference:
   model_args:
@@ -129,7 +130,7 @@ reference:
   strategy_args:
     strategy_name: hf_infer
     strategy_config: ~
-  device_mapping: list(range(0,8))
+  device_mapping: list(range(0,2)) # Keep reference mapping consistent with 4-GPU smoke topology.
   infer_batch_size: 2
 
 reward_normalization:
@@ -138,19 +139,19 @@ reward_normalization:
 
 train_env_manager:
   format_penalty: -0.15 # sokoban env penalty_for_step=-0.1
-  max_env_num_per_worker: 16
-  num_env_groups: 128
+  max_env_num_per_worker: 4 # Smaller env fanout for quick smoke startup.
+  num_env_groups: 2
   # under the same group, the env config and env seed are ensured to be equal
-  group_size: 8
+  group_size: 2
   tags: [SimpleSokoban]
-  num_groups_partition: [128] # If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  num_groups_partition: [2] # Match reduced group count for smoke.
 
 val_env_manager:
-  max_env_num_per_worker: 32
-  num_env_groups: 1024
+  max_env_num_per_worker: 4 # Keep validation manager light even though eval is disabled.
+  num_env_groups: 4
   group_size: 1 # should be set to 1 because val temperature is set to 0 and same prompt leads to same output
   tags: [SimpleSokoban, LargerSokoban, SokobanDifferentGridVocab, FrozenLake]
-  num_groups_partition: [256, 256, 256, 256] # TODO: If not set, all env names divide nums equally. Under the same group, the env config and env seed (prompt) are equal in each generation
+  num_groups_partition: [1, 1, 1, 1] # Minimal partitioning for smoke.
 
 
 # Here, you can override variables defined in the imported envs. max_tokens_per_step: 128 in custom_env.SimpleSokoban, here replaced by 64

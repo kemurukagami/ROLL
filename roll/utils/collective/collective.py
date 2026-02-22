@@ -140,3 +140,10 @@ def broadcast_object_list(object_list, src=None, group_name="default", device=No
 def destroy_collective_group(group_name: str) -> None:
     global _group_mgr
     _group_mgr.destroy_collective_group(group_name)
+
+
+def get_group_backend(group_name: str):
+    # Expose backend lookup for callers that need to branch on CPU/GPU transport behavior.
+    global _group_mgr
+    group = _group_mgr.get_group_by_name(group_name)
+    return dist.get_backend(group)

@@ -268,6 +268,13 @@ def serialize_named_weights(named_weights: list[tuple[str, torch.Tensor]], infer
 
     bucket, tensors_meta = _bucket_named_tensors(named_weights)
 
+    # Use CPU byte serialization for vLLM to avoid CUDA IPC fd-transfer restrictions (pidfd_getfd).
+    if infer_strategy == "vllm":
+        bucket_cpu = bucket.cpu().contiguous()
+        return MultiprocessingSerializer.serialize(
+            {"bucket_bytes": memoryview(bucket_cpu.numpy()).tobytes(), "tensors_meta": tensors_meta}
+        )
+
     # PumpkinComment:
     # FSDP2 will fail if using CPUOffload Policy without this check
     if not getattr(bucket, "is_cuda", False):

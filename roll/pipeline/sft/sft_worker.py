@@ -54,16 +54,17 @@ class SFTWorker(Worker):
         """
         if data.meta_info is None:
             data.meta_info = {}
-        # Auto-fill lora_name for single-adapter legacy producers and fail-fast for multi-adapter missing metadata.
+        # Broadcast non_tensor_batch (including lora_name) to all TP/PP ranks first.
+        # ensure_lora_name_in_batch runs after so every rank has the full non_tensor_batch.
+        data.meta_info.setdefault("_broadcast_non_tensor_batch", True)
+        data = self.strategy.get_data_input(data)
+        # Validate/fill lora_name after broadcast — all ranks now have non_tensor_batch.
         _bs = data.batch.batch_size[0] if data.batch is not None else None
         ensure_lora_name_in_batch(
             data.non_tensor_batch,
             adapters=self.worker_config.model_args.adapters,
             batch_size=_bs,
         )
-        # Ensure non-tensor adapter routing keys are broadcast to all Megatron ranks.
-        data.meta_info.setdefault("_broadcast_non_tensor_batch", True)
-        data = self.strategy.get_data_input(data)
         data = data.to(current_platform.device_type)
         metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
         output = DataProto(meta_info={"metrics": metrics}).to("cpu")

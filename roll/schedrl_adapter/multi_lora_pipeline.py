@@ -657,6 +657,9 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
             # All per-tag schedulers and val_rollout_scheduler share the same RequestScheduler actor.
             # A single call with skip_load=False performs weight load/selection sync and updates routing.
             ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
+            # Fail fast on adapter ID skew after expand/load, before workers serve requests.
+            adapters = set(self._tag_to_adapter.values())
+            self._verify_lora_model_update(adapters=adapters, where="multi_lora_pipeline._expand_all_schedulers")
             # TODO(item-6): Run a dummy forward pass (batch_size=1) on newly expanded workers to
             # initialize CUDA kernels before exposing them to the scheduler (prevents first-request
             # timeout). Not implemented yet — monitor expand latency before adding.

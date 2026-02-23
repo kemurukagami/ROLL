@@ -111,29 +111,92 @@ class ActorWorker(Worker):
         output = DataProto(meta_info={"metrics": metrics})
         return output
 
-    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def train_step_lora(self, data: DataProto):
         """Multi-LoRA training step.
 
         Routes per-adapter microbatches via ``non_tensor_batch["lora_name"]`` to
         ``MegatronTrainStrategy.train_step_lora`` with ``lora_optimizer_mode="per_adapter"``.
         """
-        # Auto-fill lora_name for single-adapter legacy producers and fail-fast for multi-adapter missing metadata.
-        _bs = data.batch.batch_size[0] if data.batch is not None else None
-        ensure_lora_name_in_batch(
-            data.non_tensor_batch,
-            adapters=self.worker_config.model_args.adapters,
-            batch_size=_bs,
-        )
-        # Ensure non-tensor adapter routing keys are broadcast to all Megatron ranks.
-        if self.worker_config.model_args.adapters is not None:
-            if data.meta_info is None:
-                data.meta_info = {}
-            data.meta_info["_broadcast_non_tensor_batch"] = True
-        data = data.to(current_platform.device_type)
-        data = self.strategy.get_data_input(data)
-        metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
-        output = DataProto(meta_info={"metrics": metrics}).to("cpu")
+        global_step = data.meta_info.get("global_step", 0)
+        is_offload_states = data.meta_info.get("is_offload_states", True)
+        metrics = {}
+        self.logger.info(f"{self.worker_name} lora train global step {global_step}")
+
+        # Keep train_step_lora state lifecycle consistent with train_step:
+        # reload model params before forward, then offload afterwards.
+        with state_offload_manger(
+            strategy=self.strategy,
+            metrics=metrics,
+            metric_infix=f"{self.cluster_name}/train_step_lora",
+            is_offload_states=is_offload_states,
+            load_kwargs={"include": [OffloadStateType.model_params, OffloadStateType.other_params]},
+        ):
+            # Keep a stable denominator for train-step summary metrics, aligned with train_step.
+            per_device_train_batch_size = self.worker_config.training_args.per_device_train_batch_size
+            backward_batch_size = (
+                    per_device_train_batch_size * self.worker_config.training_args.gradient_accumulation_steps
+            )
+            # DP_MP_DISPATCH_FIRST sends batch=None to non-source TP/CP ranks; only normalize routing
+            # keys on the source shard before strategy broadcast reconstructs full DataProto everywhere.
+            if data.batch is not None:
+                _bs = data.batch.batch_size[0]
+                ensure_lora_name_in_batch(
+                    data.non_tensor_batch,
+                    adapters=self.worker_config.model_args.adapters,
+                    batch_size=_bs,
+                )
+            # Ensure non-tensor adapter routing keys are broadcast to all Megatron ranks after dispatch-first.
+            if self.worker_config.model_args.adapters is not None:
+                if data.meta_info is None:
+                    data.meta_info = {}
+                data.meta_info["_broadcast_non_tensor_batch"] = True
+            # Multi-LoRA uses _broadcast_non_tensor_batch=True, which broadcasts full DataProto objects.
+            # Re-apply device placement after broadcast so embedding indices never stay on CPU.
+            data = self.strategy.get_data_input(data)
+            data = data.to(current_platform.device_type)
+            # Root-cause tracing: always log once per worker so Ray env propagation is not required.
+            if data.batch is not None and not getattr(self, "_logged_train_step_lora_device_once", False):
+                trace_keys = ["input_ids", "attention_mask", "response_mask", "labels"]
+                trace = {
+                    k: str(data.batch[k].device) for k in trace_keys if k in data.batch and isinstance(data.batch[k], torch.Tensor)
+                }
+                self.logger.info(f"[device_trace][worker/train_step_lora] devices={trace}")
+                self._logged_train_step_lora_device_once = True
+
+            lora_metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
+            # Use append_to_dict to match train_step accumulation pattern (consistent with reducers).
+            append_to_dict(metrics, lora_metrics)
+            # Mirror train_step summary metrics so dashboards remain comparable in multi-LoRA mode.
+            # For per-adapter optimizer mode, avoid using the top-level scheduler LR because it can
+            # diverge from actual adapter schedulers; prefer active-adapter LR(s).
+            if "actor/lr" not in metrics:
+                lora_mode = getattr(self.strategy, "lora_optimizer_mode", None)
+                if lora_mode == "per_adapter" and getattr(self.strategy, "adapter_schedulers", None):
+                    active_adapters = []
+                    lora_arr = data.non_tensor_batch.get("lora_name", None) if data.non_tensor_batch else None
+                    if lora_arr is not None:
+                        active_adapters = list(dict.fromkeys(str(name) for name in lora_arr.tolist()))
+                    lr_values = []
+                    for adapter_name in active_adapters:
+                        sch = self.strategy.adapter_schedulers.get(adapter_name, None)
+                        if sch is None:
+                            continue
+                        lr = sch.get_last_lr()[0]
+                        metrics[f"{self.worker_config.name}/{adapter_name}/lr"] = lr
+                        lr_values.append(float(lr))
+                    if lr_values:
+                        metrics["actor/lr"] = sum(lr_values) / len(lr_values)
+                elif hasattr(self.strategy, "scheduler") and self.strategy.scheduler is not None:
+                    metrics["actor/lr"] = self.strategy.scheduler.get_last_lr()[0]
+            if data.batch is not None:
+                metrics["actor/backward_steps"] = data.batch.batch_size[0] // max(backward_batch_size, 1)
+            data.to("cpu")
+
+        # Keep cache lifecycle consistent with train_step to avoid stale logprob cache accumulation.
+        self._logprobs_cache.clear()
+        # Match train_step return style: no .to("cpu") since meta_info holds scalar metrics only.
+        output = DataProto(meta_info={"metrics": metrics})
         return output
 
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)

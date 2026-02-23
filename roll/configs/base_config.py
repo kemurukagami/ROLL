@@ -291,6 +291,18 @@ class BaseConfig(ScheduleConfig):
 
             # Only validate for Megatron strategies
             if 'megatron' in strategy_name.lower():
+                # Fail fast when Transformer Engine is required by Megatron config but unavailable.
+                strategy_config = self.actor_train.strategy_args.strategy_config or {}
+                transformer_impl = strategy_config.get("transformer_impl", "transformer_engine")
+                if transformer_impl == "transformer_engine":
+                    from megatron.core.models.gpt.gpt_layer_specs import HAVE_TE
+                    if not HAVE_TE:
+                        raise RuntimeError(
+                            "Transformer Engine is requested by actor_train Megatron config "
+                            "(transformer_impl=transformer_engine) but not available. "
+                            "Install transformer-engine or set "
+                            "actor_train.strategy_args.strategy_config.transformer_impl=local."
+                        )
                 try:
                     validate_megatron_batch_size(
                         batch_size=self.rollout_batch_size,

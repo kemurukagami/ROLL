@@ -274,8 +274,8 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                 refs.extend(self.actor_train.initialize(pipeline_config=self.pipeline_config, blocking=False))
                 ray.get(refs)
 
-                # Before offloading actor_train, build and promote the initial (-1) cache bucket so the first
-                # expand/broadcast can sync valid weights (initialization weights).
+                # Build and promote the initial base-model cache (-1/-1) before offload.
+                # Under sleep_level=2 this cache must stay active so expand can rehydrate infer workers.
                 init_checkpoint_version = -1
                 init_bucket_step = -1
                 self.actor_train.load_states(blocking=True)

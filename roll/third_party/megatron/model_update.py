@@ -163,9 +163,22 @@ def _iter_vp_stage_named_weights(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     for vp_stage, model in enumerate(models):
         if is_peft_available() and isinstance(model, PeftModel):
-            mcore_state_dict = get_peft_model_state_dict(
-                model, model.state_dict_for_save_checkpoint(), adapter_name=adapter_name
-            )
+            # adapter_name=None means "base model cache": export base-only weights and normalize
+            # LoRA wrapper naming so converter sees canonical Megatron names.
+            if adapter_name is None:
+                full_state_dict = model.state_dict_for_save_checkpoint()
+                mcore_state_dict = {}
+                for name, weight in full_state_dict.items():
+                    if ".lora_" in name or ".lora_embedding_" in name or ".lora_magnitude_vector" in name:
+                        continue
+                    # LoRA wrappers expose base tensors as "...base_layer.<tensor>"; converter expects
+                    # the original tensor names without the wrapper hop.
+                    normalized_name = name.replace(".base_layer.", ".")
+                    mcore_state_dict[normalized_name] = weight
+            else:
+                mcore_state_dict = get_peft_model_state_dict(
+                    model, model.state_dict_for_save_checkpoint(), adapter_name=adapter_name
+                )
         else:
             mcore_state_dict = model.state_dict_for_save_checkpoint()
         for mcore_name, weight in sorted(mcore_state_dict.items()):
@@ -249,6 +262,12 @@ def gather_all_hf_weights(
         peft_cfg = peft_configs.get(adapter_name)
         if peft_cfg is not None and hasattr(peft_cfg, "r"):
             lora_rank = getattr(peft_cfg, "r")
+    elif adapter_name is None and isinstance(peft_configs, dict) and peft_configs:
+        # Fallback for full-state PEFT export: use any configured adapter rank for converter ops.
+        # Multi-LoRA configs are expected to use a consistent LoRA rank across adapters.
+        first_cfg = next(iter(peft_configs.values()))
+        if first_cfg is not None and hasattr(first_cfg, "r"):
+            lora_rank = getattr(first_cfg, "r")
 
     is_peft_model = bool(is_peft_available() and "PeftModel" in globals() and isinstance(models[0], PeftModel))  # type: ignore[name-defined]
     if lora_rank is None and is_peft_model and adapter_name is not None:

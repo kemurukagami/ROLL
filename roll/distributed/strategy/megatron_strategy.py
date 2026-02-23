@@ -5,6 +5,7 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+from dataclasses import asdict
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -258,7 +259,23 @@ class MegatronInferStrategy(InferenceStrategy):
         return results
 
     def _get_feature_on_this_cp_rank(self, feature: torch.Tensor, feature_name: str = "input_ids") -> torch.Tensor:
-        return self.models_unwrapped[0].get_batch_on_this_cp_rank({feature_name: feature}, dim3_keys=[])[feature_name]
+        # Debugging aid: detect unexpected device transition during CP slicing.
+        out = self.models_unwrapped[0].get_batch_on_this_cp_rank({feature_name: feature}, dim3_keys=[])[feature_name]
+        if (
+            feature is not None
+            and out is not None
+            and isinstance(feature, torch.Tensor)
+            and isinstance(out, torch.Tensor)
+            and feature.device != out.device
+        ):
+            logger.info(
+                "[device_trace][cp_rank_slice] rank=%s feature=%s in_device=%s out_device=%s",
+                self.worker.rank_info.rank,
+                feature_name,
+                feature.device,
+                out.device,
+            )
+        return out
 
     def _get_unpad_seqlen(self, attention_mask: torch.Tensor, pad_to_multiple_of: int = 256) -> int:
         max_seqlen = attention_mask.sum(dim=1).max().item()
@@ -442,6 +459,27 @@ class MegatronInferStrategy(InferenceStrategy):
         attention_mask = data.batch["attention_mask"] if is_pp_first else None
         labels = data.batch["labels"] if (is_pp_last and "labels" in data.batch) else None  # labels is only used for sft
         packed_seq_params = None
+        # Root-cause tracing: per-call logs for LoRA train forwards. One-time logs are insufficient because
+        # earlier compute_log_probs forwards can consume the once-only guard before train_step_lora executes.
+        is_lora_train_forward = bool(data.meta_info and ("grad_accumulation_loss_scale" in data.meta_info))
+        # Root-cause tracing: log once per strategy instance before CP split/transforms.
+        if is_pp_first and input_ids is not None and not getattr(self, "_logged_lora_inner_pre_cp_once", False):
+            logger.info(
+                "[device_trace][inner_forward_step/pre_cp] rank=%s input_ids=%s attention_mask=%s labels=%s",
+                self.worker.rank_info.rank,
+                input_ids.device,
+                attention_mask.device if attention_mask is not None else None,
+                labels.device if labels is not None else None,
+            )
+            self._logged_lora_inner_pre_cp_once = True
+        if is_pp_first and input_ids is not None and is_lora_train_forward:
+            logger.info(
+                "[device_trace][inner_forward_step/pre_cp_lora_train] rank=%s input_ids=%s attention_mask=%s labels=%s",
+                self.worker.rank_info.rank,
+                input_ids.device,
+                attention_mask.device if attention_mask is not None else None,
+                labels.device if labels is not None else None,
+            )
 
         if self.use_sequence_packing and is_pp_first:
             input_ids, packed_seq_params, cu_seqlens, cu_seqlens_padded = self._pack_sequences(
@@ -455,6 +493,24 @@ class MegatronInferStrategy(InferenceStrategy):
             attention_mask = self._get_feature_on_this_cp_rank(attention_mask, "attention_mask")
             if labels is not None:
                 labels = self._get_feature_on_this_cp_rank(labels, "labels")
+            # Root-cause tracing: log once per strategy instance after CP split/transforms.
+            if not getattr(self, "_logged_lora_inner_post_cp_once", False):
+                logger.info(
+                    "[device_trace][inner_forward_step/post_cp] rank=%s input_ids=%s attention_mask=%s labels=%s",
+                    self.worker.rank_info.rank,
+                    input_ids.device if input_ids is not None else None,
+                    attention_mask.device if attention_mask is not None else None,
+                    labels.device if labels is not None else None,
+                )
+                self._logged_lora_inner_post_cp_once = True
+            if is_lora_train_forward:
+                logger.info(
+                    "[device_trace][inner_forward_step/post_cp_lora_train] rank=%s input_ids=%s attention_mask=%s labels=%s",
+                    self.worker.rank_info.rank,
+                    input_ids.device if input_ids is not None else None,
+                    attention_mask.device if attention_mask is not None else None,
+                    labels.device if labels is not None else None,
+                )
         if attention_mask is not None and attention_mask.dtype != torch.bool and not torch.is_floating_point(attention_mask):
             attention_mask = attention_mask.bool()
         position_ids = None
@@ -496,6 +552,30 @@ class MegatronInferStrategy(InferenceStrategy):
                 forward_args["loss_mask"] = torch.ones_like(input_ids)
             else:
                 forward_args["loss_mask"] = None
+
+        # Debugging aid: log exact devices at model-call boundary for LoRA train forwards.
+        if is_lora_train_forward and is_pp_first:
+            loss_mask = forward_args.get("loss_mask", None)
+            loss_mask_device = loss_mask.device if isinstance(loss_mask, torch.Tensor) else None
+            # Try best-effort lookup for embedding weight device to compare against input_ids.
+            embedding_weight_device = None
+            try:
+                for n, p in self.models_unwrapped[0].named_parameters():
+                    if "word_embeddings.weight" in n:
+                        embedding_weight_device = p.device
+                        break
+            except Exception:
+                embedding_weight_device = None
+            logger.info(
+                "[device_trace][inner_forward_step/model_call_lora_train] rank=%s input_ids=%s attention_mask=%s position_ids=%s labels=%s loss_mask=%s emb_weight=%s",
+                self.worker.rank_info.rank,
+                input_ids.device if input_ids is not None else None,
+                attention_mask.device if attention_mask is not None else None,
+                position_ids.device if isinstance(position_ids, torch.Tensor) else None,
+                labels.device if labels is not None else None,
+                loss_mask_device,
+                embedding_weight_device,
+            )
 
         output_tensor = model(
             input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels,
@@ -1682,6 +1762,19 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 )
             num_microbatches = batch_or_microbatches.batch.batch_size[0] // micro_batch_size
             microbatches = batch_or_microbatches.chunk(chunks=num_microbatches)
+        # Root-cause tracing: log once before per-adapter grouping/chunking.
+        if not getattr(self, "_logged_lora_train_step_once", False):
+            if not microbatches:
+                logger.info("[device_trace][strategy/train_step_lora] microbatches=0")
+            else:
+                first_mb = microbatches[0]
+                if first_mb.batch is not None and "input_ids" in first_mb.batch:
+                    logger.info(
+                        "[device_trace][strategy/train_step_lora] mb_count=%s first_input_ids_device=%s",
+                        len(microbatches),
+                        first_mb.batch["input_ids"].device,
+                    )
+            self._logged_lora_train_step_once = True
 
         first_meta = (
             microbatches[0].meta_info if microbatches and microbatches[0].meta_info else {}
@@ -1734,6 +1827,19 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             self.zero_grad()
             adapter_mbs = adapter_to_mbs[adapter_name]
             count = len(adapter_mbs)
+            # Debugging aid: verify per-adapter microbatch tensor devices before forward/backward.
+            if count > 0 and adapter_mbs[0].batch is not None:
+                first_mb = adapter_mbs[0]
+                pos_ids = first_mb.batch.get("position_ids", None)
+                logger.info(
+                    "[device_trace][train_step_lora/per_adapter_first_mb] rank=%s adapter=%s count=%s input_ids=%s attention_mask=%s position_ids=%s",
+                    self.worker.rank_info.rank,
+                    adapter_name,
+                    count,
+                    first_mb.batch["input_ids"].device if "input_ids" in first_mb.batch else None,
+                    first_mb.batch["attention_mask"].device if "attention_mask" in first_mb.batch else None,
+                    pos_ids.device if isinstance(pos_ids, torch.Tensor) else None,
+                )
             logger.info(
                 f"train_step_lora(per_adapter) adapter={adapter_name} microbatches={count} "
                 f"pp={self.worker.rank_info.pp_size} rank={self.worker.rank_info.rank}"
@@ -2042,17 +2148,32 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             return [int(x) for x in tgt_device_mapping[start:end]]
 
         world_rank = dist.get_rank()
+        adapter_names_to_register: List[str] = []
+        base_cached_buckets: List[Any] = []
+        adapter_cached_buckets: Dict[str, List[Any]] = {}
 
         with self._cache_lock:
+            # Multi-LoRA under sleep_level=2 requires replaying base + adapter weights to infer workers.
+            # Base model is pinned at an active cache version (typically init checkpoint -1/-1).
+            # Keep base and adapter bucket streams separate so infer replay can run in phases:
+            # base weights first, then per-adapter stage+register.
             if adapters_to_sync is not None:
                 # Sync specified adapters using their active versions
                 missing = [a for a in adapters_to_sync if self._active_adapter_cached.get(a) is None]
                 if missing:
                     raise RuntimeError(f"selective_sync_active_cache: no active version for adapters {missing}")
-                cached_buckets = []
+                adapter_names_to_register = list(dict.fromkeys(str(a) for a in adapters_to_sync))
+                if self._active_cached is None:
+                    raise RuntimeError(
+                        "selective_sync_active_cache(is_lora): active base cache is unset; "
+                        "call promote_active_checkpoint first"
+                    )
+                if self._active_cached not in self._cache_map:
+                    raise RuntimeError(f"selective_sync_active_cache: base active cache missing key={self._active_cached}")
+                base_cached_buckets = list(self._cache_map[self._active_cached])
                 for a in adapters_to_sync:
                     key = self._active_adapter_cached[a]
-                    cached_buckets.extend(self._adapter_cache_map[a][key])
+                    adapter_cached_buckets[a] = list(self._adapter_cache_map[a][key])
             elif self.is_lora:
                 # adapters_to_sync=None + LoRA mode: sync ALL active adapters (expand path)
                 active_entries = {a: k for a, k in self._active_adapter_cached.items() if k is not None}
@@ -2060,9 +2181,17 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     raise RuntimeError(
                         "selective_sync_active_cache(is_lora, adapters_to_sync=None): no active adapter caches promoted yet"
                     )
-                cached_buckets = []
+                adapter_names_to_register = list(sorted(active_entries.keys()))
+                if self._active_cached is None:
+                    raise RuntimeError(
+                        "selective_sync_active_cache(is_lora): active base cache is unset; "
+                        "call promote_active_checkpoint first"
+                    )
+                if self._active_cached not in self._cache_map:
+                    raise RuntimeError(f"selective_sync_active_cache: base active cache missing key={self._active_cached}")
+                base_cached_buckets = list(self._cache_map[self._active_cached])
                 for a, key in active_entries.items():
-                    cached_buckets.extend(self._adapter_cache_map[a][key])
+                    adapter_cached_buckets[a] = list(self._adapter_cache_map[a][key])
             else:
                 # Full fine-tune path (unchanged)
                 if self._active_cached is None:
@@ -2071,11 +2200,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     )
                 if self._active_cached not in self._cache_map:
                     raise RuntimeError(f"active_cached={self._active_cached} missing from cache_map")
-                cached_buckets = list(self._cache_map[self._active_cached])
+                base_cached_buckets = list(self._cache_map[self._active_cached])
             logger.info(
                 "[schedrl][selective_sync] cache "
                 f"sync_id={sync_id} world_rank={world_rank} active_cached={self._active_cached} "
-                f"adapters_to_sync={adapters_to_sync} num_buckets={len(cached_buckets)}"
+                f"adapters_to_sync={adapters_to_sync} base_num_buckets={len(base_cached_buckets)} "
+                f"adapter_num_buckets={sum(len(v) for v in adapter_cached_buckets.values())}"
             )
 
             train_devices = set(int(x) for x in (self.worker_config.device_mapping or []))
@@ -2125,34 +2255,71 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
                 if 0 <= infer_worker_idx < len(tgt_workers) and infer_worker_idx in ipc_target_dp_ranks:
                     co_infer_worker = tgt_workers[infer_worker_idx]
-                    for bucket_idx, serialized_tensors in enumerate(cached_buckets):
-                        infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
-                        logger.info(
-                            "[schedrl][selective_sync] ipc_gather_enter "
-                            f"sync_id={sync_id} world_rank={world_rank} bucket_idx={bucket_idx} "
-                            f"serialized_len={len(serialized_tensors) if serialized_tensors is not None else 'None'}"
-                        )
-                        dist.gather_object(
-                            serialized_tensors,
-                            infer_parallel_tensors,
-                            group_dst=0,
-                            group=self._selective_sync_cpu_group,
-                        )
-                        if co_infer_rank == 0:
+                    # Keep gather_object calls rank-consistent by applying the same phase/bucket sequence on all ranks.
+                    def _ipc_apply_bucket_sequence(
+                        bucket_sequence: List[Any], *, is_lora_stage: bool, phase_tag: str, adapter_name: Optional[str] = None
+                    ) -> None:
+                        for bucket_idx, serialized_tensors in enumerate(bucket_sequence):
+                            infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
                             logger.info(
-                                "[schedrl][selective_sync] ipc_apply_enter "
-                                f"sync_id={sync_id} world_rank={world_rank} bucket_idx={bucket_idx}"
+                                "[schedrl][selective_sync] ipc_gather_enter "
+                                f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
+                                f"adapter={adapter_name} bucket_idx={bucket_idx} "
+                                f"serialized_len={len(serialized_tensors) if serialized_tensors is not None else 'None'}"
                             )
-                            ray.get(
-                                co_infer_worker.update_parameter_in_bucket.remote(
-                                    infer_parallel_tensors,
-                                    is_lora=self.is_lora,
+                            dist.gather_object(
+                                serialized_tensors,
+                                infer_parallel_tensors,
+                                group_dst=0,
+                                group=self._selective_sync_cpu_group,
+                            )
+                            if co_infer_rank == 0:
+                                logger.info(
+                                    "[schedrl][selective_sync] ipc_apply_enter "
+                                    f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
+                                    f"adapter={adapter_name} bucket_idx={bucket_idx}"
                                 )
+                                ray.get(
+                                    co_infer_worker.update_parameter_in_bucket.remote(
+                                        infer_parallel_tensors,
+                                        is_lora=is_lora_stage,
+                                    )
+                                )
+                                logger.info(
+                                    "[schedrl][selective_sync] ipc_apply_exit "
+                                    f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
+                                    f"adapter={adapter_name} bucket_idx={bucket_idx}"
+                                )
+
+                    # Apply base tensors first so load_weights restores model state before adapter staging.
+                    _ipc_apply_bucket_sequence(base_cached_buckets, is_lora_stage=False, phase_tag="base")
+                    if self.is_lora and adapter_names_to_register:
+                        peft_configs = getattr(self.models_unwrapped[0], "peft_config", None) or {}
+                        missing_cfg = [a for a in adapter_names_to_register if a not in peft_configs]
+                        if missing_cfg:
+                            raise RuntimeError(
+                                f"selective_sync_active_cache: missing peft_config for adapters {missing_cfg}"
                             )
-                            logger.info(
-                                "[schedrl][selective_sync] ipc_apply_exit "
-                                f"sync_id={sync_id} world_rank={world_rank} bucket_idx={bucket_idx}"
+                        # Stage one adapter at a time, then register so custom_add_lora consumes the correct tensors.
+                        for adapter_name in adapter_names_to_register:
+                            buckets = adapter_cached_buckets.get(adapter_name, [])
+                            if not buckets:
+                                raise RuntimeError(
+                                    f"selective_sync_active_cache: no cached buckets for adapter={adapter_name!r}; "
+                                    "promote_active_adapter_checkpoint must be called before sync"
+                                )
+                            _ipc_apply_bucket_sequence(
+                                buckets,
+                                is_lora_stage=True,
+                                phase_tag="adapter",
+                                adapter_name=adapter_name,
                             )
+                            if co_infer_rank == 0:
+                                ray.get(
+                                    co_infer_worker.add_lora.remote(
+                                        adapter_name=adapter_name, peft_config=asdict(peft_configs[adapter_name])
+                                    )
+                                )
 
             # Broadcast path (separated workers): ephemeral collective group managed by ModelUpdateService.
             # TODO: remove comm_plan is None self-setup path once all callers go through ModelUpdateService.
@@ -2179,69 +2346,106 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     f"sync_id={sync_id} model_update_name={model_update_name} group_name={group_name} "
                     f"broadcast_dp_ranks={planned_ranks}"
                 )
+                # Reuse one broadcast helper for base and adapter phases to avoid diverging send/apply behavior.
+                def _broadcast_apply_bucket_sequence(
+                    bucket_sequence: List[Any], *, is_lora_stage: bool, phase_tag: str, adapter_name: Optional[str] = None
+                ) -> None:
+                    for bucket_idx, serialized_tensors in enumerate(bucket_sequence):
+                        bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_tensors)
+                        # Cache stores bucket as raw bytes; reconstruct to sender GPU for NCCL broadcast.
+                        bucket_bytes = bucket_with_meta.get("bucket_bytes")
+                        tensors_meta = bucket_with_meta.get("tensors_meta")
+                        if bucket_bytes is None or tensors_meta is None:
+                            raise RuntimeError("selective_sync_active_cache cache missing bucket_bytes/tensors_meta")
+                        bucket_cpu = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8)
+                        bucket = bucket_cpu.to(current_platform.device_type).contiguous()
+                        named_params = named_tensors_from_bucket(bucket=bucket, tensors_meta=tensors_meta)
 
-                for bucket_idx, serialized_tensors in enumerate(cached_buckets):
-                    bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_tensors)
-                    # Cache stores bucket as raw bytes; reconstruct to sender GPU for NCCL broadcast.
-                    bucket_bytes = bucket_with_meta.get("bucket_bytes")
-                    tensors_meta = bucket_with_meta.get("tensors_meta")
-                    if bucket_bytes is None or tensors_meta is None:
-                        raise RuntimeError("selective_sync_active_cache cache missing bucket_bytes/tensors_meta")
-                    bucket_cpu = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8)
-                    bucket = bucket_cpu.to(current_platform.device_type).contiguous()
-                    named_params = named_tensors_from_bucket(bucket=bucket, tensors_meta=tensors_meta)
+                        names = [n for n, _ in named_params]
+                        dtypes = [t.dtype for _, t in named_params]
+                        shapes = [t.shape for _, t in named_params]
 
-                    names = [n for n, _ in named_params]
-                    dtypes = [t.dtype for _, t in named_params]
-                    shapes = [t.shape for _, t in named_params]
-
-                    logger.info(
-                        "[schedrl][selective_sync] broadcast_bucket_enter "
-                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx} "
-                        f"num_tensors={len(names)}"
-                    )
-                    recv_refs = [
-                        worker.broadcast_parameter.remote(
-                            group_name=group_name,
-                            names=names,
-                            dtypes=dtypes,
-                            shapes=shapes,
-                            is_lora=self.is_lora,
+                        logger.info(
+                            "[schedrl][selective_sync] broadcast_bucket_enter "
+                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
+                            f"adapter={adapter_name} bucket_idx={bucket_idx} num_tensors={len(names)}"
                         )
-                        for worker in broadcast_workers
-                    ]
-
-                    handles = []
-                    for _, weight in named_params:
-                        handles.append(
-                            collective.broadcast(
-                                tensor=weight,
-                                src_rank=0,
+                        recv_refs = [
+                            worker.broadcast_parameter.remote(
                                 group_name=group_name,
-                                async_op=True,
+                                names=names,
+                                dtypes=dtypes,
+                                shapes=shapes,
+                                is_lora=is_lora_stage,
                             )
+                            for worker in broadcast_workers
+                        ]
+
+                        handles = []
+                        for _, weight in named_params:
+                            handles.append(
+                                collective.broadcast(
+                                    tensor=weight,
+                                    src_rank=0,
+                                    group_name=group_name,
+                                    async_op=True,
+                                )
+                            )
+                        logger.info(
+                            "[schedrl][selective_sync] broadcast_wait_enter "
+                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
+                            f"adapter={adapter_name} bucket_idx={bucket_idx} num_handles={len(handles)}"
                         )
-                    logger.info(
-                        "[schedrl][selective_sync] broadcast_wait_enter "
-                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx} "
-                        f"num_handles={len(handles)}"
-                    )
-                    for handle in handles:
-                        handle.wait()
-                    logger.info(
-                        "[schedrl][selective_sync] broadcast_wait_exit "
-                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx}"
-                    )
-                    logger.info(
-                        "[schedrl][selective_sync] broadcast_apply_enter "
-                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx} "
-                        f"num_workers={len(broadcast_workers)}"
-                    )
-                    ray.get(recv_refs)
-                    logger.info(
-                        "[schedrl][selective_sync] broadcast_apply_exit "
-                        f"sync_id={sync_id} group_name={group_name} bucket_idx={bucket_idx}"
-                    )
+                        for handle in handles:
+                            handle.wait()
+                        logger.info(
+                            "[schedrl][selective_sync] broadcast_wait_exit "
+                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
+                            f"adapter={adapter_name} bucket_idx={bucket_idx}"
+                        )
+                        logger.info(
+                            "[schedrl][selective_sync] broadcast_apply_enter "
+                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
+                            f"adapter={adapter_name} bucket_idx={bucket_idx} num_workers={len(broadcast_workers)}"
+                        )
+                        ray.get(recv_refs)
+                        logger.info(
+                            "[schedrl][selective_sync] broadcast_apply_exit "
+                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
+                            f"adapter={adapter_name} bucket_idx={bucket_idx}"
+                        )
+
+                # Apply base tensors first so vLLM model weights are restored before adapter registration.
+                _broadcast_apply_bucket_sequence(base_cached_buckets, is_lora_stage=False, phase_tag="base")
+                if self.is_lora and adapter_names_to_register and broadcast_workers:
+                    peft_configs = getattr(self.models_unwrapped[0], "peft_config", None) or {}
+                    missing_cfg = [a for a in adapter_names_to_register if a not in peft_configs]
+                    if missing_cfg:
+                        raise RuntimeError(
+                            f"selective_sync_active_cache: missing peft_config for adapters {missing_cfg}"
+                        )
+                    # Stage one adapter at a time, then register it so staged tensors are consumed immediately.
+                    for adapter_name in adapter_names_to_register:
+                        buckets = adapter_cached_buckets.get(adapter_name, [])
+                        if not buckets:
+                            raise RuntimeError(
+                                f"selective_sync_active_cache: no cached buckets for adapter={adapter_name!r}; "
+                                "promote_active_adapter_checkpoint must be called before sync"
+                            )
+                        _broadcast_apply_bucket_sequence(
+                            buckets,
+                            is_lora_stage=True,
+                            phase_tag="adapter",
+                            adapter_name=adapter_name,
+                        )
+                        ray.get(
+                            [
+                                worker.add_lora.remote(
+                                    adapter_name=adapter_name, peft_config=asdict(peft_configs[adapter_name])
+                                )
+                                for worker in broadcast_workers
+                            ]
+                        )
                 # Destroy groups before dist.barrier(): ncclCommDestroy blocks if called after barrier.
                 logger.info(
                     "[schedrl][selective_sync] broadcast_teardown_enter "
@@ -2263,10 +2467,20 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             )
 
     def load_states(self, include=None, non_blocking=False):
-        # per_adapter mode: optimizer states are kept resident; only reload model params.
+        # Per-adapter mode must honor include semantics so SchedRL can fully release GPU memory
+        # during train->infer handoff (model + optimizer states), then restore on demand.
         if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
+            include_states = []
             if include is None or OffloadStateType.model_params in include:
+                # Include optimizer-managed trainable model params (e.g., active LoRA weights) in per-adapter mode.
                 reload_megatron_no_grad_module(model_chunks=self.model.get_models())
+                include_states.append(MegatronOffloadStateType.model_params)
+            if include is None or OffloadStateType.other_params in include:
+                include_states.append(MegatronOffloadStateType.other_params)
+            if include is None or OffloadStateType.optimizer_states in include:
+                include_states.append(MegatronOffloadStateType.optimizer_states)
+            if include_states:
+                self.optimizer.reload_states(include=include_states, non_blocking=non_blocking)
             return
 
         if include is not None:
@@ -2282,11 +2496,25 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.optimizer.reload_states(include=include, non_blocking=non_blocking)
 
     def offload_states(self, include=None, non_blocking=False, pin_memory=True):
-        # per_adapter mode: only offload model params (optimizer states stay on GPU).
+        # Per-adapter mode must honor include semantics so SchedRL can fully release GPU memory
+        # during train->infer handoff (model + optimizer states), then restore on demand.
         if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
+            include_states = []
             if include is None or OffloadStateType.model_params in include:
+                # Include optimizer-managed trainable model params (e.g., active LoRA weights) in per-adapter mode.
                 offload_megatron_no_grad_module(
                     model_chunks=self.model.get_models(), pin_memory=pin_memory
+                )
+                include_states.append(MegatronOffloadStateType.model_params)
+            if include is None or OffloadStateType.other_params in include:
+                include_states.append(MegatronOffloadStateType.other_params)
+            if include is None or OffloadStateType.optimizer_states in include:
+                include_states.append(MegatronOffloadStateType.optimizer_states)
+            if include_states:
+                self.optimizer.offload_states(
+                    include=include_states,
+                    non_blocking=non_blocking,
+                    pin_memory=pin_memory,
                 )
             RotaryEmbedding.forward.cache_clear()
             current_platform.empty_cache()
@@ -2363,7 +2591,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 validate_access_integrity=self._validate_access_integrity,
             )
             self._validate_access_integrity = False
-        elif not dist.is_initialized() or mpu.get_data_modulo_expert_parallel_rank() == 0:
+        # Compatibility: older Megatron builds do not expose get_data_modulo_expert_parallel_rank().
+        elif not dist.is_initialized() or (
+            mpu.get_data_modulo_expert_parallel_rank()
+            if hasattr(mpu, "get_data_modulo_expert_parallel_rank")
+            else mpu.get_data_parallel_rank(with_context_parallel=False)
+        ) == 0:
             torch.save(self.optimizer.state_dict(), os.path.join(checkpoint_dir, OPTIMIZER_NAME))
             logger.info(f"Saving optimizer state to {os.path.join(checkpoint_dir, OPTIMIZER_NAME)}")
 

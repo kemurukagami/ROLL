@@ -1506,7 +1506,10 @@ class RequestScheduler:
                         f"offload_dp_ranks: dp_rank {rank} is still active; "
                         "call shrink_workers(..., skip_offload=True) first"
                     )
-            offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
+            # Use explicit keyword args so Ray signature binding stays stable across wrapped actor methods.
+            offload_refs = self.infer_cluster.offload_states_partial(
+                target_dp_ranks=offload_ranks, blocking=False
+            )
             await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
         return {"offload_duration_ms": (time.time() - start_time) * 1000, "offload_ranks": offload_ranks}
 
@@ -1968,8 +1971,21 @@ class RequestScheduler:
             start_time = time.time()
             offload_ranks = self._validate_dp_ranks_input(dp_ranks, mode="shrink")
 
-            # VAL: VAL_NON_EMPTY, state consistency check
-            self._validate_calculated_ranks(offload_ranks, mode="shrink")
+            # In coupled scheduler flows (e.g., init paths), shrink can be called multiple times
+            # with skip_offload=True. Treat already-inactive ranks as no-op for idempotence.
+            if bool(skip_offload):
+                active_set = set(self.active_dp_ranks)
+                offload_ranks = [r for r in offload_ranks if r in active_set]
+                if not offload_ranks:
+                    return {
+                        "aborted": 0,
+                        "remapped": 0,
+                        "shrink_duration_ms": (time.time() - start_time) * 1000,
+                        "offload_ranks": [],
+                    }
+            else:
+                # VAL: VAL_NON_EMPTY, state consistency check (strict for normal shrink calls)
+                self._validate_calculated_ranks(offload_ranks, mode="shrink")
 
             # Atomic routing update under routing_lock
             async with self.routing_lock:
@@ -1978,7 +1994,10 @@ class RequestScheduler:
 
             if not bool(skip_offload):
                 # Offload states from target workers
-                offload_refs = self.infer_cluster.offload_states_partial(offload_ranks, blocking=False)
+                # Use explicit keyword args so Ray signature binding stays stable across wrapped actor methods.
+                offload_refs = self.infer_cluster.offload_states_partial(
+                    target_dp_ranks=offload_ranks, blocking=False
+                )
                 await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
 
             return {
@@ -2063,10 +2082,16 @@ class RequestScheduler:
                     process_refs = self.infer_cluster.process_weights_after_loading(blocking=False)
                     await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in process_refs])
                     # Now that weights are synced, initialize full infer states (incl. KV cache) for rollout.
-                    load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+                    # Use explicit keyword args so Ray signature binding stays stable across wrapped actor methods.
+                    load_refs = self.infer_cluster.load_states_partial(
+                        target_dp_ranks=load_ranks, blocking=False
+                    )
                     await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
                 else:
-                    load_refs = self.infer_cluster.load_states_partial(load_ranks, blocking=False)
+                    # Use explicit keyword args so Ray signature binding stays stable across wrapped actor methods.
+                    load_refs = self.infer_cluster.load_states_partial(
+                        target_dp_ranks=load_ranks, blocking=False
+                    )
                     await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in load_refs])
 
             # Atomic operation under routing_lock

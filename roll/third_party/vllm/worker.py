@@ -23,7 +23,6 @@ logger = get_logger()
 class TensorLoraManager:
     def __init__(self):
         self.lora_params = OrderedDict()
-        self.add_lora_count = 0
         self._lora_names: dict[str, int] = {}  # Track adapter_name -> lora_int_id for routing lookups.
 
     def get_lora_id(self, adapter_name: str) -> int | None:
@@ -38,10 +37,11 @@ class TensorLoraManager:
         Generate a unique LoRA ID based on adapter name + PEFT config so every
         rank computes the same id for the same adapter registration.
         """
-        self.add_lora_count += 1
-        peft_config["adapter_name"] = adapter_name
-        peft_config["add_lora_count"] = self.add_lora_count
-        peft_config_str = json.dumps(peft_config, sort_keys=True)
+        # Use a stable hash key (adapter + config only). Do NOT include call-order counters,
+        # otherwise different registration order across workers yields inconsistent adapter ids.
+        peft_config_for_hash = dict(peft_config)
+        peft_config_for_hash["adapter_name"] = adapter_name
+        peft_config_str = json.dumps(peft_config_for_hash, sort_keys=True)
         hash_obj = hashlib.sha256(peft_config_str.encode("utf-8"))
         hex_dig = hash_obj.hexdigest()
         lora_int_id = int(hex_dig, 16) % 0x7FFFFFFF
@@ -51,7 +51,7 @@ class TensorLoraManager:
             lora_name=adapter_name,
             lora_int_id=lora_int_id,
             lora_path="dummy_lora_path",
-            peft_config=peft_config,
+            peft_config=peft_config_for_hash,
             lora_tensors=self.lora_params,
         )
         del self.lora_params
@@ -91,8 +91,36 @@ class WorkerBase:
         return True
 
     def custom_list_loras(self) -> list[int]:
-        # Return unique ids to keep parity across ranks when strategy normalizes results.
-        return sorted(set(self.tensor_lora_manager._lora_names.values()))
+        # Query runtime vLLM LoRA state instead of tensor_lora_manager._lora_names.
+        # This allows strategy-side visibility checks to detect slots that were evicted from GPU state.
+        lora_manager = getattr(getattr(self, "model_runner", None), "lora_manager", None)
+        if lora_manager is None:
+            return []
+        list_adapters = getattr(lora_manager, "list_adapters", None)
+        if not callable(list_adapters):
+            return []
+        raw = list_adapters()
+        if isinstance(raw, dict):
+            raw = list(raw.keys())
+        lora_ids = []
+        for item in raw:
+            if isinstance(item, int):
+                lora_ids.append(item)
+                continue
+            # Some vLLM versions may return adapter names/ids as strings.
+            # Resolve names through local adapter_name->id map to keep readiness checks accurate.
+            if isinstance(item, str):
+                if item.isdigit():
+                    lora_ids.append(int(item))
+                    continue
+                mapped_id = self.tensor_lora_manager.get_lora_id(item)
+                if isinstance(mapped_id, int):
+                    lora_ids.append(mapped_id)
+                continue
+            lora_int_id = getattr(item, "lora_int_id", None)
+            if isinstance(lora_int_id, int):
+                lora_ids.append(lora_int_id)
+        return sorted(set(lora_ids))
 
     def custom_get_lora_id(self, adapter_name: str) -> int | None:
         # Strategy uses this to resolve adapter name into vLLM integer adapter id.
@@ -104,13 +132,45 @@ class WorkerBase:
             self.weight_loaded = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        # before updating the parameters, we need to reinitialize the previously released model
+        # Before updating parameters, reinitialize the previously released model.
         self.reload_model()
         if vllm.__version__ < "0.8.5":
             from roll.third_party.vllm.vllm_utils import patch_vllm_moe_model_weight_loader
 
             patch_vllm_moe_model_weight_loader(self.model_runner.model)
-        self.model_runner.model.load_weights(weights=weights)
+        # Root cause: vLLM's _create_lora_modules() permanently replaces all LoRA target modules
+        # with wrapper objects at LoRAModelManager init time (e.g. gate_up_proj becomes
+        # gate_up_proj.base_layer). model.load_weights() then builds its own params_dict from
+        # named_parameters() and applies stacked_params_mapping (gate_proj -> gate_up_proj),
+        # producing a fused key that no longer exists in params_dict -> KeyError.
+        # Fix: when LoRA wrappers are active, temporarily inject unfused aliases into
+        # named_parameters() so the stacked_params_mapping lookup succeeds. Each alias points to
+        # the same tensor as its base_layer counterpart, so weight_loader writes to the correct param.
+        model = self.model_runner.model
+        params_dict = dict(model.named_parameters(remove_duplicate=False))
+        lora_active = any(".base_layer." in k for k in params_dict)
+        if not lora_active:
+            model.load_weights(weights=weights)
+            return
+        # Strip ".base_layer." from every wrapped param that doesn't already have an unwrapped alias.
+        aliases = {
+            k.replace(".base_layer.", "."): v
+            for k, v in params_dict.items()
+            if ".base_layer." in k and k.replace(".base_layer.", ".") not in params_dict
+        }
+        original_named_parameters = model.named_parameters
+
+        # Use (*args, **kwargs) to forward all positional and keyword args to the original,
+        # matching nn.Module.named_parameters(prefix, recurse, remove_duplicate) exactly.
+        def _aliased_named_parameters(*args, **kwargs):
+            yield from original_named_parameters(*args, **kwargs)
+            yield from aliases.items()
+
+        model.named_parameters = _aliased_named_parameters
+        try:
+            model.load_weights(weights=weights)
+        finally:
+            model.named_parameters = original_named_parameters
 
     def load_states(self):
         self.reload_model()
@@ -129,6 +189,12 @@ class WorkerBase:
         assert (self.weight_loaded and self.kv_cache_loaded) or (not self.weight_loaded and not self.kv_cache_loaded)
         if not self.weight_loaded:
             logger.info("[vllm][offload] already offloaded, skip (level=%s)", level)
+            # Clear staged LoRA tensors even when model weights are already offloaded.
+            # These tensors are sync staging buffers, not persistent model state.
+            if getattr(self, "tensor_lora_manager", None) is not None and self.tensor_lora_manager.lora_params:
+                staged_count = len(self.tensor_lora_manager.lora_params)
+                self.tensor_lora_manager.lora_params = OrderedDict()
+                logger.info("[vllm][offload] cleared staged LoRA tensors while already-offloaded: count=%s", staged_count)
             return
         _desc = "destroy weights+KV" if level == 2 else "swap weights to CPU, discard KV"
         logger.info("[vllm][offload] sleep(level=%s) start: %s", level, _desc)
@@ -141,6 +207,20 @@ class WorkerBase:
         self.kv_cache_loaded = False
         if hasattr(self, "recv_manager"):
             self.recv_manager.clear()
+        # Drop staged LoRA tensors so repeated selective-sync cycles do not accumulate GPU buffers.
+        # Adapter registration ids stay in tensor_lora_manager._lora_names for routing.
+        if getattr(self, "tensor_lora_manager", None) is not None and self.tensor_lora_manager.lora_params:
+            staged_count = len(self.tensor_lora_manager.lora_params)
+            self.tensor_lora_manager.lora_params = OrderedDict()
+            logger.info("[vllm][offload] cleared staged LoRA tensors: count=%s", staged_count)
+        # sleep(level=2) destroys runtime LoRA slots in vLLM; clear name->id map to force re-registration on wake.
+        if (
+            level == 2
+            and getattr(self, "tensor_lora_manager", None) is not None
+            and self.tensor_lora_manager._lora_names
+        ):
+            self.tensor_lora_manager._lora_names = {}
+            logger.info("[vllm][offload] cleared adapter id map after sleep(level=2)")
         gc.collect()
         current_platform.empty_cache()
         logger.info("[vllm][offload] sleep(level=%s) done: GPU memory %s", level, "fully freed" if level == 2 else "weights on CPU, KV discarded")
@@ -266,7 +346,7 @@ class WorkerBase:
             if not getattr(bucket, "is_cuda", False):
                 bucket_with_meta["bucket"] = bucket.to(device=self.device).contiguous()
             bucket_with_meta.pop("bucket_bytes", None)
-        named_params = named_tensors_from_bucket(**bucket_with_meta)
+        named_params = list(named_tensors_from_bucket(**bucket_with_meta))
         if is_lora:
             for name, weight in named_params:
                 self.tensor_lora_manager.add_weight(name, weight)

@@ -484,10 +484,19 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                             critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
                         if self.pipeline_config.critic_warmup <= global_step:
+                            # GPU tracing: extract adapter names for trace label
+                            trained_adapters_for_trace: Optional[str] = None
+                            if "lora_name" in batch.non_tensor_batch:
+                                lora_name_arr = batch.non_tensor_batch["lora_name"]
+                                valid_adapter_names = set(self._tag_to_adapter.values())
+                                adapters = [str(name) for name in lora_name_arr.tolist() if str(name) in valid_adapter_names]
+                                if adapters:
+                                    trained_adapters_for_trace = ",".join(dict.fromkeys(adapters))
                             self._request_static_cluster(
                                 cluster_id=self._actor_train_cluster_id,
                                 priority=Priority.ACTOR_TRAINING,
                                 global_step=global_step,
+                                lora_name=trained_adapters_for_trace,  # GPU tracing: adapter names for trace label
                             )
                             batch_balance_metrics = batch_balance(
                                 batch,

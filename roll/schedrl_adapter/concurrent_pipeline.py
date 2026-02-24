@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import ray
@@ -520,12 +520,15 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
             )
         return allocated
 
-    def _request_static_cluster(self, *, cluster_id: str, priority: Any, global_step: int) -> List[int]:
+    def _request_static_cluster(
+        self, *, cluster_id: str, priority: Any, global_step: int, lora_name: Optional[str] = None
+    ) -> List[int]:
         allocated = ray.get(
             self._schedrl_scheduler.request_gpus.remote(
                 cluster_id=str(cluster_id),
                 priority=priority,
                 global_step=global_step,
+                lora_name=lora_name,  # GPU tracing: pass LoRA adapter name for training clusters
             )
         )
         if not isinstance(allocated, list):
@@ -546,6 +549,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         request_cluster_id: str,
         request_priority: Any,
         request_global_step: int,
+        request_lora_name: Optional[str] = None,
     ) -> List[int]:
         allocated = ray.get(
             self._schedrl_scheduler.release_and_request_gpus.remote(
@@ -554,6 +558,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                 request_cluster_id=str(request_cluster_id),
                 request_priority=request_priority,
                 request_global_step=int(request_global_step),
+                request_lora_name=request_lora_name,  # GPU tracing: pass LoRA adapter name for training clusters
             )
         )
         if not isinstance(allocated, list):

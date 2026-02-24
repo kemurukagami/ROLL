@@ -1,4 +1,5 @@
 import enum
+import logging
 import os
 
 
@@ -46,6 +47,14 @@ def schedrl_env_vars() -> dict[str, str]:
         raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
     if not ray_namespace:
         raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+    grpc_pool_size = os.environ.get("RAY_grpc_server_thread_pool_size", "4")
+    omp_threads = os.environ.get("OMP_NUM_THREADS", "1")
+    logging.getLogger(__name__).info(
+        "[schedrl_env_vars] pid=%d RAY_grpc_server_thread_pool_size=%s OMP_NUM_THREADS=%s",
+        os.getpid(),
+        grpc_pool_size,
+        omp_threads,
+    )
     return {
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
@@ -53,6 +62,13 @@ def schedrl_env_vars() -> dict[str, str]:
         "SCHEDRL_LIBRARY_MODE": os.environ.get("SCHEDRL_LIBRARY_MODE", "1"),
         # Keep imports working when Ray workers start outside the repo root.
         "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        # Limit math library threads per actor to avoid hitting container pids.max.
+        "OMP_NUM_THREADS": omp_threads,
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
+        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
+        # Limit gRPC sync thread pool per actor to avoid hitting container pids.max.
+        # Default is 32; 4 is sufficient for RL pipeline actor communication throughput.
+        "RAY_grpc_server_thread_pool_size": grpc_pool_size,
     }
 
 

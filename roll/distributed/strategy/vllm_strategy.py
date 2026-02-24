@@ -624,8 +624,16 @@ class VllmStrategy(InferenceStrategy):
                 f"Configured adapters: {list(adapters.keys())}"
             )
         existing = await self.get_lora_id(adapter_name)
+        logger.info(
+            "[vllm_strategy][add_lora] adapter=%s existing_id=%s",
+            adapter_name, existing,
+        )
         if existing is not None:
             loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
+            logger.info(
+                "[vllm_strategy][add_lora] early_return adapter=%s existing_id=%s in_loaded=%s loaded=%s",
+                adapter_name, existing, existing in loaded, loaded[:8],
+            )
             if existing not in loaded:
                 await self._wait_for_lora_visible(
                     adapter=adapter_name,
@@ -637,6 +645,10 @@ class VllmStrategy(InferenceStrategy):
         peft_config["target_modules"] = sorted(adapters[adapter_name].lora_target)
         await self.model.add_lora(adapter_name, peft_config)
         lora_int_id = await self.get_lora_id(adapter_name)
+        logger.info(
+            "[vllm_strategy][add_lora] post_add adapter=%s lora_int_id=%s",
+            adapter_name, lora_int_id,
+        )
         if lora_int_id is None:
             raise RuntimeError(f"LoRA adapter registration did not produce an id: adapter={adapter_name!r}")
         loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())

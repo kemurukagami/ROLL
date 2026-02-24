@@ -548,7 +548,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
             wait_poll_s = 30.0
             last_any_ready_mono = time.monotonic()
             wait_ready_since_mono: float | None = None
-            barrier_mode = bool(getattr(self.pipeline_config, "multi_lora_barrier_mode", False))
+            # barrier_mode removed: always use async single-adapter tick (barrier_mode=False)
             last_get_batch_done_ts_by_adapter: dict[str, float] = {}
             last_train_step_done_ts_by_adapter: dict[str, float] = {}
             last_train_step_done_ts_global: float | None = None
@@ -561,7 +561,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
 
                 if wait_ready_since_mono is None:
                     wait_ready_since_mono = time.monotonic()
-                required_ready = len(active_refs) if barrier_mode else 1
+                required_ready = 1
                 ready, _ = ray.wait(active_refs, num_returns=required_ready, timeout=wait_poll_s)
                 if len(ready) < required_ready:
                     now_mono = time.monotonic()
@@ -574,20 +574,12 @@ class AgenticMultiLoraPipeline(BasePipeline):
                         age = now_mono - submitted_mono
                         ages[tag] = round(age, 3)
                         oldest_age_s = max(oldest_age_s, age)
-                    if barrier_mode:
-                        logger.info(
-                            "Waiting for get_batch (barrier)... "
-                            f"global_tick={global_tick} lora_step={lora_step} "
-                            f"in_flight={sorted(in_flight.keys())} pending={sorted(pending_by_tag.keys())} "
-                            f"ready={len(ready)}/{len(active_refs)} ages_s={ages}"
-                        )
-                    else:
-                        logger.info(
-                            "Waiting for get_batch... "
-                            f"global_tick={global_tick} lora_step={lora_step} "
-                            f"in_flight={sorted(in_flight.keys())} pending={sorted(pending_by_tag.keys())} "
-                            f"ages_s={ages}"
-                        )
+                    logger.info(
+                        "Waiting for get_batch... "
+                        f"global_tick={global_tick} lora_step={lora_step} "
+                        f"in_flight={sorted(in_flight.keys())} pending={sorted(pending_by_tag.keys())} "
+                        f"ages_s={ages}"
+                    )
                     if ready:
                         last_any_ready_mono = now_mono
                     if now_mono - last_any_ready_mono >= stall_timeout_s or oldest_age_s >= stall_timeout_s:
@@ -605,81 +597,46 @@ class AgenticMultiLoraPipeline(BasePipeline):
                 wait_ready_since_mono = None
                 last_any_ready_mono = ready_now_mono
 
-                if barrier_mode:
-                    for tag in active_tags_in_flight:
-                        ref = in_flight[tag]
-                        batch = ray.get(ref)
-                        if batch is None:
-                            raise RuntimeError(f"get_batch returned None for tag={tag!r}")
-                        batch.meta_info.setdefault("metrics", {})
-                        batch.meta_info["metrics"]["time/ray_wait_ready_batch_s"] = tick_wait_ready_batch_s
-                        adapter_name = tag_to_adapter.get(tag, tag)
-                        get_batch_done_ts = time.monotonic() - pipeline_start_mono
-                        batch.meta_info["metrics"]["time/get_batch_done_ts"] = get_batch_done_ts
-                        issue_mono = submitted_at_mono.get(tag)
-                        if issue_mono is None:
-                            raise RuntimeError(f"Missing submitted_at timestamp for ready tag={tag!r}")
-                        issue_ts = issue_mono - pipeline_start_mono
-                        batch.meta_info["metrics"]["time/get_batch_issue_ts"] = issue_ts
-                        batch.meta_info["metrics"]["time/get_batch_latency_s"] = get_batch_done_ts - issue_ts
-                        prev_done_ts = last_get_batch_done_ts_by_adapter.get(adapter_name)
-                        batch.meta_info["metrics"]["time/get_batch_done_interval_s"] = (
-                            0.0 if prev_done_ts is None else get_batch_done_ts - prev_done_ts
-                        )
-                        last_get_batch_done_ts_by_adapter[adapter_name] = get_batch_done_ts
-                        if "get_batch_return_start_time" in batch.meta_info:
-                            batch.meta_info["metrics"]["time/get_batch_cost_train"] = (
-                                time.time() - batch.meta_info.pop("get_batch_return_start_time")
-                            )
-                        pending_by_tag[tag] = batch
-                        in_flight.pop(tag, None)
-                        start_mono = submitted_at_mono.pop(tag, None)
-                        if start_mono is None:
-                            raise RuntimeError(f"Missing submitted_at timestamp for popped tag={tag!r}")
-                        wait_s = time.monotonic() - start_mono
-                        batch.meta_info["metrics"]["time/get_batch_wait_s"] = wait_s
-                        logger.info(f"get_batch done tag={tag!r} global_tick={global_tick} elapsed_s={wait_s:.3f}")
-                else:
-                    # Single-adapter tick: consume exactly one ready batch per train_step_lora call.
-                    ready_ref = ready[0]
-                    ready_tag = next((t for t, r in in_flight.items() if r == ready_ref), None)
-                    if ready_tag is None:
-                        raise RuntimeError("ray.wait returned a ref that is not tracked in in_flight")
+                # Single-adapter tick: consume exactly one ready batch per train_step_lora call.
+                ready_ref = ready[0]
+                ready_tag = next((t for t, r in in_flight.items() if r == ready_ref), None)
+                if ready_tag is None:
+                    raise RuntimeError("ray.wait returned a ref that is not tracked in in_flight")
 
-                    batch = ray.get(ready_ref)
-                    if batch is None:
-                        raise RuntimeError(f"get_batch returned None for tag={ready_tag!r}")
-                    # Align with AgenticPipeline timing metrics:
-                    # - time/get_batch_cost_train from rollout scheduler's internal marker (if present)
-                    # - time/step_rollout approximated later as (wait + preprocess) per adapter
-                    batch.meta_info.setdefault("metrics", {})
-                    batch.meta_info["metrics"]["time/ray_wait_ready_batch_s"] = tick_wait_ready_batch_s
-                    adapter_name = tag_to_adapter.get(ready_tag, ready_tag)
-                    get_batch_done_ts = time.monotonic() - pipeline_start_mono
-                    batch.meta_info["metrics"]["time/get_batch_done_ts"] = get_batch_done_ts
-                    issue_mono = submitted_at_mono.get(ready_tag)
-                    if issue_mono is None:
-                        raise RuntimeError(f"Missing submitted_at timestamp for ready tag={ready_tag!r}")
-                    issue_ts = issue_mono - pipeline_start_mono
-                    batch.meta_info["metrics"]["time/get_batch_issue_ts"] = issue_ts
-                    batch.meta_info["metrics"]["time/get_batch_latency_s"] = get_batch_done_ts - issue_ts
-                    prev_done_ts = last_get_batch_done_ts_by_adapter.get(adapter_name)
-                    batch.meta_info["metrics"]["time/get_batch_done_interval_s"] = (
-                        0.0 if prev_done_ts is None else get_batch_done_ts - prev_done_ts
+                batch = ray.get(ready_ref)
+                if batch is None:
+                    raise RuntimeError(f"get_batch returned None for tag={ready_tag!r}")
+                # Align with AgenticPipeline timing metrics:
+                # - time/get_batch_cost_train from rollout scheduler's internal marker (if present)
+                # - time/step_rollout approximated later as (wait + preprocess) per adapter
+                batch.meta_info.setdefault("metrics", {})
+                batch.meta_info["metrics"]["time/ray_wait_ready_batch_s"] = tick_wait_ready_batch_s
+                adapter_name = tag_to_adapter.get(ready_tag, ready_tag)
+                get_batch_done_ts = time.monotonic() - pipeline_start_mono
+                batch.meta_info["metrics"]["time/get_batch_done_ts"] = get_batch_done_ts
+                issue_mono = submitted_at_mono.get(ready_tag)
+                if issue_mono is None:
+                    raise RuntimeError(f"Missing submitted_at timestamp for ready tag={ready_tag!r}")
+                issue_ts = issue_mono - pipeline_start_mono
+                batch.meta_info["metrics"]["time/get_batch_issue_ts"] = issue_ts
+                batch.meta_info["metrics"]["time/get_batch_latency_s"] = get_batch_done_ts - issue_ts
+                prev_done_ts = last_get_batch_done_ts_by_adapter.get(adapter_name)
+                batch.meta_info["metrics"]["time/get_batch_done_interval_s"] = (
+                    0.0 if prev_done_ts is None else get_batch_done_ts - prev_done_ts
+                )
+                last_get_batch_done_ts_by_adapter[adapter_name] = get_batch_done_ts
+                if "get_batch_return_start_time" in batch.meta_info:
+                    batch.meta_info["metrics"]["time/get_batch_cost_train"] = (
+                        time.time() - batch.meta_info.pop("get_batch_return_start_time")
                     )
-                    last_get_batch_done_ts_by_adapter[adapter_name] = get_batch_done_ts
-                    if "get_batch_return_start_time" in batch.meta_info:
-                        batch.meta_info["metrics"]["time/get_batch_cost_train"] = (
-                            time.time() - batch.meta_info.pop("get_batch_return_start_time")
-                        )
-                    pending_by_tag[ready_tag] = batch
-                    in_flight.pop(ready_tag, None)
-                    start_mono = submitted_at_mono.pop(ready_tag, None)
-                    if start_mono is None:
-                        raise RuntimeError(f"Missing submitted_at timestamp for popped tag={ready_tag!r}")
-                    wait_s = time.monotonic() - start_mono
-                    batch.meta_info["metrics"]["time/get_batch_wait_s"] = wait_s
-                    logger.info(f"get_batch done tag={ready_tag!r} global_tick={global_tick} elapsed_s={wait_s:.3f}")
+                pending_by_tag[ready_tag] = batch
+                in_flight.pop(ready_tag, None)
+                start_mono = submitted_at_mono.pop(ready_tag, None)
+                if start_mono is None:
+                    raise RuntimeError(f"Missing submitted_at timestamp for popped tag={ready_tag!r}")
+                wait_s = time.monotonic() - start_mono
+                batch.meta_info["metrics"]["time/get_batch_wait_s"] = wait_s
+                logger.info(f"get_batch done tag={ready_tag!r} global_tick={global_tick} elapsed_s={wait_s:.3f}")
 
                 if not pending_by_tag:
                     continue

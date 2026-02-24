@@ -158,8 +158,26 @@ def main() -> None:
 
     # This example is often run in a single-process "smoke test" setup without a pre-existing Ray cluster.
     # Initialize a local Ray runtime so schedrl.init() does not require an external `ray start --head`.
+    # Log before ray.init() — this is when the head node gRPC pool size is fixed.
+    _grpc_pool = os.environ.get("RAY_grpc_server_thread_pool_size", "4")
+    _omp = os.environ.get("OMP_NUM_THREADS", "1")
+    print(f"[ENV] RAY_grpc_server_thread_pool_size={_grpc_pool}")
+    print(f"[ENV] OMP_NUM_THREADS={_omp}")
     if not ray.is_initialized():
-        ray.init(namespace="schedrl", ignore_reinit_error=True, log_to_driver=True)
+        # Pass thread-limiting vars as the Ray-side global default runtime_env.
+        # Actors that specify their own runtime_env override this, but it catches
+        # any actor that does not set an explicit runtime_env.
+        ray.init(
+            namespace="schedrl",
+            ignore_reinit_error=True,
+            log_to_driver=True,
+            runtime_env={"env_vars": {
+                "OMP_NUM_THREADS": _omp,
+                "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
+                "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
+                "RAY_grpc_server_thread_pool_size": _grpc_pool,
+            }},
+        )
 
     hydra_config_path, _ = _resolve_hydra_config_path(roll_root=roll_root, arg_config_path=args.config_path)
     GlobalHydra.instance().clear()
@@ -236,6 +254,13 @@ def main() -> None:
                     "ROLL_RAY_NAMESPACE": ray_namespace,
                     "SCHEDRL_CONTROL_PLANE": "schedrl",
                     "SCHEDRL_LIBRARY_MODE": "1",
+                    # Propagate thread-limiting vars so adapter + coordinator actors
+                    # stay within container pids.max. Falls back to safe defaults if
+                    # not set in the shell.
+                    "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+                    "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
+                    "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
+                    "RAY_grpc_server_thread_pool_size": os.environ.get("RAY_grpc_server_thread_pool_size", "4"),
                 }
             },
         ).remote(
@@ -249,6 +274,7 @@ def main() -> None:
         run_refs.append(coordinator.run.remote())
 
         if admit_delay_s > 0 and i < len(pipeline_ids) - 1:
+            print(f"admit_delay_s: sleep {admit_delay_s=}")
             import time
             time.sleep(admit_delay_s)
 

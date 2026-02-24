@@ -47,7 +47,19 @@ def _build_pipeline_env_vars(*, pipeline_id: str, ray_namespace: str) -> Dict[st
         "HUGGINGFACE_AUTOMAP_CACHE": f"{scratch_root}/hf/automap",
         "VLLM_CACHE_ROOT": f"{scratch_root}/vllm",
         "FLASHINFER_WORKSPACE_DIR": f"{scratch_root}/flashinfer",
+        # Limit thread counts to avoid hitting container pids.max.
+        # Read from env so shell export overrides; defaults are safe minimums.
+        "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "1"),
+        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
+        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
+        "RAY_grpc_server_thread_pool_size": os.environ.get("RAY_grpc_server_thread_pool_size", "4"),
     }
+    import logging as _logging
+    _logging.getLogger(__name__).info(
+        "[_build_pipeline_env_vars] pid=%d pipeline_id=%s OMP_NUM_THREADS=%s RAY_grpc_server_thread_pool_size=%s",
+        os.getpid(), pipeline_id,
+        env_vars["OMP_NUM_THREADS"], env_vars["RAY_grpc_server_thread_pool_size"],
+    )
     return env_vars
 
 

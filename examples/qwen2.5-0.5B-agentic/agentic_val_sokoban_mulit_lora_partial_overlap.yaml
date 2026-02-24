@@ -12,7 +12,6 @@ hydra:
 
 pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
 
-multi_lora_barrier_mode: false
 
 exp_name: "n_agent_train_sokoban_multi_lora_async"
 seed: 42

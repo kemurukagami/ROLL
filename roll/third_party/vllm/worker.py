@@ -71,6 +71,21 @@ class WorkerBase:
     def custom_add_lora(self, adapter_name: str, peft_config: dict) -> bool:
         # Build request with adapter name so routing can map name -> id consistently.
         lora_request = self.tensor_lora_manager.build_request(adapter_name, peft_config)
+        lora_int_id = lora_request.lora_int_id
+        staged_count = len(lora_request.lora_tensors) if lora_request.lora_tensors else 0
+        # Diagnostic: check if adapter is still in vLLM's Python registry. After offload_states(level=2),
+        # the registry is cleared, so in_vllm_cache=True here means the adapter was registered without
+        # an intervening sleep (e.g. back-to-back add_lora calls). The cached GPU tensors are valid here.
+        lora_manager = getattr(getattr(self, "model_runner", None), "lora_manager", None)
+        in_vllm_cache = (
+            lora_int_id in lora_manager.list_adapters()
+            if lora_manager is not None and callable(getattr(lora_manager, "list_adapters", None))
+            else None
+        )
+        logger.info(
+            "[vllm][add_lora] enter adapter=%s int_id=%s staged_tensors=%s in_vllm_cache=%s weight_loaded=%s",
+            adapter_name, lora_int_id, staged_count, in_vllm_cache, self.weight_loaded,
+        )
         self.reload_model()
         add_lora = getattr(getattr(self, "model_runner", None), "add_lora", None)
         if not callable(add_lora):
@@ -80,14 +95,26 @@ class WorkerBase:
             )
         try:
             ok = add_lora(lora_request)
-        except Exception:
+        except Exception as exc:
             # Roll back local mapping so we do not keep a phantom adapter id.
             self.tensor_lora_manager._lora_names.pop(adapter_name, None)
+            logger.error(
+                "[vllm][add_lora] FAILED adapter=%s int_id=%s in_vllm_cache=%s exc=%s",
+                adapter_name, lora_int_id, in_vllm_cache, exc,
+            )
             raise
         if ok is False:
             # Roll back local mapping so verification sees only successfully-added adapters.
             self.tensor_lora_manager._lora_names.pop(adapter_name, None)
+            logger.error(
+                "[vllm][add_lora] returned_False adapter=%s int_id=%s in_vllm_cache=%s",
+                adapter_name, lora_int_id, in_vllm_cache,
+            )
             raise RuntimeError(f"vLLM add_lora returned False for adapter={adapter_name!r}")
+        logger.info(
+            "[vllm][add_lora] ok adapter=%s int_id=%s in_vllm_cache=%s",
+            adapter_name, lora_int_id, in_vllm_cache,
+        )
         return True
 
     def custom_list_loras(self) -> list[int]:
@@ -140,37 +167,51 @@ class WorkerBase:
             patch_vllm_moe_model_weight_loader(self.model_runner.model)
         # Root cause: vLLM's _create_lora_modules() permanently replaces all LoRA target modules
         # with wrapper objects at LoRAModelManager init time (e.g. gate_up_proj becomes
-        # gate_up_proj.base_layer). model.load_weights() then builds its own params_dict from
-        # named_parameters() and applies stacked_params_mapping (gate_proj -> gate_up_proj),
-        # producing a fused key that no longer exists in params_dict -> KeyError.
-        # Fix: when LoRA wrappers are active, temporarily inject unfused aliases into
-        # named_parameters() so the stacked_params_mapping lookup succeeds. Each alias points to
-        # the same tensor as its base_layer counterpart, so weight_loader writes to the correct param.
+        # gate_up_proj.base_layer). AutoWeightsLoader skips the root module and directly calls
+        # each child's load_weights (e.g. Qwen2Model.load_weights). That child builds its own
+        # params_dict from self.named_parameters() and applies stacked_params_mapping
+        # (gate_proj -> gate_up_proj), producing a fused key that no longer exists -> KeyError.
+        # Fix: patch named_parameters() on every submodule that has its own load_weights
+        # (those are the ones AutoWeightsLoader calls directly). Each alias maps the unwrapped
+        # name to the same tensor as the base_layer counterpart.
         model = self.model_runner.model
         params_dict = dict(model.named_parameters(remove_duplicate=False))
         lora_active = any(".base_layer." in k for k in params_dict)
         if not lora_active:
             model.load_weights(weights=weights)
             return
-        # Strip ".base_layer." from every wrapped param that doesn't already have an unwrapped alias.
-        aliases = {
-            k.replace(".base_layer.", "."): v
-            for k, v in params_dict.items()
-            if ".base_layer." in k and k.replace(".base_layer.", ".") not in params_dict
-        }
-        original_named_parameters = model.named_parameters
+        # Collect submodules (not root) that have their own load_weights — AutoWeightsLoader
+        # calls these directly. Build per-submodule aliases stripping ".base_layer.".
+        patches: dict = {}
+        for submod_name, submod in model.named_modules():
+            if submod is model:
+                continue  # AutoWeightsLoader skips root to avoid infinite recursion
+            if not callable(getattr(submod, "load_weights", None)):
+                continue
+            sub_params = dict(submod.named_parameters(remove_duplicate=False))
+            if not any(".base_layer." in k for k in sub_params):
+                continue
+            sub_aliases = {
+                k.replace(".base_layer.", "."): v
+                for k, v in sub_params.items()
+                if ".base_layer." in k and k.replace(".base_layer.", ".") not in sub_params
+            }
+            orig = submod.named_parameters
 
-        # Use (*args, **kwargs) to forward all positional and keyword args to the original,
-        # matching nn.Module.named_parameters(prefix, recurse, remove_duplicate) exactly.
-        def _aliased_named_parameters(*args, **kwargs):
-            yield from original_named_parameters(*args, **kwargs)
-            yield from aliases.items()
+            # Closure captures the correct orig and sub_aliases for each submodule.
+            def _make_aliased(orig_fn, aliased_dict):
+                def _aliased(*args, **kwargs):
+                    yield from orig_fn(*args, **kwargs)
+                    yield from aliased_dict.items()
+                return _aliased
 
-        model.named_parameters = _aliased_named_parameters
+            submod.named_parameters = _make_aliased(orig, sub_aliases)
+            patches[submod_name] = (submod, orig)
         try:
             model.load_weights(weights=weights)
         finally:
-            model.named_parameters = original_named_parameters
+            for _, (submod, orig) in patches.items():
+                submod.named_parameters = orig
 
     def load_states(self):
         self.reload_model()
@@ -213,14 +254,26 @@ class WorkerBase:
             staged_count = len(self.tensor_lora_manager.lora_params)
             self.tensor_lora_manager.lora_params = OrderedDict()
             logger.info("[vllm][offload] cleared staged LoRA tensors: count=%s", staged_count)
-        # sleep(level=2) destroys runtime LoRA slots in vLLM; clear name->id map to force re-registration on wake.
+        # sleep(level=2) frees ALL GPU memory including LoRA tensors, but vLLM's Python-side LoRA cache
+        # (LRUCacheWorkerLoRAManager) still holds the adapter entries pointing at the now-freed GPU memory.
+        # On the next add_lora call, vLLM would take the else-branch (adapter "in cache") and skip
+        # reloading LoRA tensors to GPU → using freed memory during generate → CUDA error / process crash.
+        # Fix: evict all registered adapters from vLLM's Python cache here, so the next add_lora always
+        # takes the fresh-load path. This also ensures newly trained LoRA weights are always applied.
         if (
             level == 2
             and getattr(self, "tensor_lora_manager", None) is not None
             and self.tensor_lora_manager._lora_names
         ):
+            lora_manager = getattr(getattr(self, "model_runner", None), "lora_manager", None)
+            remove_adapter = getattr(lora_manager, "remove_adapter", None) if lora_manager is not None else None
+            evicted = 0
+            if callable(remove_adapter):
+                for int_id in self.tensor_lora_manager._lora_names.values():
+                    remove_adapter(int_id)
+                    evicted += 1
             self.tensor_lora_manager._lora_names = {}
-            logger.info("[vllm][offload] cleared adapter id map after sleep(level=2)")
+            logger.info("[vllm][offload] cleared adapter id map and evicted vllm cache: count=%s", evicted)
         gc.collect()
         current_platform.empty_cache()
         logger.info("[vllm][offload] sleep(level=%s) done: GPU memory %s", level, "fully freed" if level == 2 else "weights on CPU, KV discarded")

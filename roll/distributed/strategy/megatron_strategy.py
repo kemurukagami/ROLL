@@ -2322,10 +2322,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                                 )
 
             # Broadcast path (separated workers): ephemeral collective group managed by ModelUpdateService.
-            # TODO: remove comm_plan is None self-setup path once all callers go through ModelUpdateService.
-            assert comm_plan is not None or not is_leader, (
-                "selective_sync_active_cache: comm_plan must be provided for leader ranks. "
-                "Self-setup (comm_plan is None) is no longer supported; use ModelUpdateService."
+            # comm_plan=None is valid for leaders when all targets are colocated (IPC-only path):
+            # ModelUpdateService intentionally passes None in that case (no NCCL group needed).
+            assert comm_plan is not None or not is_leader or not broadcast_target_dp_ranks, (
+                "selective_sync_active_cache: comm_plan must be provided for leader ranks that have "
+                "broadcast targets. Self-setup (comm_plan is None) is no longer supported; use ModelUpdateService."
             )
             group_name = None
             broadcast_workers = None

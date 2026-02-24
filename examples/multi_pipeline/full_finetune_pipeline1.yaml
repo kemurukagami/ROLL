@@ -20,6 +20,7 @@ track_with: stdout
 
 
 system_envs:
+  USE_MODELSCOPE: "0"
   NCCL_SHM_DISABLE: "1"
   RAY_PROFILING: "1"
   RAY_DEDUP_LOGS: "0"

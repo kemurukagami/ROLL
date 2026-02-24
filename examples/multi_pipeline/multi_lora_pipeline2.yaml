@@ -22,6 +22,7 @@ render_save_dir: /tmp/roll_output/lora_pipeline2/render
 
 
 system_envs:
+  USE_MODELSCOPE: "0"
   NCCL_SHM_DISABLE: "1"
   RAY_PROFILING: "1"
   RAY_DEDUP_LOGS: "0"
@@ -117,12 +118,12 @@ actor_infer:
     adapters:
       SimpleSokoban:
         lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
-        lora_rank: 32
-        lora_alpha: 32
+        lora_rank: 8
+        lora_alpha: 8
       LargerSokoban:
         lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
-        lora_rank: 32
-        lora_alpha: 32
+        lora_rank: 8
+        lora_alpha: 8
   generating_args:
     max_new_tokens: 64
     top_p: 1

@@ -157,6 +157,15 @@ class WorkerBase:
         if not self.weight_loaded:
             self.wake_up(["weights"])
             self.weight_loaded = True
+            # [debug] Stage 3: model structure just allocated on GPU by wake_up.
+            # With the streaming approach in broadcast_parameter, no receive buffers exist yet,
+            # so device_used = baseline + model_weights only.
+            _free3, _total3 = torch.cuda.mem_get_info()
+            logger.info(
+                f"[debug][wake_up_done] "
+                f"device_used={(_total3 - _free3) / 1024**3:.3f}GB "
+                f"allocated={torch.cuda.memory_allocated() / 1024**3:.3f}GB"
+            )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         # Before updating parameters, reinitialize the previously released model.
@@ -355,28 +364,59 @@ class WorkerBase:
         logger.info(f"[schedrl][vllm][collective] destroy_exit group_name={group_name}")
 
     def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
+        # [debug] Stage 1: log GPU memory before any receive buffer is allocated.
+        # If another process still has model weights loaded, device_used will be much higher
+        # than the expected idle baseline (~3.5 GiB for 6 idle processes on this test config).
+        _free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        _device_used_gb = (_total_bytes - _free_bytes) / 1024**3
+        _alloc_gb = torch.cuda.memory_allocated() / 1024**3
         logger.info(
             f"[schedrl][vllm][broadcast] enter group_name={group_name} "
-            f"num_tensors={len(names)} is_lora={int(bool(is_lora))}"
+            f"num_tensors={len(names)} is_lora={int(bool(is_lora))} "
+            f"[debug] device_used={_device_used_gb:.3f}GB allocated={_alloc_gb:.3f}GB "
+            f"device_total={_total_bytes / 1024**3:.3f}GB"
         )
-        weights_and_handles = []
-        for name, dtype, shape in zip(names, dtypes, shapes):
-            target_dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-            weight = torch.empty(shape, dtype=target_dtype, device=self.device)
-            handle = collective.broadcast(tensor=weight, src_rank=0, group_name=group_name, async_op=True)
-            weights_and_handles.append((name, weight, handle))
-
-        def weights_iter():
-            for name, weight, handle in weights_and_handles:
-                handle.wait()
-                yield name, weight
 
         if is_lora:
-            for name, weight in weights_iter():
+            # LoRA tensors are small: keep async batch pattern so NCCL can pipeline transfers.
+            weights_and_handles = []
+            for name, dtype, shape in zip(names, dtypes, shapes):
+                target_dtype = dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+                weight = torch.empty(shape, dtype=target_dtype, device=self.device)
+                handle = collective.broadcast(tensor=weight, src_rank=0, group_name=group_name, async_op=True)
+                weights_and_handles.append((name, weight, handle))
+            for name, weight, handle in weights_and_handles:
+                handle.wait()
                 self.tensor_lora_manager.add_weight(name, weight)
             logger.info(f"[schedrl][vllm][broadcast] exit group_name={group_name} mode=lora")
             return
-        self.load_weights(weights=weights_iter())
+
+        # Base weights: reload model FIRST, then stream one tensor at a time via a generator.
+        # Peak memory = model_weights + one_tensor_buffer (not model + ALL buffers simultaneously).
+        # Passing a generator to load_weights means LoRA patch logic runs ONCE for all tensors
+        # (O(1) named_modules scan), vs calling load_weights 290 times (O(290) scans).
+        self.reload_model()
+
+        def _streaming_weights_gen():
+            for _name, _dtype, _shape in zip(names, dtypes, shapes):
+                _target_dtype = _dtype if isinstance(_dtype, torch.dtype) else getattr(torch, _dtype)
+                _buf = torch.empty(_shape, dtype=_target_dtype, device=self.device)
+                # Blocking broadcast: receive this tensor before allocating the next buffer.
+                collective.broadcast(tensor=_buf, src_rank=0, group_name=group_name, async_op=False)
+                yield _name, _buf
+                del _buf  # free buffer before allocating the next one
+
+        # load_weights calls reload_model() internally; no-op since weight_loaded=True after
+        # the reload_model() call above.
+        self.load_weights(weights=_streaming_weights_gen())
+
+        # [debug] Stage 4: all tensors loaded; peak (model + one_buffer) has already passed.
+        _free4, _total4 = torch.cuda.mem_get_info()
+        logger.info(
+            f"[debug][broadcast_load_done] group_name={group_name} "
+            f"device_used={(_total4 - _free4) / 1024**3:.3f}GB "
+            f"allocated={torch.cuda.memory_allocated() / 1024**3:.3f}GB"
+        )
         logger.info(f"[schedrl][vllm][broadcast] exit group_name={group_name} mode=weights")
 
     def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):

@@ -2415,6 +2415,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                             f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
                             f"adapter={adapter_name} bucket_idx={bucket_idx}"
                         )
+                        # Free GPU bucket immediately after receivers finish.
+                        # named_params holds tensor views into bucket's CUDA storage; del it first
+                        # so the refcount on bucket drops to zero, matching the ROLL_multi_pipeline
+                        # pattern (finally: del gpu_bucket; empty_cache()).
+                        del named_params, handles, bucket, bucket_cpu
+                        current_platform.empty_cache()
 
                 # Apply base tensors first so vLLM model weights are restored before adapter registration.
                 _broadcast_apply_bucket_sequence(base_cached_buckets, is_lora_stage=False, phase_tag="base")
@@ -2519,6 +2525,17 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 )
             RotaryEmbedding.forward.cache_clear()
             current_platform.empty_cache()
+            # [debug] Same post-offload snapshot as the non-per-adapter path below.
+            import torch
+            _alloc_gb = torch.cuda.memory_allocated() / 1024**3
+            _reserv_gb = torch.cuda.memory_reserved() / 1024**3
+            _free_bytes, _total_bytes = torch.cuda.mem_get_info()
+            _device_used_gb = (_total_bytes - _free_bytes) / 1024**3
+            logger.info(
+                f"[debug][megatron_offload_done] allocated={_alloc_gb:.3f}GB "
+                f"reserved={_reserv_gb:.3f}GB "
+                f"device_used={_device_used_gb:.3f}GB device_total={_total_bytes / 1024**3:.3f}GB"
+            )
             return
 
         if include is not None:
@@ -2538,6 +2555,19 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         )
         RotaryEmbedding.forward.cache_clear()
         current_platform.empty_cache()
+        # [debug] Confirm GPU memory is freed after offload+empty_cache.
+        # This runs before _release_static_cluster signals the scheduler so it
+        # reveals whether VRAM is actually available before expansion is planned.
+        import torch
+        _alloc_gb = torch.cuda.memory_allocated() / 1024**3
+        _reserv_gb = torch.cuda.memory_reserved() / 1024**3
+        _free_bytes, _total_bytes = torch.cuda.mem_get_info()
+        _device_used_gb = (_total_bytes - _free_bytes) / 1024**3
+        logger.info(
+            f"[debug][megatron_offload_done] allocated={_alloc_gb:.3f}GB "
+            f"reserved={_reserv_gb:.3f}GB "
+            f"device_used={_device_used_gb:.3f}GB device_total={_total_bytes / 1024**3:.3f}GB"
+        )
 
     def setup_model_update(self, infer_cluster, model_update_name: str):
         assert model_update_name not in self.weight_updaters

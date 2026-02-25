@@ -94,6 +94,38 @@ def _validate_vllm_sleep_level(*, pipeline_config: Any) -> None:
         raise RuntimeError("ENG-123 Phase 3 requires actor_infer vLLM sleep_level=2 (drop model weights on offload).")
 
 
+def _validate_offload_nccl(*, pipeline_config: Any) -> None:
+    """Enforce offload_nccl=True on all clusters when sleep_level=2 is active.
+
+    sleep_level=2 is the SchedRL multi-pipeline mode where GPU VRAM is shared across
+    co-tenant pipelines. NCCL communicator buffers (~400-500 MB per process) accumulate
+    on the GPU even when a cluster is sleeping. With 10+ co-tenant processes this can
+    consume 4-5 GB of baseline VRAM, preventing KV-cache wake-up.
+
+    offload_nccl=True destroys process groups on offload and rebuilds them on load,
+    which is the only way to reclaim that memory.
+    """
+    # Clusters present in an agentic pipeline config.
+    cluster_names = ("actor_train", "actor_infer", "reference", "critic")
+    bad_clusters = []
+    for name in cluster_names:
+        worker_config = getattr(pipeline_config, name, None)
+        if worker_config is None:
+            continue
+        # Skip clusters that are inactive (no GPUs assigned — e.g. default critic).
+        device_mapping = getattr(worker_config, "device_mapping", None)
+        if not device_mapping:
+            continue
+        if not getattr(worker_config, "offload_nccl", False):
+            bad_clusters.append(name)
+    if bad_clusters:
+        raise RuntimeError(
+            f"ENG-123 sleep_level=2 requires offload_nccl=True on all clusters to reclaim NCCL "
+            f"buffer VRAM between cycles. Missing on: {bad_clusters}. "
+            f"Add 'offload_nccl: ${{offload_nccl}}' under each cluster in your pipeline YAML."
+        )
+
+
 class SchedRLAdapter:
     """Per-pipeline adapter actor (ENG-123 Phase 3).
 
@@ -115,6 +147,7 @@ class SchedRLAdapter:
 
         _validate_cpu_only_reward(pipeline_config=pipeline_config)
         _validate_vllm_sleep_level(pipeline_config=pipeline_config)
+        _validate_offload_nccl(pipeline_config=pipeline_config)
 
         # Create the cluster-wide singleton ResourceManager actor before any coordinator.
         # The adapter actor holds 0 GPU so the PG bundle ({GPU: N}) can always be satisfied.
@@ -175,9 +208,9 @@ class SchedRLAdapter:
                 placement_group=self._rm_node0_pg,
             ),
         ).remote(pipeline_id=self._pipeline_id, pipeline_config=pipeline_config)
-        # Initialize pipeline after actor creation so the actor creation task stays small and so we can
-        # fail fast with a clear error if any cluster init/cache prebuild step fails.
-        ray.get(self._coordinator.initialize_pipeline.remote())
+        # Do not block coordinator creation on initialize_pipeline.
+        # Initialization is executed lazily by pipeline.run() via _ensure_initialized(),
+        # allowing multi-pipeline startup/admission to proceed concurrently.
         return self._coordinator
 
     def _inject_pipeline_env_vars(self, *, pipeline_config: Any) -> None:

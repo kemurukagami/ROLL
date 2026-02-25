@@ -665,30 +665,58 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
         with self._infer_resize_lock:
             # All per-tag schedulers and val_rollout_scheduler share the same RequestScheduler actor.
             # A single call with skip_load=False performs weight load/selection sync and updates routing.
-            ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
+            expand_metrics = ray.get(self.val_rollout_scheduler.expand_sampler.remote(dp_ranks_to_add, skip_load=False))
+            # Verify only the ranks touched by this expand. Other inactive ranks are not expected to have LoRAs loaded yet.
+            expanded_dp_ranks = [int(r) for r in (expand_metrics.get("load_ranks") or dp_ranks_to_add)]
             # Fail fast on adapter ID skew after expand/load, before workers serve requests.
             adapters = set(self._tag_to_adapter.values())
-            self._verify_lora_model_update(adapters=adapters, where="multi_lora_pipeline._expand_all_schedulers")
+            self._verify_lora_model_update(
+                adapters=adapters,
+                where="multi_lora_pipeline._expand_all_schedulers",
+                target_dp_ranks=expanded_dp_ranks,
+            )
             # TODO(item-6): Run a dummy forward pass (batch_size=1) on newly expanded workers to
             # initialize CUDA kernels before exposing them to the scheduler (prevents first-request
             # timeout). Not implemented yet — monitor expand latency before adding.
 
-    def _verify_lora_model_update(self, *, adapters: Optional[set], where: str) -> None:
-        """Fail-fast: verify all infer workers agree on adapter_name → lora_int_id mapping."""
+    def _verify_lora_model_update(
+        self,
+        *,
+        adapters: Optional[set],
+        where: str,
+        target_dp_ranks: Optional[List[int]] = None,
+    ) -> None:
+        """Fail-fast: verify infer workers agree on adapter_name → lora_int_id mapping."""
         if not adapters:
             return
         if getattr(self.pipeline_config.actor_infer.model_args, "adapters", None) is None:
             raise RuntimeError(
                 f"{where}: actor_infer.model_args.adapters not configured; cannot verify LoRA model update."
             )
+        if target_dp_ranks is None:
+            verify_workers = list(self.actor_infer.workers)
+        else:
+            target_dp_rank_set = {int(r) for r in target_dp_ranks}
+            if not target_dp_rank_set:
+                return
+            # Resolve dp-rank scoping from cached rank_info to avoid RPC fanout in the verification path.
+            verify_workers = [
+                worker
+                for worker, rank_info in zip(self.actor_infer.workers, self.actor_infer.worker_rank_info)
+                if int(rank_info.dp_rank) in target_dp_rank_set
+            ]
+            if not verify_workers:
+                raise RuntimeError(
+                    f"{where}: no infer workers matched target_dp_ranks={sorted(target_dp_rank_set)!r}"
+                )
+
         timeout_s = float(os.environ.get("ROLL_VERIFY_LORA_TIMEOUT_S", "30"))
         adapter_names = sorted(adapters)
         ray.get(
-            [w.wait_loras_ready.remote(adapter_names=adapter_names, timeout_s=timeout_s)
-             for w in self.actor_infer.workers]
+            [w.wait_loras_ready.remote(adapter_names=adapter_names, timeout_s=timeout_s) for w in verify_workers]
         )
         for adapter_name in adapter_names:
-            lora_ids = ray.get([w.get_lora_id.remote(adapter_name) for w in self.actor_infer.workers])
+            lora_ids = ray.get([w.get_lora_id.remote(adapter_name) for w in verify_workers])
             if not lora_ids or lora_ids[0] is None:
                 raise RuntimeError(
                     f"{where}: infer workers missing adapter id: adapter={adapter_name!r} ids={lora_ids!r}"

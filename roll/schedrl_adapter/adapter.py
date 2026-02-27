@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -162,7 +163,9 @@ class SchedRLAdapter:
         self._rm_node0_pg = _rm_state["node2pg"].get(0)
 
         self._coordinator = None
-        # NOTE: infer resize serialization is owned by the per-pipeline pipeline-side resize actor.
+        # Serializes resize_infer and sync_adapter_weights: prevents a weight sync from
+        # racing with a concurrent shrink/expand triggered by the central scheduler.
+        self._resize_sync_lock = threading.Lock()
 
         # Driver is responsible for:
         # - orchestrator.allocate_pipeline_id()
@@ -238,8 +241,43 @@ class SchedRLAdapter:
         _update_system_envs(getattr(pipeline_config, "train_env_manager", None))
         _update_system_envs(getattr(pipeline_config, "val_env_manager", None))
 
+    def sync_adapter_weights(self, *, adapters_to_sync: List[str]) -> None:
+        """Push trained adapter weights to currently-awake infer workers.
+
+        Ranks are queried INSIDE _resize_sync_lock by looking up the generate_scheduler
+        actor directly, so the set cannot change between query and use (resize_infer also
+        acquires this lock before shrinking/expanding).
+        If all infer workers are sleeping (preempted by concurrent pipelines), sync is
+        skipped — sleeping workers receive the updated adapter via expand_worker on wake.
+        """
+        with self._resize_sync_lock:
+            # Look up generate_scheduler by its well-known name and query ranks atomically.
+            from roll.utils.constants import RAY_NAMESPACE
+            generate_scheduler = ray.get_actor(
+                f"RequestScheduler-{self._pipeline_id}", namespace=RAY_NAMESPACE
+            )
+            active_ranks = sorted(ray.get(generate_scheduler.get_active_dp_ranks.remote()))
+            if not active_ranks:
+                # All infer workers preempted/sleeping; expand_worker syncs on next wake.
+                return
+            model_update_service_name = f"{self._pipeline_id}_model_update_service"
+            try:
+                model_update_service = ray.get_actor(
+                    model_update_service_name, namespace=self._ray_namespace
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to resolve ModelUpdateService {model_update_service_name!r} "
+                    f"in namespace {self._ray_namespace!r}"
+                ) from e
+            ray.get(model_update_service.sync_selected_workers.remote(
+                active_ranks, adapters_to_sync=list(adapters_to_sync)
+            ))
+
     def resize_infer(self, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         """Pipeline-scoped resize for actor_infer (ENG-123).
+
+        Serialized with sync_adapter_weights via _resize_sync_lock.
 
         Contract: exactly one of {dp_ranks_to_remove, dp_ranks_to_add} must be non-empty.
         Applies to both train+val RequestSchedulers (shared infer cluster):
@@ -258,20 +296,21 @@ class SchedRLAdapter:
         if bool(dp_ranks_to_remove) == bool(dp_ranks_to_add):
             raise ValueError("Exactly one of dp_ranks_to_remove or dp_ranks_to_add must be non-empty")
 
-        # NOTE: adapter does not coordinate train/val request schedulers directly; it delegates to the
-        # per-pipeline coordinator actor (single serialization boundary owned by pipeline runtime).
-        resize_actor_name = f"schedrl:pipeline:{self._pipeline_id}"
-        try:
-            resize_actor = ray.get_actor(resize_actor_name, namespace=self._ray_namespace)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to resolve pipeline coordinator actor {resize_actor_name!r} in namespace {self._ray_namespace!r} "
-                f"for pipeline_id={self._pipeline_id!r}"
-            ) from e
+        with self._resize_sync_lock:
+            # NOTE: adapter does not coordinate train/val request schedulers directly; it delegates to the
+            # per-pipeline coordinator actor (single serialization boundary owned by pipeline runtime).
+            resize_actor_name = f"schedrl:pipeline:{self._pipeline_id}"
+            try:
+                resize_actor = ray.get_actor(resize_actor_name, namespace=self._ray_namespace)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to resolve pipeline coordinator actor {resize_actor_name!r} in namespace {self._ray_namespace!r} "
+                    f"for pipeline_id={self._pipeline_id!r}"
+                ) from e
 
-        ref = resize_actor.resize_infer.remote(
-            dp_ranks_to_remove=list(dp_ranks_to_remove),
-            dp_ranks_to_add=list(dp_ranks_to_add),
-        )
-        ray.get(ref)
+            ref = resize_actor.resize_infer.remote(
+                dp_ranks_to_remove=list(dp_ranks_to_remove),
+                dp_ranks_to_add=list(dp_ranks_to_add),
+            )
+            ray.get(ref)
         return ActionResponse(success=True)

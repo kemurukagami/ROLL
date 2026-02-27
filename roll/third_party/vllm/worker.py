@@ -86,7 +86,11 @@ class WorkerBase:
             "[vllm][add_lora] enter adapter=%s int_id=%s staged_tensors=%s in_vllm_cache=%s weight_loaded=%s",
             adapter_name, lora_int_id, staged_count, in_vllm_cache, self.weight_loaded,
         )
-        self.reload_model()
+        # Must fully initialize (weights + KV cache) before allocating LoRA tensors.
+        # LoRA tensors are outside the cumem pool; calling reload_model() only here
+        # leaves KV cache un-initialized, causing OOM when load_states_partial later
+        # calls wake_up(["kv_cache"]) on a nearly-full GPU.
+        self.load_states()
         add_lora = getattr(getattr(self, "model_runner", None), "add_lora", None)
         if not callable(add_lora):
             raise NotImplementedError(

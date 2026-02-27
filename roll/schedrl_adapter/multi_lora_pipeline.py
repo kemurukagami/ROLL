@@ -25,7 +25,7 @@ import torch
 from codetiming import Timer
 from ray.util.timer import _Timer
 
-from schedrl.protocol.types import ActionResponse
+from schedrl.protocol.types import ActionResponse, Priority
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import compute_rollout_traj_metrics, compute_train_data_metrics
@@ -50,6 +50,18 @@ from roll.utils.lora_routing import normalize_domain
 from roll.utils.train_infer_corrections import apply_train_infer_correction_to_batch
 
 logger = get_logger()
+
+
+def _get_env_timeout_s(var_name: str, default_s: float) -> float:
+    """Read a timeout in seconds from an env var; fall back to default_s if unset or invalid."""
+    raw = os.environ.get(var_name)
+    if raw is None:
+        return default_s
+    try:
+        val = float(raw)
+    except ValueError:
+        return default_s
+    return val if val > 0 else default_s
 
 
 class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
@@ -189,440 +201,368 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
         )
         return ActionResponse(success=True)
 
-    @torch.no_grad()
-    def run(self):
-        """Multi-LoRA SchedRL training loop.
 
-        Adapted from SchedRLConcurrentPipeline.run() with these changes:
-        - PHASE 6: collect batches from ALL per-tag schedulers (not a single one)
-        - PHASE 14: use actor_train.train_step_lora() instead of train_step()
+    @torch.no_grad()
+    def run(self) -> None:
+        """Multi-LoRA training loop.
+
+        Per-adapter step tracking with first-ready (barrier_mode=False) dispatch:
+        each adapter trains independently and terminates when its lora_step reaches max_steps.
+
+        Cycle per tick (one ready tag):
+          Phase 1 → Phase 4.5 → Phase 7 (async get_batch) → Phase 10 → Phase 13 → Phase 14
+          → Phase 15 (GAE only) → Phase 16 (train_step_lora + promote + sync) → Phase 17
         """
         self._ensure_initialized()
-        tps_timer = _Timer(window_size=5)
-        last_notify_ready_step: Optional[int] = None
+        logger.info(f"Starting SchedRLMultiLoraPipeline run: {self._pipeline_id}")
 
-        for global_step in range(self.pipeline_config.max_steps):
-            if global_step <= self.state.step:
-                global_step += 1
-                continue
-            logger.info(f"[schedrl][{self._pipeline_id}] multi-lora step={global_step} start")
-            metrics: Dict[str, Any] = {}
-            should_checkpoint = bool(
-                global_step > 0
-                and (
-                    global_step % self.pipeline_config.save_steps == 0
-                    or global_step == self.pipeline_config.max_steps - 1
+        rollout_get_batch_timeout_s = _get_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
+
+        # Build ordered adapter + tag lists (insertion-order dedup via dict.fromkeys).
+        adapters: List[str] = list(dict.fromkeys(self._tag_to_adapter.values()))
+        max_steps_per_adapter: int = self.pipeline_config.max_steps
+        # Per-adapter step counters — each terminates independently.
+        # TODO: checkpoint resume — restore per-adapter lora_step from saved state.
+        lora_step: Dict[str, int] = {name: 0 for name in adapters}
+        tags: List[str] = list(self.rollout_schedulers.keys())
+
+        # Phase-1 / Phase-4.5 state: track whether any tick has completed to know
+        # when it is safe to call _notify_ready_to_release_actor_infer.
+        any_tick_completed: bool = False
+        prev_trained_step: int = 0
+
+        # ============================================================
+        # Kick off initial get_batch for all active tags (mirrors agentic_multi_lora_pipeline.py:532-545).
+        # ============================================================
+        in_flight: Dict[str, Any] = {}  # tag -> ray.ObjectRef
+        for tag in tags:
+            adapter = self._tag_to_adapter[tag]
+            if lora_step[adapter] < max_steps_per_adapter:
+                in_flight[tag] = self.rollout_schedulers[tag].get_batch.remote(
+                    DataProto(meta_info={"global_step": lora_step[adapter]}),
+                    self.pipeline_config.rollout_batch_size,
                 )
-            )
-            defer_actor_train_release_for_checkpoint = False
 
-            with Timer(name="pipeline_step_total", logger=None) as step_timer:
-                with tps_timer:
-                    # Phase 0: ensure previous step's notify_ready_to_release was called.
-                    if global_step > 0 and last_notify_ready_step != global_step - 1:
-                        self._notify_ready_to_release_actor_infer(global_step=global_step - 1)
-                        last_notify_ready_step = global_step - 1
+        while any(lora_step[name] < max_steps_per_adapter for name in adapters):
+            metrics: Dict[str, Any] = {}
 
-                    # PHASE 1: Offload States
+            with Timer(name="per_step", logger=None) as step_timer:
+                # ============================================================
+                # Phase 1: Notify release of generation GPUs from previous tick.
+                # Only called after the first tick completes (no GPUs held on step 0).
+                # ============================================================
+                if any_tick_completed:
+                    self._notify_ready_to_release_actor_infer(global_step=prev_trained_step)
+                    logger.info(f"run() {self._pipeline_id=} Phase 1: notified release prev_step={prev_trained_step}")
+
+                # ============================================================
+                # Phase 4.5: Request generation GPUs.
+                # On the first tick there is no cluster to release; on subsequent ticks
+                # release actor_train (from previous training) and request actor_infer.
+                # ============================================================
+                expected_gpus = list(self.actor_infer.worker_config.device_mapping)
+                assert len(expected_gpus) > 0
+                if any_tick_completed and (
+                    self.pipeline_config.adv_estimator != "gae"
+                    or self.pipeline_config.critic_warmup <= prev_trained_step
+                ):
+                    # Release actor_train GPUs from last tick and request actor_infer GPUs.
+                    allocated_actor_infer_gpus = self._release_and_request_static_cluster(
+                        release_cluster_id=self._actor_train_cluster_id,
+                        release_global_step=prev_trained_step,
+                        request_cluster_id=self._actor_infer_cluster_id,
+                        request_priority=Priority.GENERATION,
+                        request_global_step=prev_trained_step + 1,
+                    )
+                else:
+                    allocated_actor_infer_gpus = self._request_static_cluster(
+                        cluster_id=self._actor_infer_cluster_id,
+                        priority=Priority.GENERATION,
+                        global_step=prev_trained_step,
+                    )
+                assert len(allocated_actor_infer_gpus) > 0
+                is_partial_allocation = len(allocated_actor_infer_gpus) < len(expected_gpus)
+                logger.info(
+                    f"run() {self._pipeline_id=} Phase 4.5: infer GPU alloc "
+                    f"expected={expected_gpus} allocated={allocated_actor_infer_gpus} "
+                    f"partial={is_partial_allocation}"
+                )
+
+                # ============================================================
+                # Phase 7: First-ready get_batch (barrier_mode=False).
+                # Fill any gaps for active tags, then wait for the first ready ref.
+                # Pattern copied from agentic_multi_lora_pipeline.py:556-639.
+                # ============================================================
+                for tag in tags:
+                    adapter = self._tag_to_adapter[tag]
+                    if lora_step[adapter] < max_steps_per_adapter and tag not in in_flight:
+                        in_flight[tag] = self.rollout_schedulers[tag].get_batch.remote(
+                            DataProto(meta_info={"global_step": lora_step[adapter]}),
+                            self.pipeline_config.rollout_batch_size,
+                        )
+
+                active_refs = [in_flight[t] for t in tags if t in in_flight]
+                assert active_refs, f"no in-flight get_batch refs; lora_step={lora_step}"
+                ready, _ = ray.wait(active_refs, num_returns=1, timeout=rollout_get_batch_timeout_s)
+                if not ready:
+                    raise RuntimeError(
+                        f"get_batch timed out ({rollout_get_batch_timeout_s}s) "
+                        f"in_flight={sorted(in_flight)}"
+                    )
+                ready_tag = next(t for t, r in in_flight.items() if r == ready[0])
+                batch = ray.get(ready[0])
+                in_flight.pop(ready_tag)
+                adapter_name = self._tag_to_adapter[ready_tag]
+
+                dump_rollout_trajectories(
+                    self.pipeline_config.rollout_dump_dir, lora_step[adapter_name], batch
+                )
+                metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                # Required by strategy._get_batch_num_tokens() to identify valid token masks.
+                batch.meta_info["loss_mask_keys"] = ["response_mask"]
+                # Required for workers to broadcast non_tensor_batch across DP ranks.
+                batch.meta_info["_broadcast_non_tensor_batch"] = True
+                # Pass per-adapter step so base_worker.train_step_lora can build bucket cache.
+                batch.meta_info["global_step"] = lora_step[adapter_name]
+                batch.meta_info["is_offload_states"] = True
+                logger.info(
+                    f"run() {self._pipeline_id=} Phase 7: ready tag={ready_tag!r} "
+                    f"adapter={adapter_name!r} lora_step={lora_step[adapter_name]}"
+                )
+
+                # ============================================================
+                # Phase 10: Batch processing (CPU).
+                # ============================================================
+                batch = compute_discounted_returns(
+                    batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma
+                )
+                batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
+                metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                with Timer(name="cal_response_level_mask", logger=None) as timer:
+                    batch, mask_metrics = get_agentic_response_level_mask(batch, self.pipeline_config)
+                    metrics.update(mask_metrics)
+                metrics["time/cal_response_level_mask"] = timer.last
+                logger.info(f"run() {self._pipeline_id=} Phase 10: batch processing completed")
+
+                # ============================================================
+                # Phase 11: Value compute (GAE only).
+                # ============================================================
+                if self.pipeline_config.adv_estimator == "gae":
+                    self._request_static_cluster(
+                        cluster_id=self._critic_cluster_id,
+                        priority=Priority.VALUE_COMPUTE,
+                        global_step=lora_step[adapter_name],
+                    )
+                    values_refs = self.critic.compute_values(batch, blocking=False)
+                    values = DataProto.materialize_concat(data_refs=values_refs)
+                    batch.batch["values"] = values.batch["values"]
+
+                # ============================================================
+                # Phase 13: Old log probs.
+                # ============================================================
+                if self.pipeline_config.adv_estimator != "gae":
+                    # Do NOT call _notify_ready_to_release_actor_infer here. In multi-lora, we
+                    # sync dirty adapter weights directly to active infer workers at Phase 16.
+                    # The scheduler's preemption path frees only the GPUs that actor_train needs
+                    # (a partial shrink), so active_dp_ranks stays non-empty through Phase 16.
+                    # After actor_train releases, the scheduler calls expand_worker to sync
+                    # adapters to any workers that were preempted (now idle).
+                    allocated_actor_train_gpus = self._request_static_cluster(
+                        cluster_id=self._actor_train_cluster_id,
+                        priority=Priority.OLD_LOG_PROBS,
+                        global_step=lora_step[adapter_name],
+                    )
+                else:
+                    allocated_actor_train_gpus = self._release_and_request_static_cluster(
+                        release_cluster_id=self._critic_cluster_id,
+                        release_global_step=lora_step[adapter_name],
+                        request_cluster_id=self._actor_train_cluster_id,
+                        request_priority=Priority.OLD_LOG_PROBS,
+                        request_global_step=lora_step[adapter_name],
+                    )
+                with Timer(name="cal_old_log_probs_values", logger=None) as old_logpb_timer:
+                    old_log_probs_refs = self.actor_train.compute_log_probs(batch, blocking=False)
+                    old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                    batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
+                    # TODO: support true ref_log_probs for enable_reference=True via dedicated
+                    # reference cluster GPU cycle. Simplified: old_log_probs used as ref.
+                    batch.batch["ref_log_probs"] = batch.batch["old_log_probs"]
+                metrics["time/old_log_probs_values"] = old_logpb_timer.last
+                logger.info(f"run() {self._pipeline_id=} Phase 13: old log probs completed")
+
+                # ============================================================
+                # Phase 14: Advantage computation (CPU).
+                # ============================================================
+                with Timer(name="cal_norm_rewards", logger=None) as timer:
+                    batch, reward_metrics = compute_response_level_rewards(
+                        batch=batch, pipeline_config=self.pipeline_config
+                    )
+                    metrics.update(reward_metrics)
+                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                metrics["time/cal_norm_rewards"] = timer.last
+
+                with Timer(name="cal_token_reward", logger=None) as timer:
+                    batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
+                    metrics.update(token_level_metrics)
+                metrics["time/cal_token_reward"] = timer.last
+
+                with Timer(name="compute_advantage", logger=None) as timer:
+                    batch = agentic_compute_advantage(
+                        data=batch,
+                        gamma=self.pipeline_config.gamma,
+                        lambd=self.pipeline_config.lambd,
+                        adv_estimator=self.pipeline_config.adv_estimator,
+                        advantage_clip=self.pipeline_config.advantage_clip,
+                        whiten_advantages=self.pipeline_config.whiten_advantages,
+                        whiten_rewards=self.pipeline_config.whiten_rewards,
+                    )
+                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                metrics["time/adv"] = timer.last
+                logger.info(f"run() {self._pipeline_id=} Phase 14: advantage computation completed")
+
+                if self.pipeline_config.enable_old_logprobs_recompute:
+                    batch, corr_metrics = apply_train_infer_correction_to_batch(
+                        self.pipeline_config, batch,
+                        update_mask_keys=batch.meta_info["loss_mask_keys"],
+                    )
+                    metrics.update(corr_metrics)
+
+                # ============================================================
+                # Phase 15: Critic training (GAE only).
+                # ============================================================
+                if self.pipeline_config.adv_estimator == "gae":
+                    self._release_and_request_static_cluster(
+                        release_cluster_id=self._actor_train_cluster_id,
+                        release_global_step=lora_step[adapter_name],
+                        request_cluster_id=self._critic_cluster_id,
+                        request_priority=Priority.CRITIC_TRAINING,
+                        request_global_step=lora_step[adapter_name],
+                    )
+                    with Timer(name="critic_train_step", logger=None) as critic_train_timer:
+                        critic_train_metrics_refs = self.critic.train_step(batch, blocking=False)
+                        critic_train_metrics = DataProto.materialize_concat(
+                            data_refs=critic_train_metrics_refs
+                        )
+                        metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
+                    metrics["time/critic_train_step"] = critic_train_timer.last
+
+                    if self.pipeline_config.critic_warmup > lora_step[adapter_name]:
+                        self._release_static_cluster(
+                            cluster_id=self._critic_cluster_id,
+                            global_step=lora_step[adapter_name],
+                        )
+                    logger.info(f"run() {self._pipeline_id=} Phase 15: critic training completed")
+
+                # ============================================================
+                # Phase 16: Actor training (train_step_lora) + promote + scheduler sync.
+                # Pattern copied from concurrent_pipeline.py Phase 16 + HEAD multi_lora_pipeline.py:534-568.
+                # ============================================================
+                if self.pipeline_config.critic_warmup <= lora_step[adapter_name]:
+                    # Request actor_train GPUs (release critic if GAE, else re-request actor_train).
                     if self.pipeline_config.adv_estimator == "gae":
-                        self.critic.offload_states(blocking=True)
-                    if self.pipeline_config.enable_reference and self.use_ref_model:
-                        self.reference.offload_states(blocking=True)
-                    self.actor_train.offload_states(blocking=True)
-
-                    # PHASE 3: Model update (no-op: done via expand_sampler on next expand)
-                    with Timer(name="model_update", logger=None) as model_update_timer:
-                        pass
-                    metrics["time/step_model_update"] = model_update_timer.last
-
-                    # PHASE 4: Request actor_infer GPUs from SchedRL.
-                    from schedrl.protocol.types import Priority
-
-                    if global_step > 0 and self.pipeline_config.critic_warmup <= (global_step - 1):
                         self._release_and_request_static_cluster(
-                            release_cluster_id=self._actor_train_cluster_id,
-                            release_global_step=global_step - 1,
-                            request_cluster_id=self._actor_infer_cluster_id,
-                            request_priority=Priority.GENERATION,
-                            request_global_step=global_step,
+                            release_cluster_id=self._critic_cluster_id,
+                            release_global_step=lora_step[adapter_name],
+                            request_cluster_id=self._actor_train_cluster_id,
+                            request_priority=Priority.ACTOR_TRAINING,
+                            request_global_step=lora_step[adapter_name],
                         )
                     else:
-                        self._request_actor_infer_gpus(global_step=global_step)
+                        # Switch actor_train from OLD_LOG_PROBS → ACTOR_TRAINING.
+                        self._release_and_request_static_cluster(
+                            release_cluster_id=self._actor_train_cluster_id,
+                            release_global_step=lora_step[adapter_name],
+                            request_cluster_id=self._actor_train_cluster_id,
+                            request_priority=Priority.ACTOR_TRAINING,
+                            request_global_step=lora_step[adapter_name],
+                        )
 
-                    batch: DataProto = DataProto()
-                    batch.meta_info = {"global_step": global_step}
+                    with Timer(name="actor_train_step", logger=None) as actor_train_timer:
+                        # (a) Train using per-adapter optimizer step.
+                        actor_train_metrics_refs = self.actor_train.train_step_lora(batch, blocking=False)
+                        actor_train_metrics = DataProto.materialize_concat(
+                            data_refs=actor_train_metrics_refs
+                        )
+                        metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+                    metrics["time/train_step"] = actor_train_timer.last
 
-                    # PHASE 5: Validation (synchronous)
-                    val_metrics = {}
-                    with Timer(name="val", logger=None) as val_timer:
-                        if self.pipeline_config.eval_steps > 0 and global_step % self.pipeline_config.eval_steps == 0:
-                            val_metrics = self.val(global_step)
+                    # (b) Extract trained adapters from lora_name; fail fast if missing or unknown.
+                    if "lora_name" not in batch.non_tensor_batch:
+                        raise RuntimeError("missing non_tensor_batch['lora_name']")
+                    valid_adapters = set(self._tag_to_adapter.values())
+                    trained_adapters: List[str] = list(dict.fromkeys(
+                        str(n) for n in batch.non_tensor_batch["lora_name"].tolist()
+                        if str(n) in valid_adapters
+                    ))
+                    if not trained_adapters:
+                        raise RuntimeError(
+                            f"no recognized adapters in lora_name: "
+                            f"{batch.non_tensor_batch['lora_name'].tolist()!r}"
+                        )
 
-                    # PHASE 6: Rollout - collect from ALL per-tag schedulers and concatenate.
-                    with Timer(name="rollout", logger=None) as rollout_timer:
-                        tag_batches: List[DataProto] = []
-                        for tag, scheduler in self.rollout_schedulers.items():
-                            tag_batch = ray.get(
-                                scheduler.get_batch.remote(batch, self.pipeline_config.rollout_batch_size)
-                            )
-                            if "get_batch_return_start_time" in tag_batch.meta_info:
-                                metrics[f"time/get_batch_cost_{tag}"] = time.time() - tag_batch.meta_info.pop(
-                                    "get_batch_return_start_time"
-                                )
-                            tag_batches.append(tag_batch)
-
-                        batch = DataProto.concat(tag_batches)
-                        sample_uuids = [f"{traj_id}_{i}" for i, traj_id in enumerate(batch.non_tensor_batch["traj_id"])]
-                        batch.non_tensor_batch["sample_uuid"] = np.array(sample_uuids, dtype=object)
-                        actor_infer_metrics = self.actor_infer.get_metrics()
-                        metrics.update(reduce_metrics(actor_infer_metrics.meta_info.pop("metrics", {})))
-                        metrics.update(compute_rollout_traj_metrics(batch))
-                        dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_step, batch)
-
-                    metrics["time/step_rollout"] = rollout_timer.last
-                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                    batch.meta_info["global_step"] = global_step
-                    batch.meta_info["_broadcast_non_tensor_batch"] = True
-                    batch.meta_info["loss_mask_keys"] = ["response_mask"]
-
-                    if val_metrics:
-                        metrics.update(val_metrics)
-                        metrics["time/step_val"] = val_timer.last
-
-                    batch = compute_discounted_returns(
-                        batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma
+                    # (c) Promote per-adapter checkpoint — enables expand_sampler to load on next expand.
+                    checkpoint_version = int(
+                        batch.meta_info.get("checkpoint_version", lora_step[adapter_name])
                     )
-                    batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
-                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-
-                    # PHASE 11: Reference Log Probs
-                    if self.pipeline_config.enable_reference:
-                        if self.use_ref_model:
-                            self._request_static_cluster(
-                                cluster_id=self._reference_cluster_id,
-                                priority=Priority.REF_LOG_PROBS,
-                                global_step=global_step,
+                    for adapter in trained_adapters:
+                        ray.get([
+                            worker.promote_active_adapter_checkpoint.remote(
+                                adapter, checkpoint_version, lora_step[adapter_name]
                             )
-                        else:
-                            self._request_static_cluster(
-                                cluster_id=self._actor_train_cluster_id,
-                                priority=Priority.REF_LOG_PROBS,
-                                global_step=global_step,
-                            )
-                    with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
-                        if self.pipeline_config.enable_reference:
-                            worker_config = (
-                                self.pipeline_config.reference if self.use_ref_model else self.pipeline_config.actor_train
-                            )
-                            worker = self.reference if self.use_ref_model else self.actor_train
-                            if worker_config.use_dynamic_batching_in_infer:
-                                batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                    batch,
-                                    worker.dp_size,
-                                    worker_config.max_tokens_per_microbatch_in_infer,
-                                    worker_config.sequence_length_round_in_infer,
-                                    worker_config.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
-                                    worker_config.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
-                                    "reference/compute_log_probs",
-                                )
-                                metrics.update(dynamic_batching_metrics)
-                            if not self.use_ref_model:
-                                batch.meta_info["disable_adapter"] = True
-                                batch.meta_info["is_offload_states"] = False
-                                batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
-                                ref_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
-                                    batch, blocking=False
-                                )
-                            else:
-                                batch_balance(batch, dp_size=self.reference.dp_size, minibatch_size=len(batch))
-                                ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(
-                                    batch, blocking=False
-                                )
+                            for worker in self.actor_train.workers
+                        ])
 
-                            ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
-                            ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
-                            batch = batch.union(ref_log_probs)
-                            avg_ref_log_prob = masked_mean(
-                                batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:]
-                            )
-                            metrics.update(reduce_metrics(ref_log_probs.meta_info.pop("metrics", {})))
-                            metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
-                    metrics["time/step_ref_log_probs_values_reward"] = cal_timer.last
-                    if self.pipeline_config.enable_reference:
-                        if self.use_ref_model:
-                            self.reference.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._reference_cluster_id, global_step=global_step)
-                        else:
-                            self.actor_train.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
+                    # (d) Push updated adapter weights to active infer workers directly via
+                    # the adapter actor. The adapter looks up generate_scheduler itself and
+                    # queries active_dp_ranks inside _resize_sync_lock to avoid race conditions.
+                    # If all workers are sleeping (preempted by concurrent pipelines),
+                    # the adapter skips sync and expand_worker handles it on next wake.
+                    ray.get(self._get_adapter_handle().sync_adapter_weights.remote(
+                        adapters_to_sync=trained_adapters,
+                    ))
+                    logger.info(f"run() {self._pipeline_id=} Phase 16: actor training + sync completed")
 
-                    # PHASE 12: Old Log Probs & Values
-                    with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
-                        critic_requested = False
-                        if self.pipeline_config.enable_reference and not self.use_ref_model:
-                            batch.meta_info["disable_adapter"] = False
-                        batch.meta_info["is_offload_states"] = False
-                        if self.pipeline_config.enable_old_logprobs_recompute:
-                            self._request_static_cluster(
-                                cluster_id=self._actor_train_cluster_id,
-                                priority=Priority.OLD_LOG_PROBS,
-                                global_step=global_step,
-                            )
-                            batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
-                            if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
-                                batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                    batch,
-                                    self.actor_train.dp_size,
-                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
-                                    self.pipeline_config.actor_train.sequence_length_round_in_infer,
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "pipeline_model_parallel_size", 1
-                                    ),
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "virtual_pipeline_model_parallel_size", None
-                                    ),
-                                    "actor_train/compute_log_probs",
-                                )
-                                metrics.update(dynamic_batching_metrics)
-                            old_log_probs: DataProto = self.actor_train.compute_log_probs(batch, blocking=True)
-                            batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
-                            avg_old_log_prob = masked_mean(
-                                batch.batch["old_log_probs"], batch.batch["response_mask"][:, 1:]
-                            )
-                            metrics.update({"critic/old_log_prob/mean": avg_old_log_prob.item()})
-                            metrics.update(reduce_metrics(old_log_probs.meta_info.pop("metrics", {})))
-                            agg_entropy = agg_loss(
-                                loss_mat=old_log_probs.batch["entropy"],
-                                loss_mask=batch.batch["response_mask"][:, 1:],
-                                loss_agg_mode="token-mean",
-                            )
-                            metrics.update({"critic/entropy/mean": agg_entropy.item()})
-                            self.actor_train.offload_states(blocking=True)
-                            if self.pipeline_config.adv_estimator == "gae":
-                                self._release_and_request_static_cluster(
-                                    release_cluster_id=self._actor_train_cluster_id,
-                                    release_global_step=global_step,
-                                    request_cluster_id=self._critic_cluster_id,
-                                    request_priority=Priority.VALUE_COMPUTE,
-                                    request_global_step=global_step,
-                                )
-                                critic_requested = True
-                            else:
-                                self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
-                        else:
-                            batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
+                # ============================================================
+                # Phase 17: Per-adapter step tracking and metrics.
+                # ============================================================
+                prev_trained_step = lora_step[adapter_name]  # capture before increment
+                lora_step[adapter_name] += 1
+                any_tick_completed = True
 
-                        if self.pipeline_config.adv_estimator == "gae":
-                            if not critic_requested:
-                                self._request_static_cluster(
-                                    cluster_id=self._critic_cluster_id,
-                                    priority=Priority.VALUE_COMPUTE,
-                                    global_step=global_step,
-                                )
-                            values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
+                metrics.update(compute_rollout_traj_metrics(batch))
+                metrics["system/lora_step"] = lora_step[adapter_name]
+                for name, step in lora_step.items():
+                    metrics[f"system/lora_step/{name}"] = step
+                logger.info(f"run() {self._pipeline_id=} Phase 17: metrics computed lora_step={lora_step}")
 
-                        if self.pipeline_config.adv_estimator == "gae":
-                            values = DataProto.materialize_concat(data_refs=values_refs)
-                            batch = batch.union(values)
-                            metrics.update(reduce_metrics(values.meta_info.pop("metrics", {})))
-                            self.critic.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
+            # End of Timer block — record per-tick wall time before checkpointing.
+            metrics["time/per_step_e2e"] = step_timer.last
 
-                        if not self.pipeline_config.enable_reference:
-                            batch.batch["ref_log_probs"] = batch.batch["old_log_probs"].clone()
-                            avg_ref_log_prob = masked_mean(
-                                batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:]
-                            )
-                            metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
+            self.state.step = lora_step[adapter_name]
+            self.state.log_history.append(metrics)
+            self.do_checkpoint(global_step=lora_step[adapter_name])
+            self.tracker.log(values=metrics, step=lora_step[adapter_name], lora_name=adapter_name)
+            logger.info(f"===== {self._pipeline_id} tick completed adapter={adapter_name!r} step={lora_step[adapter_name]} =====")
 
-                    metrics["time/step_old_log_probs_values"] = cal_old_logpb_timer.last
+            # Re-kick in-flight get_batch for the consumed tag if adapter has more steps.
+            if lora_step[adapter_name] < max_steps_per_adapter:
+                in_flight[ready_tag] = self.rollout_schedulers[ready_tag].get_batch.remote(
+                    DataProto(meta_info={"global_step": lora_step[adapter_name]}),
+                    self.pipeline_config.rollout_batch_size,
+                )
 
-                    with Timer(name="cal_response_level_mask", logger=None) as timer:
-                        batch, mask_metrics = get_agentic_response_level_mask(batch, self.pipeline_config)
-                        metrics.update(mask_metrics)
-                    metrics["time/step_cal_response_level_mask"] = timer.last
-
-                    # PHASE 13: Advantage Computation
-                    with Timer(name="cal_response_norm_rewards", logger=None) as timer:
-                        batch, reward_metrics = compute_response_level_rewards(batch=batch, pipeline_config=self.pipeline_config)
-                        metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                        metrics.update(reward_metrics)
-                    metrics["time/step_cal_norm_rewards"] = timer.last
-
-                    with Timer(name="cal_token_reward", logger=None) as timer:
-                        batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
-                        metrics.update(token_level_metrics)
-                    metrics["time/step_cal_token_reward"] = timer.last
-
-                    with Timer(name="compute_advantage", logger=None) as timer:
-                        batch = agentic_compute_advantage(
-                            data=batch,
-                            gamma=self.pipeline_config.gamma,
-                            lambd=self.pipeline_config.lambd,
-                            adv_estimator=self.pipeline_config.adv_estimator,
-                            advantage_clip=self.pipeline_config.advantage_clip,
-                            whiten_advantages=self.pipeline_config.whiten_advantages,
-                            whiten_rewards=self.pipeline_config.whiten_rewards,
-                        )
-                        metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                    metrics["time/step_adv"] = timer.last
-
-                    if self.pipeline_config.enable_old_logprobs_recompute:
-                        batch, corr_metrics = apply_train_infer_correction_to_batch(
-                            self.pipeline_config, batch, update_mask_keys=batch.meta_info["loss_mask_keys"]
-                        )
-                        metrics.update(corr_metrics)
-
-                    # PHASE 14: Training (multi-LoRA: use train_step_lora)
-                    with Timer(name="train_timer", logger=None) as train_timer:
-                        if self.pipeline_config.adv_estimator == "gae":
-                            self._request_static_cluster(
-                                cluster_id=self._critic_cluster_id,
-                                priority=Priority.CRITIC_TRAINING,
-                                global_step=global_step,
-                            )
-                            critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
-
-                        if self.pipeline_config.critic_warmup <= global_step:
-                            # GPU tracing: extract adapter names for trace label
-                            trained_adapters_for_trace: Optional[str] = None
-                            if "lora_name" in batch.non_tensor_batch:
-                                lora_name_arr = batch.non_tensor_batch["lora_name"]
-                                valid_adapter_names = set(self._tag_to_adapter.values())
-                                adapters = [str(name) for name in lora_name_arr.tolist() if str(name) in valid_adapter_names]
-                                if adapters:
-                                    trained_adapters_for_trace = ",".join(dict.fromkeys(adapters))
-                            self._request_static_cluster(
-                                cluster_id=self._actor_train_cluster_id,
-                                priority=Priority.ACTOR_TRAINING,
-                                global_step=global_step,
-                                lora_name=trained_adapters_for_trace,  # GPU tracing: adapter names for trace label
-                            )
-                            batch_balance_metrics = batch_balance(
-                                batch,
-                                dp_size=self.actor_train.dp_size,
-                                minibatch_size=self.actor_train.dp_size
-                                * self.pipeline_config.actor_train.training_args.per_device_train_batch_size
-                                * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps,
-                                logging_prefix="global_seqlen/actor_train",
-                            )
-                            metrics.update(batch_balance_metrics)
-                            if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
-                                batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                    batch,
-                                    self.actor_train.dp_size,
-                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
-                                    self.pipeline_config.actor_train.sequence_length_round_in_train,
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "pipeline_model_parallel_size", 1
-                                    ),
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "virtual_pipeline_model_parallel_size", None
-                                    ),
-                                    "actor_train/train_step",
-                                )
-                                metrics.update(dynamic_batching_metrics)
-
-                            # Multi-LoRA: use train_step_lora instead of train_step.
-                            actor_train_metrics_refs = self.actor_train.train_step_lora(batch, blocking=False)
-                            actor_train_metrics: DataProto = DataProto.materialize_concat(
-                                data_refs=actor_train_metrics_refs
-                            )
-                            metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
-                            checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
-
-                            # Determine trained adapters from canonical lora_name and fail fast on missing/unknown values.
-                            if "lora_name" not in batch.non_tensor_batch:
-                                raise RuntimeError(
-                                    "multi_lora_pipeline.run(): missing non_tensor_batch['lora_name']. "
-                                    "Env managers must inject lora_name before the training step."
-                                )
-                            lora_name_arr = batch.non_tensor_batch["lora_name"]
-                            valid_adapter_names = set(self._tag_to_adapter.values())
-                            trained_adapters = list(dict.fromkeys(
-                                str(name) for name in lora_name_arr.tolist() if str(name) in valid_adapter_names
-                            ))
-                            if not trained_adapters:
-                                raise RuntimeError(
-                                    "multi_lora_pipeline.run(): no recognized adapters in lora_name. "
-                                    f"lora_name values={lora_name_arr.tolist()!r} "
-                                    f"valid_adapters={sorted(valid_adapter_names)!r}"
-                                )
-
-                            # Build per-adapter CPU bucket caches (BEFORE offload_states — needs GPU).
-                            for adapter_name in trained_adapters:
-                                ray.get([
-                                    worker.build_latest_bucket_cache.remote(
-                                        checkpoint_version, int(global_step), adapter_name
-                                    )
-                                    for worker in self.actor_train.workers
-                                ])
-
-                            # Promote active adapter versions.
-                            for adapter_name in trained_adapters:
-                                ray.get([
-                                    worker.promote_active_adapter_checkpoint.remote(
-                                        adapter_name, checkpoint_version, int(global_step)
-                                    )
-                                    for worker in self.actor_train.workers
-                                ])
-
-                            # Notify scheduler to sync updated adapters to all currently active rollout workers.
-                            # All per-tag schedulers share the same underlying RequestScheduler.
-                            first_scheduler = next(iter(self.rollout_schedulers.values()))
-                            ray.get(first_scheduler.notify_adapter_updated.remote(trained_adapters))
-
-                            # Offload train states (AFTER cache build; cache is CPU-resident).
-                            self.actor_train.offload_states(blocking=True)
-                            if should_checkpoint:
-                                defer_actor_train_release_for_checkpoint = True
-                            else:
-                                if global_step == self.pipeline_config.max_steps - 1:
-                                    self._release_static_cluster(
-                                        cluster_id=self._actor_train_cluster_id,
-                                        global_step=global_step,
-                                    )
-
-                        if self.pipeline_config.adv_estimator == "gae":
-                            critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
-                            metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
-                            self.critic.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
-                        tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
-                    metrics["time/step_train"] = train_timer.last
-
-                with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
-                    data_metrics = compute_train_data_metrics(batch=batch)
-                metrics["time/step_compute_data_metrics"] = data_metrics_timer.last
-                metrics.update(data_metrics)
-                metrics["system/tps"] = tps_timer.mean_throughput
-                metrics["system/samples"] = (global_step + 1) * self.pipeline_config.rollout_batch_size
-
-                self.state.step = global_step
-                self.state.log_history.append(metrics)
-
-                self.do_checkpoint(global_step=global_step)
-                if defer_actor_train_release_for_checkpoint:
-                    self.actor_train.offload_states(blocking=True)
-                    if global_step == self.pipeline_config.max_steps - 1:
-                        self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
-
-                with Timer(name="log", logger=None) as log_timer:
-                    if self.pipeline_config.logging_steps > 0 and global_step % self.pipeline_config.logging_steps == 0:
-                        logger.info(json.dumps(metrics, ensure_ascii=False))
-                metrics["time/step_log"] = log_timer.last
-
-            metrics["time/step_total"] = step_timer.last
-            self.tracker.log(values=metrics, step=global_step)
-            logger.info(f"[schedrl][{self._pipeline_id}] multi-lora step={global_step} done")
-
-        # Final cleanup.
-        if last_notify_ready_step != self.pipeline_config.max_steps - 1:
-            self._notify_ready_to_release_actor_infer(global_step=self.pipeline_config.max_steps - 1)
-
-        ray.get([scheduler.shutdown.remote() for scheduler in self.rollout_schedulers.values()])
+        # ============================================================
+        # End-of-loop cleanup: release GPUs and shut down schedulers.
+        # ============================================================
+        max_lora_step = max(lora_step.values()) if lora_step else 0
+        if max_lora_step > 0:
+            self._notify_ready_to_release_actor_infer(global_step=max_lora_step - 1)
+            self._release_static_cluster(
+                cluster_id=self._actor_train_cluster_id, global_step=max_lora_step - 1
+            )
+        ray.get([sched.shutdown.remote() for sched in self.rollout_schedulers.values()])
         ray.get(self.val_rollout_scheduler.shutdown.remote())
-        logger.info(f"[schedrl][{self._pipeline_id}] multi-lora pipeline complete!")
+        logger.info(f"{self._pipeline_id} pipeline run() completed")
 
     def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         """SchedRL hook for per-tag scheduler shrink/expand."""

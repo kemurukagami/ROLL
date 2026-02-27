@@ -72,6 +72,27 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         self._actor_train_cluster_id = f"{self._pipeline_id}_actor_train"
         self._critic_cluster_id = f"{self._pipeline_id}_critic"
         self._reference_cluster_id = f"{self._pipeline_id}_reference"
+        # Lazily resolved and cached on first use by _get_adapter_handle().
+        self._adapter_handle: Any = None
+
+    def _get_adapter_handle(self) -> Any:
+        """Resolve and cache the per-pipeline SchedRLAdapter actor handle.
+
+        Named 'schedrl:adapter:{pipeline_id}' in the pipeline namespace.
+        The adapter serializes resize_infer and sync_adapter_weights via _resize_sync_lock.
+        """
+        if self._adapter_handle is not None:
+            return self._adapter_handle
+        # Namespace convention mirrors adapter.py:_get_pipeline_namespace().
+        namespace = f"pipeline_{self._pipeline_id}_NS"
+        actor_name = f"schedrl:adapter:{self._pipeline_id}"
+        try:
+            self._adapter_handle = ray.get_actor(actor_name, namespace=namespace)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to resolve adapter actor {actor_name!r} in namespace {namespace!r}"
+            ) from e
+        return self._adapter_handle
 
     def initialize_pipeline(self) -> ActionResponse:
         # In SchedRL mode we should follow the ConcurrentAgenticPipeline semantics:

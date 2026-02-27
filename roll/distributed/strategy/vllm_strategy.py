@@ -644,6 +644,10 @@ class VllmStrategy(InferenceStrategy):
         # Keep target_modules JSON-serializable and deterministic for worker-side hashing.
         peft_config["target_modules"] = sorted(adapters[adapter_name].lora_target)
         await self.model.add_lora(adapter_name, peft_config)
+        # custom_add_lora calls self.load_states() on the worker before registering the LoRA,
+        # so weights + KV cache are fully resident after this RPC returns.
+        # Advance the strategy-level flag now so load_states_partial() can skip its no-op RPC.
+        self.is_model_in_gpu = True
         lora_int_id = await self.get_lora_id(adapter_name)
         logger.info(
             "[vllm_strategy][add_lora] post_add adapter=%s lora_int_id=%s",

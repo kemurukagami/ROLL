@@ -2105,37 +2105,3 @@ class RequestScheduler:
                 "load_ranks": load_ranks,
             }
 
-    async def notify_adapter_updated(self, adapters_to_sync: list) -> None:
-        """Sync newly trained adapters to all currently active rollout workers.
-
-        Strictly serialized with shrink/expand scheduling loops via _op_lock.
-        TODO: fuse with scheduling loop in a future implementation.
-        """
-        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
-            return
-
-        async with self._op_lock:
-            async with self.routing_lock:
-                active_ranks = sorted(self.active_dp_ranks)
-            if not active_ranks:
-                return
-
-            pipeline_id = os.environ.get("PIPELINE_ID") or None
-            ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
-            if not pipeline_id:
-                raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
-            if not ray_namespace:
-                raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
-            try:
-                model_update_service = ray.get_actor(
-                    f"{pipeline_id}_model_update_service", namespace=ray_namespace
-                )
-            except Exception as e:
-                raise RuntimeError(
-                    f"Failed to resolve ModelUpdateService for pipeline_id={pipeline_id!r}"
-                ) from e
-            await asyncio.wrap_future(
-                model_update_service.sync_selected_workers.remote(
-                    active_ranks, adapters_to_sync=list(adapters_to_sync)
-                ).future()
-            )

@@ -1061,6 +1061,11 @@ class RolloutScheduler(RolloutMockMixin):
         """Return the current active DP ranks from the underlying RequestScheduler.
 
         Used for state verification after initialization shrink operations.
+
+        # FIXME: remove this method and have all callers look up RequestScheduler directly
+        # via ray.get_actor(f"RequestScheduler-{pipeline_id}", namespace=RAY_NAMESPACE)
+        # and call get_active_dp_ranks() on it. The RolloutScheduler indirection adds
+        # an unnecessary hop and obscures which actor owns the authoritative state.
         """
         return await self.generate_scheduler.get_active_dp_ranks.remote()
     def get_generate_scheduler_name(self) -> str:
@@ -1073,6 +1078,3 @@ class RolloutScheduler(RolloutMockMixin):
         # but better to just return the name we stored.
         return getattr(self.generate_scheduler, "_actor_name", "unknown")
 
-    async def notify_adapter_updated(self, adapters_to_sync: list) -> None:
-        """Delegate adapter update notification to RequestScheduler."""
-        await self.generate_scheduler.notify_adapter_updated.remote(adapters_to_sync)

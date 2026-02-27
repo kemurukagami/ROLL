@@ -167,6 +167,27 @@ class ActorWorker(Worker):
             lora_metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
             # Use append_to_dict to match train_step accumulation pattern (consistent with reducers).
             append_to_dict(metrics, lora_metrics)
+            # Build CPU bucket cache for dirty adapters while GPU weights are still resident.
+            # Only applicable when SchedRL selective sync is enabled (SCHEDRL_CONTROL_PLANE=schedrl).
+            # Must run before state_offload_manger offloads weights back to CPU.
+            if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+                # per_adapter_step is set by SchedRLMultiLoraPipeline.run() via meta_info["global_step"].
+                per_adapter_step = int(data.meta_info.get("global_step", 0))
+                checkpoint_version = int(data.meta_info.get("checkpoint_version", per_adapter_step))
+                valid_adapters = set((self.worker_config.model_args.adapters or {}).keys())
+                lora_arr = (data.non_tensor_batch or {}).get("lora_name")
+                if lora_arr is not None and valid_adapters:
+                    # Deduplicate while preserving order (dict.fromkeys trick).
+                    dirty = list(dict.fromkeys(
+                        s for s in (str(n) for n in lora_arr.tolist()) if s in valid_adapters
+                    ))
+                    for adapter in dirty:
+                        if callable(getattr(self.strategy, "_build_latest_bucket_cache", None)):
+                            self.strategy._build_latest_bucket_cache(
+                                checkpoint_version=checkpoint_version,
+                                global_step=per_adapter_step,
+                                adapter_name=adapter,
+                            )
             # Mirror train_step summary metrics so dashboards remain comparable in multi-LoRA mode.
             # For per-adapter optimizer mode, avoid using the top-level scheduler LR because it can
             # diverge from actual adapter schedulers; prefer active-adapter LR(s).
@@ -470,16 +491,18 @@ class InferWorker(Worker):
 
         assert getattr(self, "strategy", None) is not None, "worker has no strategy to load"
         if self.rank_info.dp_rank in target_dp_ranks:
-            # AST: AST_PRECONDITION(is_model_in_gpu is False) - verify strategy offloaded before load
             is_loaded = self._get_strategy_load_state()
-
-            assert is_loaded is False, (
-                    f"Pre-condition: strategy must be offloaded before load_states_partial, "
-                    f"got Worker {self.rank} (DP {self.rank_info.dp_rank}) is_model_in_gpu={is_loaded}"
+            if is_loaded:
+                # Already loaded — vllm_strategy.add_lora() set is_model_in_gpu=True because
+                # custom_add_lora calls load_states() on the worker before this point.
+                # Nothing to do; skip the no-op collective RPC.
+                self.logger.info(
+                    f"Worker {self.rank} (DP {self.rank_info.dp_rank}) "
+                    "load_states_partial: already loaded (add_lora preloaded), skipping"
                 )
-
-            await self.strategy.load_states()
-            self.logger.info(f"Worker {self.rank} (DP {self.rank_info.dp_rank}) loaded states")
+            else:
+                await self.strategy.load_states()
+                self.logger.info(f"Worker {self.rank} (DP {self.rank_info.dp_rank}) loaded states")
         else:
             self.logger.debug(f"Worker {self.rank} (DP {self.rank_info.dp_rank}) skipped load")
 

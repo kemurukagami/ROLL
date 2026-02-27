@@ -51,7 +51,7 @@ checkpoint_config:
 num_gpus_per_node: 2
 model_download_type: HUGGINGFACE_HUB
 offload_nccl: true
-max_steps: 5
+max_steps: 3
 save_steps: 10000
 logging_steps: 1
 eval_steps: 20

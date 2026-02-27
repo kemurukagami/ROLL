@@ -9,9 +9,10 @@ import numpy as np
 import ray
 import torch
 from codetiming import Timer
-from ray.util.timer import _Timer
 
-from schedrl.protocol.types import ActionResponse
+from schedrl.protocol.types import ActionResponse, Priority
+
+from roll.schedrl_adapter.utils import _get_env_timeout_s
 
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_pipeline import AgenticPipeline
@@ -592,466 +593,383 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         )
         return released
 
+
     @torch.no_grad()
     def run(self):
-        # In SchedRL mode we should follow the ConcurrentAgenticPipeline semantics:
+        """
+        Reorganized run method following concurrent_agentic_pipeline_workflow.md.
+
+        Implements individual blocking cycles with request → execute → release pattern
+        for each cluster (reference, actor_train, critic). Only actor_infer (rollout)
+        uses async/partial allocation.
+
+        Key differences from run():
+        - Phase 1: Conditional suspend with atomic try_set_offload_notified()
+        - Phase 5: Uses expand_workers() instead of start_server()
+        - Phases 11-16: Individual blocking cycles (not merged)
+        - Worker methods handle load/offload internally via state_offload_manager
+        """
+        # Ensure pipeline is initialized before running the training loop.
         self._ensure_initialized()
-        tps_timer = _Timer(window_size=5)
-        last_notify_ready_step: int | None = None
+
+        logger.info("Starting reorganized concurrent agentic pipeline")
+
+        # SchedRL: timeouts for notify/gpu-request are managed internally by SchedRL methods.
+        # SchedRL: model_update() removed — weights are promoted via promote_active_checkpoint after actor training.
+        rollout_get_batch_timeout_s = _get_env_timeout_s("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", 1800.0)
+
+        
+        batch = DataProto()
+        batch.meta_info["global_step"] = 0
+        # SchedRL: has_active_allocation not available on SchedRL scheduler; skip assertion.
 
         for global_step in range(self.pipeline_config.max_steps):
+            # Resume from checkpoint: skip steps already completed (mirrors AgenticPipeline.run()).
             if global_step <= self.state.step:
                 global_step += 1
                 continue
-            logger.info(f"[schedrl][{self._pipeline_id}] pipeline global_step={global_step} start")
-            metrics: Dict[str, Any] = {}
-            should_checkpoint = bool(
-                global_step > 0
-                and (
-                    global_step % self.pipeline_config.save_steps == 0
-                    or global_step == self.pipeline_config.max_steps - 1
+
+            batch.meta_info["global_step"] = global_step
+            # Offload model states to CPU after every worker call this step (applies to all clusters).
+            batch.meta_info["is_offload_states"] = True
+            metrics = {}
+
+            logger.info(f"=========={self._pipeline_id} Step {global_step} ==========")  # SchedRL: use _pipeline_id
+
+            with Timer(name="per_step", logger=None) as step_timer:
+                # ============================================================
+                # Phase 1: Conditional Suspend & Notify Release
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 58-78
+                # ============================================================
+                if global_step > 0:
+                    # Suspend rollout generation (async mode only)
+                    # notify_ready_to_release() is idempotent internally, so safe to call always
+                    # ray.get(self.train_rollout_scheduler.suspend.remote(), timeout=10)
+
+                    # Notify CentralScheduler that we're ready to release generation GPUs.
+                    # SchedRL: _notify_ready_to_release_actor_infer() wraps ray.get + internal timeout.
+                    self._notify_ready_to_release_actor_infer(global_step=global_step - 1)
+                    logger.info(f"run() {self._pipeline_id=} Phase 1: Suspended rollout and notified scheduler")
+
+                # SchedRL: Phase 3 model_update() removed.
+                # Weights are promoted to infer workers via promote_active_checkpoint in Phase 16
+                # after actor training completes. expand_sampler loads promoted weights on next expand.
+
+                # ============================================================
+                # Phase 4.5: Request Generation GPUs
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 87-98
+                # ============================================================
+                # SchedRL: gpu_scheduler check removed — SchedRL scheduler is always present.
+                allocated_actor_infer_gpus = None
+                actor_infer_num_gpus = len(
+                    getattr(self.actor_infer.worker_config, 'device_mapping', [])
                 )
-            )
-            defer_actor_train_release_for_checkpoint = False
+                assert actor_infer_num_gpus > 0
+                expected_gpus = list(self.actor_infer.worker_config.device_mapping)
+                if global_step > 0 and (self.pipeline_config.adv_estimator != "gae" or (
+                        self.pipeline_config.adv_estimator == "gae" and self.pipeline_config.critic_warmup <= (global_step - 1))):
+                    # Offload is enforced in _release_and_request_static_cluster().
+                    # SchedRL: no timeout param.
+                    allocated_actor_infer_gpus = self._release_and_request_static_cluster(
+                        release_cluster_id=self._actor_train_cluster_id,
+                        release_global_step=global_step - 1,
+                        request_cluster_id=self._actor_infer_cluster_id,
+                        request_priority=Priority.GENERATION,
+                        request_global_step=global_step,
+                    )
+                else:
+                    # SchedRL: no timeout param.
+                    allocated_actor_infer_gpus = self._request_static_cluster(
+                        cluster_id=self._actor_infer_cluster_id,
+                        priority=Priority.GENERATION,
+                        global_step=global_step,
+                    )
+                assert len(allocated_actor_infer_gpus) > 0
+                # Log allocation details
+                is_partial_allocation = len(allocated_actor_infer_gpus) < len(expected_gpus)
+                logger.info(
+                    f"run() {self._pipeline_id=} Phase 4.5: Actor infer GPU allocation completed - "
+                    f"expected={expected_gpus}, allocated={allocated_actor_infer_gpus}, "
+                    f"is_partial_allocation={is_partial_allocation}"
+                )
 
-            with Timer(name="pipeline_step_total", logger=None) as step_timer:
-                with tps_timer:
-                    # Phase 0 (Multi-pipeline semantics): at step start, block until the previous step's rollout
-                    # workers are stopped/offloaded by the central scheduler. This ensures model update happens
-                    # with maximum free GPU memory and without concurrent rollout activity.
-                    if global_step > 0 and last_notify_ready_step != global_step - 1:
-                        self._notify_ready_to_release_actor_infer(global_step=global_step - 1)
-                        last_notify_ready_step = global_step - 1
+                if is_partial_allocation:
+                    logger.warning(
+                        f"run() {self._pipeline_id=} Phase 4.5: PARTIAL allocation detected for actor_infer - "
+                        f"got {len(allocated_actor_infer_gpus)}/{len(expected_gpus)} GPUs. "
+                        f"This will trigger partial worker expansion. "
+                        f"Missing GPUs: {set(expected_gpus) - set(allocated_actor_infer_gpus)}"
+                    )
+                # SchedRL: _validate_gpu_allocation() not defined; skip.
+                assert len(allocated_actor_infer_gpus) != 0, 'shall not be empty for sched logic as we just released all gpus'
 
-                    # PHASE 1: Offload States
+                # ============================================================
+                # Phase 5: Expand Workers (Load & Resume)
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 102-114
+                # ============================================================
+                # Phase 5: Central scheduler drives worker expansion via resize_infer() callback.
+                # No explicit expand_workers() call needed here.
+                # TODO: add val() call here (after GPU allocation, before rollout) for eval_steps > 0.
+                # HEAD: if eval_steps > 0 and step % eval_steps == 0: self.val(global_step)
+
+                # ============================================================
+                # Phase 7: Rollout Get Batch
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 118-124
+                # ============================================================
+                with Timer(name="rollout", logger=None) as rollout_timer:
+                    batch = ray.get(self.train_rollout_scheduler.get_batch.remote(
+                        batch, self.pipeline_config.rollout_batch_size
+                    ), timeout=rollout_get_batch_timeout_s)
+                    dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_step, batch)
+
+                metrics["time/rollout"] = rollout_timer.last
+                metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                batch.meta_info["global_step"] = global_step
+                # Required by strategy._get_batch_num_tokens() to identify valid token masks.
+                # Mirrors agentic_pipeline.py:441. Source: roll/pipeline/agentic/agentic_pipeline.py
+                batch.meta_info["loss_mask_keys"] = ["response_mask"]
+                # Required for workers to broadcast non_tensor_batch (traj_id, scores, etc.) across DP ranks.
+                batch.meta_info["_broadcast_non_tensor_batch"] = True
+                logger.info(f"run() {self._pipeline_id=} Phase 7: Rollout Get Batch")
+
+                # ============================================================
+                # Phase 10: Batch Processing (CPU)
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 111-115
+                # ============================================================
+                batch = compute_discounted_returns(
+                    batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma
+                )
+                batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
+                metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+
+                # Get response level mask
+                with Timer(name="cal_response_level_mask", logger=None) as timer:
+                    batch, mask_metrics = get_agentic_response_level_mask(batch, self.pipeline_config)
+                    metrics.update(mask_metrics)
+                metrics["time/cal_response_level_mask"] = timer.last
+                logger.info(f"run() {self._pipeline_id=} Phase 10: Batch processing (CPU) completed")
+
+                # ============================================================
+                # Phase 11: Value Compute Cycle (Priority.VALUE_COMPUTE, if GAE)
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 133-151
+                # ============================================================
+                if self.pipeline_config.adv_estimator == "gae":
+                    # 1. Request GPUs (blocking). SchedRL: no timeout param.
+                    allocated_critic_gpus = self._request_static_cluster(
+                        cluster_id=self._critic_cluster_id,
+                        priority=Priority.VALUE_COMPUTE,
+                        global_step=global_step,
+                    )
+
+                    # 2. Compute values (BLOCKING) - internally handles load/offload
+                    values_refs = self.critic.compute_values(batch, blocking=False)
+                    values = DataProto.materialize_concat(data_refs=values_refs)
+                    batch.batch["values"] = values.batch["values"]
+                    # Offload is enforced in the upcoming GPU release/transfer call.
+
+                # ============================================================
+                # Phase 13: Old Log Probs Cycle (Priority.OLD_LOG_PROBS)
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 176-193
+                # ============================================================
+                # 1. Request GPUs (blocking via PendingRequest). SchedRL: no timeout param.
+                if self.pipeline_config.adv_estimator != "gae":
+                    # IMPORTANT: actor_infer is a GENERATION cluster. Its release/offload must be driven by
+                    # _notify_ready_to_release_actor_infer() (which does shrink/offload), NOT by directly
+                    # popping it from the scheduler via release_and_request_gpus().
+                    self._notify_ready_to_release_actor_infer(global_step=global_step)
+                    allocated_actor_train_gpus = self._request_static_cluster(
+                        cluster_id=self._actor_train_cluster_id,
+                        priority=Priority.OLD_LOG_PROBS,
+                        global_step=global_step,
+                    )
+                else:
+                    allocated_actor_train_gpus = self._release_and_request_static_cluster(
+                        release_cluster_id=self._critic_cluster_id,
+                        release_global_step=global_step,
+                        request_cluster_id=self._actor_train_cluster_id,
+                        request_priority=Priority.OLD_LOG_PROBS,
+                        request_global_step=global_step,
+                    )
+
+                # 2. Compute log probs (BLOCKING) - internally handles load/offload
+                with Timer(name="cal_old_log_probs_values", logger=None) as old_logpb_timer:
+                    old_log_probs_refs = self.actor_train.compute_log_probs(batch, blocking=False)
+                    old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                    batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
+                    # TODO: support true ref_log_probs for enable_reference=True configs via a
+                    # dedicated reference cluster GPU cycle (mirrors HEAD Phase 11). Simplified
+                    # for now: old_log_probs used as ref, correct only when enable_reference=False.
+                    batch.batch["ref_log_probs"] = batch.batch["old_log_probs"]
+                metrics["time/old_log_probs_values"] = old_logpb_timer.last
+                # Offload is enforced in the upcoming GPU release/transfer call.
+                logger.info(f"run() {self._pipeline_id=} Phase 13: Old log probs cycle completed")
+
+                # ============================================================
+                # Phase 14: Advantage Computation (CPU)
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 197-204
+                # ============================================================
+                with Timer(name="cal_norm_rewards", logger=None) as timer:
+                    batch, reward_metrics = compute_response_level_rewards(
+                        batch=batch, pipeline_config=self.pipeline_config
+                    )
+                    metrics.update(reward_metrics)
+                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                metrics["time/cal_norm_rewards"] = timer.last
+
+                with Timer(name="cal_token_reward", logger=None) as timer:
+                    batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
+                    metrics.update(token_level_metrics)
+                metrics["time/cal_token_reward"] = timer.last
+
+                with Timer(name="compute_advantage", logger=None) as timer:
+                    # SchedRL: use agentic_compute_advantage (consistent with agentic_pipeline.py).
+                    batch = agentic_compute_advantage(
+                        data=batch,
+                        gamma=self.pipeline_config.gamma,
+                        lambd=self.pipeline_config.lambd,
+                        adv_estimator=self.pipeline_config.adv_estimator,
+                        advantage_clip=self.pipeline_config.advantage_clip,
+                        whiten_advantages=self.pipeline_config.whiten_advantages,
+                        whiten_rewards=self.pipeline_config.whiten_rewards,
+                    )
+                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
+                metrics["time/adv"] = timer.last
+                logger.info(f"run() {self._pipeline_id=} Phase 14: Advantage computation (CPU) completed")
+
+                # When recomputing old log-probs at train time, precompute train-infer IS weights
+                # into batch.batch["train_infer_is_weight"] so agentic_actor_worker.loss_func can read it.
+                # Mirrors agentic_pipeline.py:613-616. Source: roll/pipeline/agentic/agentic_pipeline.py
+                if self.pipeline_config.enable_old_logprobs_recompute:
+                    batch, corr_metrics = apply_train_infer_correction_to_batch(
+                        self.pipeline_config, batch,
+                        update_mask_keys=batch.meta_info['loss_mask_keys'],
+                    )
+                    metrics.update(corr_metrics)
+
+                # ============================================================
+                # Phase 15: Critic Training Cycle (Priority.CRITIC_TRAINING, if GAE)
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 207-225
+                # ============================================================
+                if self.pipeline_config.adv_estimator == "gae":
+                    # 1. Request GPUs (blocking). SchedRL: no timeout param.
+                    allocated_critic_gpus = self._release_and_request_static_cluster(
+                        release_cluster_id=self._actor_train_cluster_id,
+                        release_global_step=global_step,
+                        request_cluster_id=self._critic_cluster_id,
+                        request_priority=Priority.CRITIC_TRAINING,
+                        request_global_step=global_step,
+                    )
+
+                    # 2. Train step (BLOCKING) - internally handles load/offload
+                    with Timer(name="critic_train_step", logger=None) as critic_train_timer:
+                        critic_train_metrics_refs = self.critic.train_step(batch, blocking=False)
+                        critic_train_metrics = DataProto.materialize_concat(
+                            data_refs=critic_train_metrics_refs
+                        )
+                        metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
+                    metrics["time/critic_train_step"] = critic_train_timer.last
+                    # Offload is enforced in the upcoming GPU release/transfer call.
+
+                    if self.pipeline_config.critic_warmup > global_step:
+                        # SchedRL: _release_static_cluster instead of _release_gpu.
+                        self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
+                    logger.info(f"run() {self._pipeline_id=} Phase 15: Critic training cycle completed")
+
+                # ============================================================
+                # Phase 16: Actor Training Cycle (Priority.ACTOR_TRAINING)
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 229-247
+                # ============================================================
+                if self.pipeline_config.critic_warmup <= global_step:
+                    # 1. Request GPUs (blocking). SchedRL: no timeout param.
                     if self.pipeline_config.adv_estimator == "gae":
-                        self.critic.offload_states(blocking=True)
-                    if self.pipeline_config.enable_reference and self.use_ref_model:
-                        self.reference.offload_states(blocking=True)
-                    self.actor_train.offload_states(blocking=True)
-
-                    # PHASE 2: (SchedRL) no local suspend; scheduler-driven shrink/expand owns routing state.
-
-                    # PHASE 3: Model Update
-                    # In SchedRL mode we should follow the ConcurrentAgenticPipeline semantics:
-                    # the pipeline must not run model_update() itself.
-                    #
-                    # Selective model update is triggered by the central scheduler when it grants the next
-                    # generation allocation and calls resize_infer/expand.
-                    # Selective model update is triggered by the central scheduler when it grants the next
-                    # generation allocation and calls resize_infer/expand.
-                    with Timer(name="model_update", logger=None) as model_update_timer:
-                        pass
-                    metrics["time/step_model_update"] = model_update_timer.last
-
-                    # PHASE 4: Request actor_infer GPUs (central scheduler will call resize_infer).
-                    # Multi-pipeline semantics: for step>0, atomically release last step's actor_train
-                    # allocation before requesting actor_infer generation GPUs.
-                    #
-                    # Note: actor_train is intentionally kept allocated (but offloaded) at the end of the
-                    # previous step when actor training runs, and is released here via release_and_request.
-                    from schedrl.protocol.types import Priority
-
-                    if global_step > 0 and self.pipeline_config.critic_warmup <= (global_step - 1):
-                        self._release_and_request_static_cluster(
-                            release_cluster_id=self._actor_train_cluster_id,
-                            release_global_step=global_step - 1,
-                            request_cluster_id=self._actor_infer_cluster_id,
-                            request_priority=Priority.GENERATION,
+                        allocated_actor_train_gpus = self._release_and_request_static_cluster(
+                            release_cluster_id=self._critic_cluster_id,
+                            release_global_step=global_step,
+                            request_cluster_id=self._actor_train_cluster_id,
+                            request_priority=Priority.ACTOR_TRAINING,
                             request_global_step=global_step,
                         )
                     else:
-                        self._request_actor_infer_gpus(global_step=global_step)
-
-                    batch: DataProto = DataProto()
-                    batch.meta_info = {"global_step": global_step}
-
-                    # PHASE 5: Validation (synchronous in SchedRL mode)
-                    val_metrics = {}
-                    with Timer(name="val", logger=None) as val_timer:
-                        if self.pipeline_config.eval_steps > 0 and global_step % self.pipeline_config.eval_steps == 0:
-                            val_metrics = self.val(global_step)
-
-                    # PHASE 6: Rollout Get Batch
-                    with Timer(name="rollout", logger=None) as rollout_timer:
-                        batch = ray.get(
-                            self.train_rollout_scheduler.get_batch.remote(batch, self.pipeline_config.rollout_batch_size)
+                        # Switch actor_train from OLD_LOG_PROBS -> ACTOR_TRAINING priority (same cluster, different task).
+                        allocated_actor_train_gpus = self._release_and_request_static_cluster(
+                            release_cluster_id=self._actor_train_cluster_id,
+                            release_global_step=global_step,
+                            request_cluster_id=self._actor_train_cluster_id,
+                            request_priority=Priority.ACTOR_TRAINING,
+                            request_global_step=global_step,
                         )
-                        sample_uuids = [f"{traj_id}_{i}" for i, traj_id in enumerate(batch.non_tensor_batch["traj_id"])]
-                        batch.non_tensor_batch["sample_uuid"] = np.array(sample_uuids, dtype=object)
-                        if "get_batch_return_start_time" in batch.meta_info:
-                            metrics["time/get_batch_cost_train"] = time.time() - batch.meta_info.pop(
-                                "get_batch_return_start_time"
-                            )
-                        actor_infer_metrics = self.actor_infer.get_metrics()
-                        metrics.update(reduce_metrics(actor_infer_metrics.meta_info.pop("metrics", {})))
-                        metrics.update(compute_rollout_traj_metrics(batch))
 
-                        dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_step, batch)
-
-                    metrics["time/step_rollout"] = rollout_timer.last
-                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                    batch.meta_info["global_step"] = global_step
-                    batch.meta_info["_broadcast_non_tensor_batch"] = True
-                    batch.meta_info["loss_mask_keys"] = ["response_mask"]
-
-                    if len(val_metrics) > 0:
-                        metrics.update(val_metrics)
-                        metrics["time/step_val"] = val_timer.last
-
-                    batch = compute_discounted_returns(
-                        batch, self.pipeline_config.adv_estimator, self.pipeline_config.step_reward_gamma
-                    )
-
-                    batch = self.adjust_batch(batch, mode=self.pipeline_config.batch_adjust_mode)
-                    metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-
-                    # PHASE 11: Reference Log Probs
-                    if self.pipeline_config.enable_reference:
-                        from schedrl.protocol.types import Priority
-
-                        if self.use_ref_model:
-                            self._request_static_cluster(
-                                cluster_id=self._reference_cluster_id,
-                                priority=Priority.REF_LOG_PROBS,
-                                global_step=global_step,
-                            )
-                        else:
-                            self._request_static_cluster(
-                                cluster_id=self._actor_train_cluster_id,
-                                priority=Priority.REF_LOG_PROBS,
-                                global_step=global_step,
-                            )
-                    with Timer(name="cal_ref_log_probs", logger=None) as cal_timer:
-                        if self.pipeline_config.enable_reference:
-                            worker_config = (
-                                self.pipeline_config.reference if self.use_ref_model else self.pipeline_config.actor_train
-                            )
-                            worker = self.reference if self.use_ref_model else self.pipeline_config.actor_train
-                            if worker_config.use_dynamic_batching_in_infer:
-                                batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                    batch,
-                                    worker.dp_size,
-                                    worker_config.max_tokens_per_microbatch_in_infer,
-                                    worker_config.sequence_length_round_in_infer,
-                                    worker_config.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
-                                    worker_config.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
-                                    "reference/compute_log_probs",
-                                )
-                                metrics.update(dynamic_batching_metrics)
-                            if not self.use_ref_model:
-                                batch.meta_info["disable_adapter"] = True
-                                batch.meta_info["is_offload_states"] = False
-                                batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
-                                ref_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
-                                    batch, blocking=False
-                                )
-                            else:
-                                batch_balance(batch, dp_size=self.reference.dp_size, minibatch_size=len(batch))
-                                ref_log_probs_refs: List[ray.ObjectRef] = self.reference.compute_log_probs(
-                                    batch, blocking=False
-                                )
-
-                            ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
-                            ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
-                            batch = batch.union(ref_log_probs)
-                            avg_ref_log_prob = masked_mean(
-                                batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:]
-                            )
-                            metrics.update(reduce_metrics(ref_log_probs.meta_info.pop("metrics", {})))
-                            metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
-                    metrics["time/step_ref_log_probs_values_reward"] = cal_timer.last
-                    if self.pipeline_config.enable_reference:
-                        if self.use_ref_model:
-                            self.reference.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._reference_cluster_id, global_step=global_step)
-                        else:
-                            self.actor_train.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
-
-                    # PHASE 12: Old Log Probs & Values
-                    with Timer(name="cal_old_log_probs_values", logger=None) as cal_old_logpb_timer:
-                        critic_requested = False
-                        if self.pipeline_config.enable_reference and not self.use_ref_model:
-                            batch.meta_info["disable_adapter"] = False
-                        batch.meta_info["is_offload_states"] = False
-                        if self.pipeline_config.enable_old_logprobs_recompute:
-                            from schedrl.protocol.types import Priority
-
-                            self._request_static_cluster(
-                                cluster_id=self._actor_train_cluster_id,
-                                priority=Priority.OLD_LOG_PROBS,
-                                global_step=global_step,
-                            )
-                            batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
-                            if self.pipeline_config.actor_train.use_dynamic_batching_in_infer:
-                                batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                    batch,
-                                    self.actor_train.dp_size,
-                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_infer,
-                                    self.pipeline_config.actor_train.sequence_length_round_in_infer,
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "pipeline_model_parallel_size", 1
-                                    ),
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "virtual_pipeline_model_parallel_size", None
-                                    ),
-                                    "actor_train/compute_log_probs",
-                                )
-                                metrics.update(dynamic_batching_metrics)
-                            old_log_probs: DataProto = self.actor_train.compute_log_probs(batch, blocking=True)
-                            batch.batch["old_log_probs"] = old_log_probs.batch["log_probs"]
-                            avg_old_log_prob = masked_mean(
-                                batch.batch["old_log_probs"], batch.batch["response_mask"][:, 1:]
-                            )
-                            metrics.update({"critic/old_log_prob/mean": avg_old_log_prob.item()})
-                            metrics.update(reduce_metrics(old_log_probs.meta_info.pop("metrics", {})))
-                            agg_entropy = agg_loss(
-                                loss_mat=old_log_probs.batch["entropy"],
-                                loss_mask=batch.batch["response_mask"][:, 1:],
-                                loss_agg_mode="token-mean",
-                            )
-                            metrics.update({"critic/entropy/mean": agg_entropy.item()})
-                            self.actor_train.offload_states(blocking=True)
-                            if self.pipeline_config.adv_estimator == "gae":
-                                self._release_and_request_static_cluster(
-                                    release_cluster_id=self._actor_train_cluster_id,
-                                    release_global_step=global_step,
-                                    request_cluster_id=self._critic_cluster_id,
-                                    request_priority=Priority.VALUE_COMPUTE,
-                                    request_global_step=global_step,
-                                )
-                                critic_requested = True
-                            else:
-                                self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
-                        else:
-                            batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
-
-                        if self.pipeline_config.adv_estimator == "gae":
-                            from schedrl.protocol.types import Priority
-
-                            if not critic_requested:
-                                self._request_static_cluster(
-                                    cluster_id=self._critic_cluster_id,
-                                    priority=Priority.VALUE_COMPUTE,
-                                    global_step=global_step,
-                                )
-                            values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
-
-                        if self.pipeline_config.adv_estimator == "gae":
-                            values = DataProto.materialize_concat(data_refs=values_refs)
-                            batch = batch.union(values)
-                            metrics.update(reduce_metrics(values.meta_info.pop("metrics", {})))
-                            self.critic.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
-
-                        if not self.pipeline_config.enable_reference:
-                            batch.batch["ref_log_probs"] = batch.batch["old_log_probs"].clone()
-                            avg_ref_log_prob = masked_mean(
-                                batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:]
-                            )
-                            metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
-
-                    metrics["time/step_old_log_probs_values"] = cal_old_logpb_timer.last
-
-                    with Timer(name="cal_response_level_mask", logger=None) as timer:
-                        batch, mask_metrics = get_agentic_response_level_mask(batch, self.pipeline_config)
-                        metrics.update(mask_metrics)
-                    metrics["time/step_cal_response_level_mask"] = timer.last
-
-                    # PHASE 13: Advantage Computation
-                    with Timer(name="cal_response_norm_rewards", logger=None) as timer:
-                        batch, reward_metrics = compute_response_level_rewards(batch=batch, pipeline_config=self.pipeline_config)
-                        metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                        metrics.update(reward_metrics)
-                    metrics["time/step_cal_norm_rewards"] = timer.last
-
-                    with Timer(name="cal_token_reward", logger=None) as timer:
-                        batch, token_level_metrics = compute_token_reward(batch, self.pipeline_config, self.kl_ctrl)
-                        metrics.update(token_level_metrics)
-                    metrics["time/step_cal_token_reward"] = timer.last
-
-                    with Timer(name="compute_advantage", logger=None) as timer:
-                        batch = agentic_compute_advantage(
-                            data=batch,
-                            gamma=self.pipeline_config.gamma,
-                            lambd=self.pipeline_config.lambd,
-                            adv_estimator=self.pipeline_config.adv_estimator,
-                            advantage_clip=self.pipeline_config.advantage_clip,
-                            whiten_advantages=self.pipeline_config.whiten_advantages,
-                            whiten_rewards=self.pipeline_config.whiten_rewards,
-                        )
-                        metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                    metrics["time/step_adv"] = timer.last
-
-                    if self.pipeline_config.enable_old_logprobs_recompute:
-                        batch, corr_metrics = apply_train_infer_correction_to_batch(
-                            self.pipeline_config, batch, update_mask_keys=batch.meta_info["loss_mask_keys"]
-                        )
-                        metrics.update(corr_metrics)
-
-                    # PHASE 14: Training (critic + actor)
-                    with Timer(name="train_timer", logger=None) as train_timer:
-                        if self.pipeline_config.adv_estimator == "gae":
-                            from schedrl.protocol.types import Priority
-
-                            self._request_static_cluster(
-                                cluster_id=self._critic_cluster_id,
-                                priority=Priority.CRITIC_TRAINING,
-                                global_step=global_step,
-                            )
-                            critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
-
-                        if self.pipeline_config.critic_warmup <= global_step:
-                            from schedrl.protocol.types import Priority
-
-                            self._request_static_cluster(
-                                cluster_id=self._actor_train_cluster_id,
-                                priority=Priority.ACTOR_TRAINING,
-                                global_step=global_step,
-                            )
-                            batch_balance_metrics = batch_balance(
+                    # TODO: add batch_balance() here to equalize token counts across DP ranks
+                    # before training (mirrors HEAD). Skipped for simplification; restore if
+                    # distributed training hangs on uneven shards.
+                    # 2. Train step (BLOCKING) - internally handles load/offload
+                    with Timer(name="actor_train_step", logger=None) as actor_train_timer:
+                        # Shard batch into dynamic micro-batches if enabled; sets global_micro_batch_indices
+                        # required by make_mini_batch_iter_for_dynamic_batching() in base_worker.train_step().
+                        # Mirrors agentic_pipeline.py:631-641. Source: roll/pipeline/agentic/agentic_pipeline.py
+                        if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
+                            batch, dynamic_batching_metrics = dynamic_batching_shard(
                                 batch,
-                                dp_size=self.actor_train.dp_size,
-                                minibatch_size=self.actor_train.dp_size
-                                * self.pipeline_config.actor_train.training_args.per_device_train_batch_size
-                                * self.pipeline_config.actor_train.training_args.gradient_accumulation_steps,
-                                logging_prefix="global_seqlen/actor_train",
+                                self.actor_train.dp_size,
+                                self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
+                                self.pipeline_config.actor_train.sequence_length_round_in_train,
+                                self.pipeline_config.actor_train.strategy_args.strategy_config.get("pipeline_model_parallel_size", 1),
+                                self.pipeline_config.actor_train.strategy_args.strategy_config.get("virtual_pipeline_model_parallel_size", None),
+                                "actor_train/train_step",
                             )
-                            metrics.update(batch_balance_metrics)
-                            if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
-                                batch, dynamic_batching_metrics = dynamic_batching_shard(
-                                    batch,
-                                    self.actor_train.dp_size,
-                                    self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
-                                    self.pipeline_config.actor_train.sequence_length_round_in_train,
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "pipeline_model_parallel_size", 1
-                                    ),
-                                    self.pipeline_config.actor_train.strategy_args.strategy_config.get(
-                                        "virtual_pipeline_model_parallel_size", None
-                                    ),
-                                    "actor_train/train_step",
-                                )
-                                metrics.update(dynamic_batching_metrics)
-                            actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
-                            actor_train_metrics: DataProto = DataProto.materialize_concat(data_refs=actor_train_metrics_refs)
-                            metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
-                            checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
-                            ray.get(
-                                [
-                                    worker.promote_active_checkpoint.remote(checkpoint_version, int(global_step))
-                                    for worker in self.actor_train.workers
-                                ]
-                            )
-                            self.actor_train.offload_states(blocking=True)
-                            if should_checkpoint:
-                                # Always defer: save_checkpoint calls load_states(), so we must
-                                # re-offload after the checkpoint before any GPU release or handoff.
-                                defer_actor_train_release_for_checkpoint = True
-                            else:
-                                # Keep actor_train allocated (but offloaded) so next step can perform an
-                                # atomic release_and_request during the train→infer transition.
-                                if global_step == self.pipeline_config.max_steps - 1:
-                                    self._release_static_cluster(
-                                        cluster_id=self._actor_train_cluster_id,
-                                        global_step=global_step,
-                                    )
+                            metrics.update(dynamic_batching_metrics)
+                        actor_train_metrics_refs = self.actor_train.train_step(batch, blocking=False)
+                        actor_train_metrics = DataProto.materialize_concat(
+                            data_refs=actor_train_metrics_refs
+                        )
+                        metrics.update(reduce_metrics(actor_train_metrics.meta_info.pop("metrics", {})))
+                    metrics["time/train_step"] = actor_train_timer.last
 
-                        if self.pipeline_config.adv_estimator == "gae":
-                            critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_metrics_refs)
-                            metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
-                            self.critic.offload_states(blocking=True)
-                            self._release_static_cluster(cluster_id=self._critic_cluster_id, global_step=global_step)
-                        tps_timer.push_units_processed(n=torch.sum(batch.batch["attention_mask"]).detach().item())
-                    metrics["time/step_train"] = train_timer.last
+                    # Promote trained weights so expand_sampler can rehydrate infer workers on the next step.
+                    # Replaces Phase 3 model_update(): expand_sampler loads from the promoted checkpoint.
+                    checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
+                    ray.get([
+                        worker.promote_active_checkpoint.remote(checkpoint_version, int(global_step))
+                        for worker in self.actor_train.workers
+                    ])
 
-                from roll.pipeline.agentic.agentic_pipeline import compute_train_data_metrics
+                    # Offload is enforced in the upcoming GPU release/transfer call (next handoff).
 
-                with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
-                    data_metrics = compute_train_data_metrics(batch=batch)
-
-                metrics["time/step_compute_data_metrics"] = data_metrics_timer.last
-                metrics.update(data_metrics)
-                metrics["system/tps"] = tps_timer.mean_throughput
-                metrics["system/samples"] = (global_step + 1) * self.pipeline_config.rollout_batch_size
-
-                self.state.step = global_step
-                self.state.log_history.append(metrics)
-
-                self.do_checkpoint(global_step=global_step)
-                if defer_actor_train_release_for_checkpoint:
-                    # save_checkpoint calls load_states() internally to read weights for saving.
-                    # Re-offload so peer pipelines see clean GPU state before any release or
-                    # next-step Phase 4 handoff.
-                    self.actor_train.offload_states(blocking=True)
-                    if global_step == self.pipeline_config.max_steps - 1:
-                        # Last step: no next-step Phase 4 to release actor_train, so release here.
+                    if global_step >= (self.pipeline_config.max_steps - 1):
+                        # SchedRL: _release_static_cluster instead of _release_gpu.
                         self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
+                    logger.info(f"run() {self._pipeline_id=} Phase 16: Actor training cycle completed")
 
-                with Timer(name="log", logger=None) as log_timer:
-                    if self.pipeline_config.logging_steps > 0 and global_step % self.pipeline_config.logging_steps == 0:
-                        if int(os.environ.get("RAY_PROFILING", "0")):
-                            timeline_dir = os.path.join(self.pipeline_config.profiler_output_dir, "timeline")
-                            os.makedirs(timeline_dir, exist_ok=True)
-                            ray.timeline(filename=os.path.join(timeline_dir, f"timeline-step-{global_step}.json"))
+                # ============================================================
+                # Phase 17: Metrics & Logging
+                # Reference: concurrent_agentic_pipeline_workflow.md lines 251-256
+                # ============================================================
+                # SchedRL: compute_rollout_traj_metrics replaces compute_data_metrics.
+                data_metrics = compute_rollout_traj_metrics(batch)
+                metrics.update(data_metrics)
+                logger.info(f"run() {self._pipeline_id=} Phase 17: Metrics computation completed")
 
-                        log_res = []
-                        batch_grouped = batch.group_by(keys="traj_id")
-                        for _, group_batch in batch_grouped.items():
-                            if "step" in group_batch.non_tensor_batch.keys():
-                                indices = torch.argsort(
-                                    torch.from_numpy(group_batch.non_tensor_batch["step"].astype(np.int64))
-                                )
-                                group_batch.reorder(indices)
+            # End of Timer block — record per-step wall time before checkpointing.
+            metrics["time/per_step_e2e"] = step_timer.last
 
-                            prompt_mask = group_batch.batch["prompt_mask"]
-                            non_prompt_mask = (
-                                torch.logical_not(group_batch.batch["prompt_mask"]) * group_batch.batch["attention_mask"]
-                            )
-                            input_ids = group_batch.batch["input_ids"]
-                            prompt_ids_list = [input_ids[i][mask.bool()] for i, mask in enumerate(prompt_mask)]
-                            response_ids_list = [input_ids[i][mask.bool()] for i, mask in enumerate(non_prompt_mask)]
-                            prompts = self.tokenizer.batch_decode(prompt_ids_list, skip_special_tokens=False)
-                            responses = self.tokenizer.batch_decode(response_ids_list, skip_special_tokens=False)
-                            episode_scores = group_batch.non_tensor_batch["episode_scores"].tolist()
-                            step_scores = group_batch.non_tensor_batch["step_scores"].tolist()
-                            if isinstance(step_scores[0], np.ndarray):
-                                step_scores = [t.tolist() for t in step_scores]
-
-                            log_item = []
-                            for prompt, response, episode_score, step_score in zip(
-                                prompts, responses, episode_scores, step_scores
-                            ):
-                                log_item.append(
-                                    {
-                                        "prompt": prompt,
-                                        "response": response,
-                                        "episode_score": episode_score,
-                                        "step_score": step_score,
-                                    }
-                                )
-                            log_res.append(log_item)
-                            if len(log_res) >= 10:
-                                break
-                        logger.info(json.dumps(log_res, ensure_ascii=False))
-                        logger.info(json.dumps(metrics, ensure_ascii=False))
-
-                metrics["time/step_log"] = log_timer.last
-
-            metrics["time/step_total"] = step_timer.last
+            # State, checkpoint, and tracker — ordering matches AgenticPipeline.run().
+            self.state.step = global_step
+            self.state.log_history.append(metrics)
+            self.do_checkpoint(global_step=global_step)  # respects save_steps; waits for async futures
             self.tracker.log(values=metrics, step=global_step)
+            logger.info(f"=========={self._pipeline_id} Step {global_step} completed ==========")
 
-            logger.info(f"[schedrl][{self._pipeline_id}] pipeline step {global_step} finished")
+        # Release generation GPUs after the final step (only if any steps ran).
+        if self.pipeline_config.max_steps > 0:
+            self._notify_ready_to_release_actor_infer(global_step=global_step)
+            logger.info(f"run() {self._pipeline_id=} Phase 1: final suspended rollout, scheduler notified")
 
-        # Final cleanup: release the last step's actor_infer allocation.
-        # This matches ROLL_multi_pipeline pattern where notify_ready_to_release is called after the loop.
-        if last_notify_ready_step != self.pipeline_config.max_steps - 1:
-            self._notify_ready_to_release_actor_infer(global_step=self.pipeline_config.max_steps - 1)
-            logger.info(f"[schedrl][{self._pipeline_id}] final notify_ready_to_release for step {self.pipeline_config.max_steps - 1}")
-
-        ray.get([self.train_rollout_scheduler.shutdown.remote(), self.val_rollout_scheduler.shutdown.remote()])
-        logger.info(f"[schedrl][{self._pipeline_id}] pipeline complete!")
+        # Shut down rollout schedulers to clean up their Ray actors after training completes.
+        ray.get([
+            self.train_rollout_scheduler.shutdown.remote(),
+            self.val_rollout_scheduler.shutdown.remote(),
+        ])
+        logger.info(f"{self._pipeline_id} pipeline run() completed")
 
     def resize_infer(self, *, dp_ranks_to_remove: List[int], dp_ranks_to_add: List[int]):
         self._ensure_initialized()

@@ -82,11 +82,11 @@ actor_train:
     dtype: bf16
     model_type: ~
     adapters:
-      SimpleSokoban:
+      Sokoban3:
         lora_target: all-linear
         lora_rank: 8
         lora_alpha: 8
-      LargerSokoban:
+      Sokoban4:
         lora_target: all-linear
         lora_rank: 8
         lora_alpha: 8
@@ -122,11 +122,11 @@ actor_infer:
     disable_gradient_checkpointing: true
     dtype: bf16
     adapters:
-      SimpleSokoban:
+      Sokoban3:
         lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
         lora_rank: 8
         lora_alpha: 8
-      LargerSokoban:
+      Sokoban4:
         lora_target: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
         lora_rank: 8
         lora_alpha: 8
@@ -185,20 +185,20 @@ train_env_manager:
   max_env_num_per_worker: 4
   num_env_groups: 2
   group_size: 2
-  tags: [SimpleSokoban, LargerSokoban]
+  tags: [Sokoban3, Sokoban4]
   num_groups_partition: [1, 1]
 
 val_env_manager:
   max_env_num_per_worker: 4
   num_env_groups: 2
   group_size: 2
-  tags: [SimpleSokoban, LargerSokoban]
+  tags: [Sokoban3, Sokoban4]
   num_groups_partition: [1, 1]
 
 max_tokens_per_step: 64
 
 custom_envs:
-  SimpleSokoban:
+  Sokoban3:
     ${custom_env.SimpleSokoban}
-  LargerSokoban:
-    ${custom_env.LargerSokoban}
+  Sokoban4:
+    ${custom_env.SimpleSokoban}

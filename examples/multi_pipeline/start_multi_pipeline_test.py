@@ -111,6 +111,17 @@ def _cluster_registry_inputs(*, pipeline_config: Any) -> tuple[Dict[str, int], D
     return cluster_tp_configs, cluster_device_mappings
 
 
+def _pipeline_type(pipeline_config: Any) -> str:
+    """Return 'lora' if the config has LoRA adapters configured, else 'ft'.
+
+    Mirrors the same adapter detection used in SchedRLAdapter.create_coordinator().
+    Source: external/ROLL_schedrl/roll/schedrl_adapter/adapter.py:180-187
+    """
+    adapters = getattr(getattr(pipeline_config, "actor_train", None), "model_args", None)
+    adapters = getattr(adapters, "adapters", None) if adapters is not None else None
+    return "lora" if adapters else "ft"
+
+
 def main() -> None:
     repo_root, roll_root = _ensure_import_paths()
 
@@ -222,7 +233,8 @@ def main() -> None:
 
     pipeline_ids: List[str] = []
     for pipeline_config in pipeline_configs:
-        pipeline_id = ray.get(orchestrator.allocate_pipeline_id.remote())
+        # Pass the pipeline type so the id is prefixed "ft_" or "lora_" for trace readability.
+        pipeline_id = ray.get(orchestrator.allocate_pipeline_id.remote(_pipeline_type(pipeline_config)))
         pipeline_ids.append(str(pipeline_id))
 
     for i, (pipeline_id, pipeline_config) in enumerate(zip(pipeline_ids, pipeline_configs)):

@@ -417,7 +417,7 @@ class ActorWorker(Worker):
         return total_loss, pg_metrics
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    def do_checkpoint(self, global_step, is_last_step=None):
+    def do_checkpoint(self, global_step, is_last_step=None, offload_after_checkpoint: bool = False):
         if self.worker_config.offload_nccl:
             reload_process_groups()
         with Timer("do_checkpoint") as total_timer:
@@ -431,6 +431,10 @@ class ActorWorker(Worker):
             exec_metrics: Dict = self.strategy.save_checkpoint(
                 save_dir, global_step, ckpt_id, is_last_step=is_last_step
             )
+            # Offload all states (model + optimizer) reloaded during save_checkpoint so GPU
+            # memory is fully released before the caller returns the GPU to the scheduler.
+            if offload_after_checkpoint:
+                self.strategy.offload_states()
 
         metrics = {
             f"time/{self.cluster_name}/do_checkpoint/total": total_timer.last,

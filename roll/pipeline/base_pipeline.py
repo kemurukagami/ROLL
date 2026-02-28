@@ -93,7 +93,7 @@ class BasePipeline:
             model_update_group.tgt_cluster.process_weights_after_loading()
         return metrics
 
-    def do_checkpoint(self, global_step, is_last_step=None):
+    def do_checkpoint(self, global_step, is_last_step=None, offload_after_checkpoint: bool = False):
         if is_last_step is None:
             is_last_step = global_step == self.pipeline_config.max_steps - 1
 
@@ -105,7 +105,12 @@ class BasePipeline:
             ckpt_metrics_refss = []
             for cluster in self.checkpoint_clusters:
                 ckpt_metrics_refss.append(
-                    cluster.do_checkpoint(global_step=global_step, is_last_step=is_last_step, blocking=False)
+                    cluster.do_checkpoint(
+                        global_step=global_step,
+                        is_last_step=is_last_step,
+                        offload_after_checkpoint=offload_after_checkpoint,
+                        blocking=False,
+                    )
                 )
 
             for ckpt_metrics_refs in ckpt_metrics_refss:

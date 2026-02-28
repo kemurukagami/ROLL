@@ -47,6 +47,7 @@ num_gpus_per_node: 2
 model_download_type: HUGGINGFACE_HUB
 offload_nccl: true 
 max_steps: 3
+model_update_buffer_size_mb: 100  # Limit broadcast bucket to 100 MB to avoid OOM with co-located infer workers
 save_steps: 10000
 logging_steps: 1
 eval_steps: 20
@@ -126,7 +127,7 @@ actor_infer:
     strategy_name: vllm
     strategy_config:
       VLLM_USE_V1: 1
-      gpu_memory_utilization: 0.65 # cannot be too high due to residual memory of megatron
+      gpu_memory_utilization: 0.6 # cannot be too high due to residual memory of megatron
       block_size: 16
       load_format: auto
       tensor_parallel_size: 1

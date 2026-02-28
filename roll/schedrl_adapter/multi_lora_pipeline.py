@@ -247,14 +247,7 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
             metrics: Dict[str, Any] = {}
 
             with Timer(name="per_step", logger=None) as step_timer:
-                # ============================================================
-                # Phase 1: Notify release of generation GPUs from previous tick.
-                # Only called after the first tick completes (no GPUs held on step 0).
-                # ============================================================
-                if any_tick_completed:
-                    self._notify_ready_to_release_actor_infer(global_step=prev_trained_step)
-                    logger.info(f"run() {self._pipeline_id=} Phase 1: notified release prev_step={prev_trained_step}")
-
+  
                 # ============================================================
                 # Phase 4.5: Request generation GPUs.
                 # On the first tick there is no cluster to release; on subsequent ticks
@@ -371,6 +364,7 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                         cluster_id=self._actor_train_cluster_id,
                         priority=Priority.OLD_LOG_PROBS,
                         global_step=lora_step[adapter_name],
+                        lora_name=adapter_name,
                     )
                 else:
                     allocated_actor_train_gpus = self._release_and_request_static_cluster(
@@ -379,6 +373,7 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                         request_cluster_id=self._actor_train_cluster_id,
                         request_priority=Priority.OLD_LOG_PROBS,
                         request_global_step=lora_step[adapter_name],
+                        request_lora_name=adapter_name,
                     )
                 with Timer(name="cal_old_log_probs_values", logger=None) as old_logpb_timer:
                     old_log_probs_refs = self.actor_train.compute_log_probs(batch, blocking=False)
@@ -466,6 +461,7 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                             request_cluster_id=self._actor_train_cluster_id,
                             request_priority=Priority.ACTOR_TRAINING,
                             request_global_step=lora_step[adapter_name],
+                            request_lora_name=adapter_name,
                         )
                     else:
                         # Switch actor_train from OLD_LOG_PROBS → ACTOR_TRAINING.
@@ -475,6 +471,7 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                             request_cluster_id=self._actor_train_cluster_id,
                             request_priority=Priority.ACTOR_TRAINING,
                             request_global_step=lora_step[adapter_name],
+                            request_lora_name=adapter_name,
                         )
 
                     with Timer(name="actor_train_step", logger=None) as actor_train_timer:
@@ -520,8 +517,17 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                     ray.get(self._get_adapter_handle().sync_adapter_weights.remote(
                         adapters_to_sync=trained_adapters,
                     ))
-                    logger.info(f"run() {self._pipeline_id=} Phase 16: actor training + sync completed")
-
+                    # Append metrics before do_checkpoint so log_history[-1] exists.
+                    # metrics is a mutable dict, so Phase 17 updates are visible via the same reference.
+                    self.state.step = lora_step[adapter_name]
+                    self.state.log_history.append(metrics)
+                    # Checkpoint while actor_train GPU is still held, then offload all states
+                    # so the GPU is clean when Phase 4.5 of the next tick releases actor_train
+                    # and requests actor_infer (preventing OOM on the infer expand).
+                    self.do_checkpoint(global_step=lora_step[adapter_name], offload_after_checkpoint=True)
+                    # actor_train GPU is released at Phase 4.5 of the next while-loop tick
+                    # via _release_and_request_static_cluster; GPU is clean (offloaded) by then.
+                    logger.info(f"run() {self._pipeline_id=} Phase 16: actor training + sync + checkpoint completed")
                 # ============================================================
                 # Phase 17: Per-adapter step tracking and metrics.
                 # ============================================================
@@ -538,9 +544,7 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
             # End of Timer block — record per-tick wall time before checkpointing.
             metrics["time/per_step_e2e"] = step_timer.last
 
-            self.state.step = lora_step[adapter_name]
-            self.state.log_history.append(metrics)
-            self.do_checkpoint(global_step=lora_step[adapter_name])
+            # state.step and log_history were already set in Phase 16.
             self.tracker.log(values=metrics, step=lora_step[adapter_name], lora_name=adapter_name)
             logger.info(f"===== {self._pipeline_id} tick completed adapter={adapter_name!r} step={lora_step[adapter_name]} =====")
 

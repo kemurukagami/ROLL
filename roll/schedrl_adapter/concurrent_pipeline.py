@@ -523,24 +523,6 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         max_dp = len(device_mapping) // int(gpus_per_dp_rank)
         return list(range(int(max_dp)))
 
-    def _request_actor_infer_gpus(self, *, global_step: int) -> List[int]:
-        from schedrl.protocol.types import Priority
-
-        allocated = ray.get(
-            self._schedrl_scheduler.request_gpus.remote(
-                cluster_id=self._actor_infer_cluster_id,
-                priority=Priority.GENERATION,
-                global_step=global_step,
-            )
-        )
-        if not isinstance(allocated, list):
-            raise RuntimeError(f"schedrl:scheduler.request_gpus returned non-list: {type(allocated).__name__}")
-        allocated = [int(x) for x in allocated]
-        if not allocated:
-            raise RuntimeError(
-                f"schedrl:scheduler allocated empty GPU list for cluster_id={self._actor_infer_cluster_id!r}"
-            )
-        return allocated
 
     def _request_static_cluster(
         self, *, cluster_id: str, priority: Any, global_step: int, lora_name: Optional[str] = None
@@ -677,7 +659,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                 # after actor training completes. expand_sampler loads promoted weights on next expand.
 
                 # ============================================================
-                # Phase 4.5: Request Generation GPUs
+                # Phase 4.5: Request Generation GPUs, this triggers model update and gpu provisioning
                 # Reference: concurrent_agentic_pipeline_workflow.md lines 87-98
                 # ============================================================
                 # SchedRL: gpu_scheduler check removed — SchedRL scheduler is always present.
@@ -794,11 +776,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                 # ============================================================
                 # 1. Request GPUs (blocking via PendingRequest). SchedRL: no timeout param.
                 if self.pipeline_config.adv_estimator != "gae":
-                    # IMPORTANT: actor_infer is a GENERATION cluster. Its release/offload must be driven by
-                    # _notify_ready_to_release_actor_infer() (which does shrink/offload), NOT by directly
-                    # popping it from the scheduler via release_and_request_gpus().
-                    self._notify_ready_to_release_actor_infer(global_step=global_step)
-                    allocated_actor_train_gpus = self._request_static_cluster(
+                     allocated_actor_train_gpus = self._request_static_cluster(
                         cluster_id=self._actor_train_cluster_id,
                         priority=Priority.OLD_LOG_PROBS,
                         global_step=global_step,
@@ -953,12 +931,13 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
                         worker.promote_active_checkpoint.remote(checkpoint_version, int(global_step))
                         for worker in self.actor_train.workers
                     ])
-
-                    # Offload is enforced in the upcoming GPU release/transfer call (next handoff).
-
-                    if global_step >= (self.pipeline_config.max_steps - 1):
-                        # SchedRL: _release_static_cluster instead of _release_gpu.
-                        self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
+                    # Append metrics before do_checkpoint so log_history[-1] exists.
+                    # metrics is a mutable dict, so Phase 17 updates are visible via the same reference.
+                    self.state.step = global_step
+                    self.state.log_history.append(metrics)
+                    # offload_after_checkpoint=True frees model + optimizer from GPU.
+                    # _release_static_cluster runs post-loop, so GPU is still held here.
+                    self.do_checkpoint(global_step=global_step, offload_after_checkpoint=True)
                     logger.info(f"run() {self._pipeline_id=} Phase 16: Actor training cycle completed")
 
                 # ============================================================
@@ -973,17 +952,15 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
             # End of Timer block — record per-step wall time before checkpointing.
             metrics["time/per_step_e2e"] = step_timer.last
 
-            # State, checkpoint, and tracker — ordering matches AgenticPipeline.run().
-            self.state.step = global_step
-            self.state.log_history.append(metrics)
-            self.do_checkpoint(global_step=global_step)  # respects save_steps; waits for async futures
+            # State was already set and log_history was already appended in Phase 16.
             self.tracker.log(values=metrics, step=global_step)
             logger.info(f"=========={self._pipeline_id} Step {global_step} completed ==========")
 
-        # Release generation GPUs after the final step (only if any steps ran).
+        # Release train, generation GPUs after the final step (only if any steps ran).
         if self.pipeline_config.max_steps > 0:
+            self._release_static_cluster(cluster_id=self._actor_train_cluster_id, global_step=global_step)
             self._notify_ready_to_release_actor_infer(global_step=global_step)
-            logger.info(f"run() {self._pipeline_id=} Phase 1: final suspended rollout, scheduler notified")
+            logger.info(f"run() {self._pipeline_id=} end-of-loop cleanup: actor_train GPU released, scheduler notified")
 
         # Shut down rollout schedulers to clean up their Ray actors after training completes.
         ray.get([

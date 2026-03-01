@@ -16,6 +16,7 @@ import json
 import os
 import time
 import threading
+from collections import deque
 from dataclasses import replace
 from typing import Any, Dict, List, Optional
 
@@ -234,14 +235,17 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
         # ============================================================
         # Kick off initial get_batch for all active tags (mirrors agentic_multi_lora_pipeline.py:532-545).
         # ============================================================
-        in_flight: Dict[str, Any] = {}  # tag -> ray.ObjectRef
+        # Track in-flight refs as a single FIFO queue to keep fair wait order.
+        # Each item is (tag, get_batch_ref); tags are unique in the queue.
+        in_flight: deque[tuple[str, Any]] = deque()
         for tag in tags:
             adapter = self._tag_to_adapter[tag]
             if lora_step[adapter] < max_steps_per_adapter:
-                in_flight[tag] = self.rollout_schedulers[tag].get_batch.remote(
+                ref = self.rollout_schedulers[tag].get_batch.remote(
                     DataProto(meta_info={"global_step": lora_step[adapter]}),
                     self.pipeline_config.rollout_batch_size,
                 )
+                in_flight.append((tag, ref))
 
         while any(lora_step[name] < max_steps_per_adapter for name in adapters):
             metrics: Dict[str, Any] = {}
@@ -288,23 +292,27 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
                 # ============================================================
                 for tag in tags:
                     adapter = self._tag_to_adapter[tag]
-                    if lora_step[adapter] < max_steps_per_adapter and tag not in in_flight:
-                        in_flight[tag] = self.rollout_schedulers[tag].get_batch.remote(
+                    # Keep at most one in-flight request per tag.
+                    if lora_step[adapter] < max_steps_per_adapter and all(t != tag for t, _ in in_flight):
+                        ref = self.rollout_schedulers[tag].get_batch.remote(
                             DataProto(meta_info={"global_step": lora_step[adapter]}),
                             self.pipeline_config.rollout_batch_size,
                         )
+                        in_flight.append((tag, ref))
 
-                active_refs = [in_flight[t] for t in tags if t in in_flight]
+                # Build wait inputs using queue order (head first) to avoid fixed tag-order bias.
+                active_refs = [ref for _, ref in in_flight]
                 assert active_refs, f"no in-flight get_batch refs; lora_step={lora_step}"
                 ready, _ = ray.wait(active_refs, num_returns=1, timeout=rollout_get_batch_timeout_s)
                 if not ready:
                     raise RuntimeError(
                         f"get_batch timed out ({rollout_get_batch_timeout_s}s) "
-                        f"in_flight={sorted(in_flight)}"
+                        f"in_flight={sorted(tag for tag, _ in in_flight)}"
                     )
-                ready_tag = next(t for t, r in in_flight.items() if r == ready[0])
-                batch = ray.get(ready[0])
-                in_flight.pop(ready_tag)
+                ready_ref = ready[0]
+                ready_tag = next(tag for tag, ref in in_flight if ref == ready_ref)
+                batch = ray.get(ready_ref)
+                in_flight = deque((tag, ref) for tag, ref in in_flight if tag != ready_tag)
                 adapter_name = self._tag_to_adapter[ready_tag]
 
                 dump_rollout_trajectories(
@@ -550,10 +558,11 @@ class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):
 
             # Re-kick in-flight get_batch for the consumed tag if adapter has more steps.
             if lora_step[adapter_name] < max_steps_per_adapter:
-                in_flight[ready_tag] = self.rollout_schedulers[ready_tag].get_batch.remote(
+                ref = self.rollout_schedulers[ready_tag].get_batch.remote(
                     DataProto(meta_info={"global_step": lora_step[adapter_name]}),
                     self.pipeline_config.rollout_batch_size,
                 )
+                in_flight.append((ready_tag, ref))
 
         # ============================================================
         # End-of-loop cleanup: release GPUs and shut down schedulers.

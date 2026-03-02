@@ -26,13 +26,13 @@ class PolicyProxy(BaseLLMProxy):
 
         lm_input.meta_info["generation_config"] = generation_config
         lm_input.meta_info["pad_to_seq_len"] = False
-        schedrl_request_id = lm_input.meta_info.get("schedrl_request_id")
+        rlix_request_id = lm_input.meta_info.get("rlix_request_id")
         src_rank = lm_input.meta_info.get("src_rank")
         global_step = lm_input.meta_info.get("global_step")
         start_s = time.time()
         self.logger.info(
             f"[PolicyProxy] submit generate_one_request"
-            f" schedrl_request_id={schedrl_request_id!r} src_rank={src_rank} global_step={global_step}"
+            f" rlix_request_id={rlix_request_id!r} src_rank={src_rank} global_step={global_step}"
         )
         lm_output: DataProto = ray.get(self.generate_scheduler.generate_one_request.remote(data=lm_input))
         elapsed_s = time.time() - start_s
@@ -40,13 +40,13 @@ class PolicyProxy(BaseLLMProxy):
             self.logger.warning(
                 f"[PolicyProxy] generate_one_request slow"
                 f" elapsed_s={elapsed_s:.3f}"
-                f" schedrl_request_id={schedrl_request_id!r} src_rank={src_rank} global_step={global_step}"
+                f" rlix_request_id={rlix_request_id!r} src_rank={src_rank} global_step={global_step}"
             )
         else:
             self.logger.info(
                 f"[PolicyProxy] generate_one_request done"
                 f" elapsed_s={elapsed_s:.3f}"
-                f" schedrl_request_id={schedrl_request_id!r} src_rank={src_rank} global_step={global_step}"
+                f" rlix_request_id={rlix_request_id!r} src_rank={src_rank} global_step={global_step}"
             )
 
         if lm_output is not None:

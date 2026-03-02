@@ -23,7 +23,7 @@ from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.generate_scheduler import GlobalCounter
 from roll.distributed.scheduler.protocol import DataProto
 from roll.models.model_providers import default_tokenizer_provider
-from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
+from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 from roll.utils.functionals import (
     GenerateRequestType,
     concatenate_input_and_output,
@@ -411,7 +411,7 @@ class AsyncDynamicSamplingScheduler:
             name=counter_name,
             get_if_exists=True,
             namespace=RAY_NAMESPACE,
-            runtime_env={"env_vars": schedrl_env_vars()},
+            runtime_env={"env_vars": rlix_env_vars()},
         ).remote()
 
     def reset_status(self):

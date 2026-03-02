@@ -27,7 +27,7 @@ from roll.pipeline.agentic.utils import (
     get_agentic_response_level_mask,
 )
 from roll.pipeline.base_pipeline import BasePipeline
-from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
+from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     RunningMoments,
@@ -59,7 +59,7 @@ class AgenticPipeline(BasePipeline):
 
         # Derived configuration for partial GPU mode (auto-detected from device_mapping)
         self.partial_gpu_mode: bool = False
-        schedrl_mode = os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl"
+        rlix_mode = os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix"
 
         self.kl_ctrl = get_kl_controller(
             init_kl_coef=self.pipeline_config.init_kl_coef,
@@ -128,7 +128,7 @@ class AgenticPipeline(BasePipeline):
                 name=f"RewardScheduler-{self.pipeline_config.reward.name}",
                 get_if_exists=True,
                 namespace=RAY_NAMESPACE,
-                runtime_env={"env_vars": schedrl_env_vars()},
+                runtime_env={"env_vars": rlix_env_vars()},
                 scheduling_strategy=NodeAffinitySchedulingStrategy(
                     node_id=ray.get_runtime_context().get_node_id(),
                     soft=False,
@@ -144,7 +144,7 @@ class AgenticPipeline(BasePipeline):
         self.train_rollout_scheduler = ray.remote(RolloutScheduler).options(
             name="RolloutScheduler-train",
             namespace=RAY_NAMESPACE,
-            runtime_env={"env_vars": schedrl_env_vars()},
+            runtime_env={"env_vars": rlix_env_vars()},
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False)).remote(
@@ -158,7 +158,7 @@ class AgenticPipeline(BasePipeline):
         self.val_rollout_scheduler = ray.remote(RolloutScheduler).options(
             name="RolloutScheduler-val",
             namespace=RAY_NAMESPACE,
-            runtime_env={"env_vars": schedrl_env_vars()},
+            runtime_env={"env_vars": rlix_env_vars()},
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node_id=ray.get_runtime_context().get_node_id(),
                 soft=False)).remote(
@@ -171,7 +171,7 @@ class AgenticPipeline(BasePipeline):
         self.val_dataset_manager = GlobalDatasetManager.options(name=f"val_dataset_manager",
                                                                 get_if_exists=True,
                                                                 namespace=RAY_NAMESPACE,
-                                                                runtime_env={"env_vars": schedrl_env_vars()},
+                                                                runtime_env={"env_vars": rlix_env_vars()},
                                                                 ).remote()
 
         # Per-pipeline infer resize serialization boundary (ENG-123).
@@ -190,10 +190,10 @@ class AgenticPipeline(BasePipeline):
         if self.pipeline_config.adv_estimator == "gae":
             refs.extend(self.critic.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
-        # ENG-123 / SchedRL mode: ensure training-side clusters are offloaded before initializing actor_infer.
+        # ENG-123 / RLix mode: ensure training-side clusters are offloaded before initializing actor_infer.
         # This prevents transient multi-model GPU residency during init (commonly triggers OOM when actor_infer
         # spans multiple GPUs).
-        if schedrl_mode:
+        if rlix_mode:
             self.actor_train.offload_states(blocking=True)
             if self.pipeline_config.adv_estimator == "gae":
                 self.critic.offload_states(blocking=True)
@@ -204,15 +204,15 @@ class AgenticPipeline(BasePipeline):
             refs.extend(self.reward.initialize(pipeline_config=self.pipeline_config, blocking=False))
         refs.extend(self.actor_infer.initialize(pipeline_config=self.pipeline_config, blocking=False))
         ray.get(refs)
-        # ENG-123 / SchedRL mode: keep infer-side clusters offloaded after init (SchedRL will load them on demand).
-        if schedrl_mode:
+        # ENG-123 / RLix mode: keep infer-side clusters offloaded after init (RLix will load them on demand).
+        if rlix_mode:
             if self.reward:
                 self.reward.offload_states(blocking=True)
             self.actor_infer.offload_states(blocking=True)
 
         if self.use_ref_model:
             refs.extend(self.reference.initialize(pipeline_config=self.pipeline_config, blocking=True))
-            if schedrl_mode:
+            if rlix_mode:
                 self.reference.offload_states(blocking=True)
         # INIT PHASE: Setup Operations
         self.set_model_update_pair(

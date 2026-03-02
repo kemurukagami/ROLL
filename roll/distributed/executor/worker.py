@@ -307,7 +307,7 @@ class Worker:
         self, checkpoint_version: int, global_step: int, adapter_name: str | None = None
     ) -> None:
         """
-        Build a sender-side CPU bucket cache for selective sync under SchedRL.
+        Build a sender-side CPU bucket cache for selective sync under RLix.
 
         This is a thin wrapper around the strategy implementation. Fail fast if unsupported.
         """
@@ -356,7 +356,7 @@ class Worker:
         if not callable(fn):
             raise RuntimeError(f"{type(self.strategy).__name__} does not support selective_sync_active_cache")
         self.logger.info(
-            "[schedrl][selective_sync] worker_call_enter "
+            "[rlix][selective_sync] worker_call_enter "
             f"sync_id={sync_id} tgt_dp_ranks={list(tgt_dp_ranks)} "
             f"tgt_num_gpus_per_worker={tgt_num_gpus_per_worker}"
         )
@@ -371,7 +371,7 @@ class Worker:
             is_leader=bool(is_leader),
             adapters_to_sync=adapters_to_sync,
         )
-        self.logger.info(f"[schedrl][selective_sync] worker_call_exit sync_id={sync_id}")
+        self.logger.info(f"[rlix][selective_sync] worker_call_exit sync_id={sync_id}")
 
     def add_lora(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:

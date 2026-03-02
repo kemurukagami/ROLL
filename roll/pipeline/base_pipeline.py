@@ -30,7 +30,7 @@ class BasePipeline:
     def __init__(self, pipeline_config):
         set_seed(seed=pipeline_config.seed)
         self.pipeline_config = pipeline_config
-        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+        if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
             from roll.distributed.scheduler.resource_manager import (
                 get_or_create_roll_resource_manager_actor,
                 RollResourceManagerProxy,

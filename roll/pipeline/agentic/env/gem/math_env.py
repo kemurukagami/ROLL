@@ -11,7 +11,7 @@ from gem.utils.parsing import extract_last_boxed_answer
 import ray
 
 from roll.datasets.global_dataset import GlobalDataset, GlobalDatasetManager
-from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
+from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 
 logger = logging.getLogger(__name__)
 
@@ -39,14 +39,14 @@ class MathEnv(GEMMathEnv):
         self.dataset = GlobalDataset.options(name=f"{self.mode}_{dataset_name}",
                                              get_if_exists=True,
                                              namespace=RAY_NAMESPACE,
-                                             runtime_env={"env_vars": schedrl_env_vars()},
+                                             runtime_env={"env_vars": rlix_env_vars()},
                                              ).remote(dataset_name=dataset_name,
                                                                              split=split,
                                                                              mode=global_dataset_mode)
         self.dataset_manager = GlobalDatasetManager.options(name=f"{self.mode}_dataset_manager",
                                                             get_if_exists=True,
                                                             namespace=RAY_NAMESPACE,
-                                                            runtime_env={"env_vars": schedrl_env_vars()},
+                                                            runtime_env={"env_vars": rlix_env_vars()},
                                                             ).remote()
         ray.get(self.dataset_manager.register.remote(dataset_name=dataset_name, dataset_ref=self.dataset))
         self.idx = 0

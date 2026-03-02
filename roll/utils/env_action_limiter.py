@@ -3,7 +3,7 @@ import os
 import time
 from typing import Dict
 import ray
-from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
+from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 
 @ray.remote
 class GlobalLimiter:
@@ -83,7 +83,7 @@ class LimiterClient:
             name=limiter_name,
             get_if_exists=True,
             namespace=RAY_NAMESPACE,
-            runtime_env={"env_vars": schedrl_env_vars()},
+            runtime_env={"env_vars": rlix_env_vars()},
         ).remote(max_concurrent_calls=self.max_concurrent_calls)
 
     def acquire(self) -> str:

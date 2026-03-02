@@ -7,8 +7,8 @@ from ray.util.placement_group import PlacementGroup
 
 from roll.platforms import current_platform
 from roll.utils.ray_utils import get_visible_gpus, get_node_rank
-# todo(tao) fixme: we shall make schedrl optional, not installed won't causing import error
-from schedrl.protocol.types import ROLL_RESOURCE_MANAGER_ACTOR_NAME, SCHEDRL_NAMESPACE
+# todo(tao) fixme: we shall make rlix optional, not installed won't causing import error
+from rlix.protocol.types import ROLL_RESOURCE_MANAGER_ACTOR_NAME, RLIX_NAMESPACE
 
 
 class ResourceManager:
@@ -180,18 +180,18 @@ class ResourceManager:
 
 
 # ---------------------------------------------------------------------------
-# Singleton actor + proxy for SchedRL control-plane mode
+# Singleton actor + proxy for RLix control-plane mode
 # ---------------------------------------------------------------------------
 
-# Use imported constants from schedrl.protocol.types for consistency
+# Use imported constants from rlix.protocol.types for consistency
 _ROLL_RM_ACTOR_NAME = ROLL_RESOURCE_MANAGER_ACTOR_NAME
-_ROLL_RM_NAMESPACE = SCHEDRL_NAMESPACE
+_ROLL_RM_NAMESPACE = RLIX_NAMESPACE
 
 
 def get_or_create_roll_resource_manager_actor(num_gpus_per_node):
     """Return (or lazily create) the cluster-wide singleton ResourceManager Ray actor.
 
-    In SchedRL mode all concurrent pipelines share ONE ResourceManager actor so
+    In RLix mode all concurrent pipelines share ONE ResourceManager actor so
     that GPU placement groups are allocated only once for the whole cluster.
     ``num_gpus_per_node`` must be consistent across pipelines (homogeneous cluster).
     ``num_nodes=None`` means auto-discover all eligible GPU nodes.
@@ -223,7 +223,7 @@ def get_or_create_roll_resource_manager_actor(num_gpus_per_node):
 class RollResourceManagerProxy:
     """Synchronous drop-in replacement for ResourceManager backed by a shared Ray actor.
 
-    Used in SchedRL control-plane mode so that all concurrent pipelines share a
+    Used in RLix control-plane mode so that all concurrent pipelines share a
     single ResourceManager actor (and its placement groups) rather than each
     pipeline creating its own, which would exhaust cluster GPU resources.
 

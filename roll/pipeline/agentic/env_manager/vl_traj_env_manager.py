@@ -185,7 +185,7 @@ class VLTrajEnvManager(TrajEnvManager):
                     self.stop_reason = EpisodeStopReason.MAX_LENGTH
                 elif generation_stop_reason == GenerateStopReason.ABORT:
                     self.stop_reason = EpisodeStopReason.ABORT
-                    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+                    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
                         self.rollout_cache.attempt += 1
             log_stats["current_step"].append(self.current_step)
             log_stats["generate_time"].append(generate_timer.last)
@@ -271,7 +271,7 @@ class VLTrajEnvManager(TrajEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
-        self._maybe_set_schedrl_request_id(lm_input)
+        self._maybe_set_rlix_request_id(lm_input)
 
         lm_output: DataProto = self.llm_proxy.generate(messages=messages,
                                                        lm_input=lm_input,

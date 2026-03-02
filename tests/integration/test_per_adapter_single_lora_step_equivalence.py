@@ -6,7 +6,7 @@ Strategy
 Run the two clusters **sequentially** on the *same* GPU set so GPU requirements are
 halved compared to running them in parallel.
 
-Phase 1 — per_adapter cluster (multi-LoRA, ROLL_schedrl ported strategy):
+Phase 1 — per_adapter cluster (multi-LoRA, ROLL_rlix ported strategy):
   - Register all adapters under ``lora_optimizer_mode="per_adapter"``.
   - For each adapter in turn, run ``train_step_lora`` for *n_steps* steps.
   - Record the scalar loss returned at every step.
@@ -66,7 +66,7 @@ The test enforces this via four mechanisms:
    are seeded identically so any remaining RNG-dependent operation (e.g., Megatron
    TP dropout, weight init) starts from the same state.
 
-Phase 1 dependencies (must be ported into ROLL_schedrl before tests pass):
+Phase 1 dependencies (must be ported into ROLL_rlix before tests pass):
   - ``MegatronTrainStrategy.train_step_lora``  with ``lora_optimizer_mode="per_adapter"``
   - ``Worker.train_step_lora``
   - ``Worker.{get_lora_tensors, set_lora_tensors, copy_lora_params}``
@@ -305,7 +305,7 @@ def _extract_loss(result: DataProto) -> float:
     """Extract the scalar loss from a train_step / train_step_lora DataProto result.
 
     Checks both ``{worker_name}/loss`` (upstream convention) and
-    ``{worker_name}/loss@sum`` (ROLL_schedrl convention).
+    ``{worker_name}/loss@sum`` (ROLL_rlix convention).
     """
     metrics: dict = result.meta_info.get("metrics", {}) if result.meta_info else {}
     for key in (f"{_WORKER_NAME}/loss", f"{_WORKER_NAME}/loss@sum"):
@@ -403,7 +403,7 @@ def _run_equivalence_test(
     - Driver-side RNG is reset via ``_seed_driver(seed)`` before both phases.
     - Both clusters use the same ``pipeline_config.seed`` (worker-side Megatron RNG).
     """
-    debug_trace = os.environ.get("SCHEDRL_DEBUG_PER_ADAPTER", "") not in ("", "0", "false", "False")
+    debug_trace = os.environ.get("RLIX_DEBUG_PER_ADAPTER", "") not in ("", "0", "false", "False")
 
     # Fixed token sequences, one per step (different steps → different data,
     # making the multi-step comparison more discriminating).
@@ -471,7 +471,7 @@ def _run_equivalence_test(
 
     if phase1_order == "sequential":
         # All steps for adapter A, then all steps for adapter B, ...
-        # Mirrors the simplest SchedRL scheduling policy.
+        # Mirrors the simplest RLix scheduling policy.
         for name in adapter_names:
             for step in range(n_steps):
                 mb = _make_microbatch(step_input_ids[step], name, global_step=step)

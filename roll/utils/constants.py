@@ -3,14 +3,14 @@ import logging
 import os
 
 
-_SCHEDRL_CONTROL_PLANE = os.environ.get("SCHEDRL_CONTROL_PLANE", "")
-if _SCHEDRL_CONTROL_PLANE == "schedrl":
+_RLIX_CONTROL_PLANE = os.environ.get("RLIX_CONTROL_PLANE", "")
+if _RLIX_CONTROL_PLANE == "rlix":
     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
     if not ray_namespace:
-        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set before importing roll.*")
+        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires ROLL_RAY_NAMESPACE to be set before importing roll.*")
     pipeline_id = os.environ.get("PIPELINE_ID")
     if not pipeline_id:
-        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set before importing roll.*")
+        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set before importing roll.*")
 
 RAY_NAMESPACE = os.environ.get("ROLL_RAY_NAMESPACE", "roll")
 GLOBAL_STORAGE_NAMESPACE = "global_storage_namespace"
@@ -32,25 +32,25 @@ CACHE_PATH = os.path.join(os.path.expanduser("~"), ".cache", "roll")
 IGNORE_INDEX = -100
 
 
-def schedrl_env_vars() -> dict[str, str]:
-    """Env vars that must be present in all per-pipeline Ray actor processes in SchedRL mode.
+def rlix_env_vars() -> dict[str, str]:
+    """Env vars that must be present in all per-pipeline Ray actor processes in RLix mode.
 
     Use this when creating child actors from within a pipeline actor; Ray does not reliably
     inherit runtime_env env vars from parent actors.
     """
-    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+    if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
         return {}
-    # In SchedRL mode, roll.* import already validated these exist; keep them explicit here too.
+    # In RLix mode, roll.* import already validated these exist; keep them explicit here too.
     pipeline_id = os.environ.get("PIPELINE_ID")
     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
     if not pipeline_id:
-        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
     if not ray_namespace:
-        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires ROLL_RAY_NAMESPACE to be set")
     grpc_pool_size = os.environ.get("RAY_grpc_server_thread_pool_size", "4")
     omp_threads = os.environ.get("OMP_NUM_THREADS", "1")
     logging.getLogger(__name__).info(
-        "[schedrl_env_vars] pid=%d RAY_grpc_server_thread_pool_size=%s OMP_NUM_THREADS=%s",
+        "[rlix_env_vars] pid=%d RAY_grpc_server_thread_pool_size=%s OMP_NUM_THREADS=%s",
         os.getpid(),
         grpc_pool_size,
         omp_threads,
@@ -58,8 +58,8 @@ def schedrl_env_vars() -> dict[str, str]:
     return {
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
-        "SCHEDRL_CONTROL_PLANE": "schedrl",
-        "SCHEDRL_LIBRARY_MODE": os.environ.get("SCHEDRL_LIBRARY_MODE", "1"),
+        "RLIX_CONTROL_PLANE": "rlix",
+        "RLIX_LIBRARY_MODE": os.environ.get("RLIX_LIBRARY_MODE", "1"),
         # Keep imports working when Ray workers start outside the repo root.
         "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
         # Limit math library threads per actor to avoid hitting container pids.max.

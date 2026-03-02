@@ -172,7 +172,7 @@ class VllmStrategy(InferenceStrategy):
             vllm_use_v1 = int(os.environ.get("VLLM_USE_V1", "1"))
             if vllm_use_v1 != 1:
                 raise RuntimeError(
-                    "LoRA mode in ROLL_schedrl requires VLLM_USE_V1=1. "
+                    "LoRA mode in ROLL_rlix requires VLLM_USE_V1=1. "
                     "Non-v1 engine path does not expose adapter-id APIs required by multi-LoRA routing."
                 )
 

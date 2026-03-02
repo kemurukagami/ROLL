@@ -304,7 +304,7 @@ class WorkerBase:
             )
             if group_rank is None:
                 logger.info(
-                    f"[schedrl][vllm][collective] setup_skip "
+                    f"[rlix][vllm][collective] setup_skip "
                     f"rank_in_cluster={rank_in_cluster} rank_in_worker={int(self.rank)}"
                 )
                 return
@@ -314,7 +314,7 @@ class WorkerBase:
             master_port = comm_plan_args["master_port"]
             world_size = int(len(comm_plan_args["tgt_devices"]) + 1)
             logger.info(
-                f"[schedrl][vllm][collective] setup_enter group_name={group_name} "
+                f"[rlix][vllm][collective] setup_enter group_name={group_name} "
                 f"rank={group_rank} world_size={world_size} master={master_address}:{master_port} "
                 f"timeout_s={timeout_s}"
             )
@@ -329,7 +329,7 @@ class WorkerBase:
             )
             collective.allreduce(torch.zeros(1, device=current_platform.device_type), group_name=group_name)
             logger.info(
-                f"[schedrl][vllm][collective] setup_exit group_name={group_name} "
+                f"[rlix][vllm][collective] setup_exit group_name={group_name} "
                 f"rank={group_rank} world_size={world_size}"
             )
             return
@@ -344,7 +344,7 @@ class WorkerBase:
         timeout_s = kwargs.get("timeout_s", None)
         group_rank = int(self.rank) + int(rank_offset)
         logger.info(
-            f"[schedrl][vllm][collective] setup_enter group_name={group_name} "
+            f"[rlix][vllm][collective] setup_enter group_name={group_name} "
             f"rank={group_rank} world_size={world_size} master={master_address}:{master_port} "
             f"rank_offset={rank_offset} timeout_s={timeout_s}"
         )
@@ -358,14 +358,14 @@ class WorkerBase:
             timeout_s=timeout_s,
         )
         logger.info(
-            f"[schedrl][vllm][collective] setup_exit group_name={group_name} "
+            f"[rlix][vllm][collective] setup_exit group_name={group_name} "
             f"rank={group_rank} world_size={world_size}"
         )
 
     def destroy_collective_group(self, group_name: str):
-        logger.info(f"[schedrl][vllm][collective] destroy_enter group_name={group_name}")
+        logger.info(f"[rlix][vllm][collective] destroy_enter group_name={group_name}")
         collective.destroy_collective_group(group_name)
-        logger.info(f"[schedrl][vllm][collective] destroy_exit group_name={group_name}")
+        logger.info(f"[rlix][vllm][collective] destroy_exit group_name={group_name}")
 
     def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
         # [debug] Stage 1: log GPU memory before any receive buffer is allocated.
@@ -375,7 +375,7 @@ class WorkerBase:
         _device_used_gb = (_total_bytes - _free_bytes) / 1024**3
         _alloc_gb = torch.cuda.memory_allocated() / 1024**3
         logger.info(
-            f"[schedrl][vllm][broadcast] enter group_name={group_name} "
+            f"[rlix][vllm][broadcast] enter group_name={group_name} "
             f"num_tensors={len(names)} is_lora={int(bool(is_lora))} "
             f"[debug] device_used={_device_used_gb:.3f}GB allocated={_alloc_gb:.3f}GB "
             f"device_total={_total_bytes / 1024**3:.3f}GB"
@@ -392,7 +392,7 @@ class WorkerBase:
             for name, weight, handle in weights_and_handles:
                 handle.wait()
                 self.tensor_lora_manager.add_weight(name, weight)
-            logger.info(f"[schedrl][vllm][broadcast] exit group_name={group_name} mode=lora")
+            logger.info(f"[rlix][vllm][broadcast] exit group_name={group_name} mode=lora")
             return
 
         # Base weights: reload model FIRST, then stream one tensor at a time via a generator.
@@ -421,14 +421,14 @@ class WorkerBase:
             f"device_used={(_total4 - _free4) / 1024**3:.3f}GB "
             f"allocated={torch.cuda.memory_allocated() / 1024**3:.3f}GB"
         )
-        logger.info(f"[schedrl][vllm][broadcast] exit group_name={group_name} mode=weights")
+        logger.info(f"[rlix][vllm][broadcast] exit group_name={group_name} mode=weights")
 
     def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
         monkey_patch_torch_reductions()
         bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_named_tensors[self.rank])
         # Support both formats:
         # - {"bucket": <torch.Tensor>, "tensors_meta": ...}  (legacy / CUDA-IPC path)
-        # - {"bucket_bytes": <bytes>, "tensors_meta": ...}  (SchedRL CPU-cache safe path)
+        # - {"bucket_bytes": <bytes>, "tensors_meta": ...}  (RLix CPU-cache safe path)
         if "bucket" not in bucket_with_meta:
             bucket_bytes = bucket_with_meta.get("bucket_bytes")
             if bucket_bytes is None:

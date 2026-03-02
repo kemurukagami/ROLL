@@ -168,10 +168,10 @@ class ActorWorker(Worker):
             # Use append_to_dict to match train_step accumulation pattern (consistent with reducers).
             append_to_dict(metrics, lora_metrics)
             # Build CPU bucket cache for dirty adapters while GPU weights are still resident.
-            # Only applicable when SchedRL selective sync is enabled (SCHEDRL_CONTROL_PLANE=schedrl).
+            # Only applicable when RLix selective sync is enabled (RLIX_CONTROL_PLANE=rlix).
             # Must run before state_offload_manger offloads weights back to CPU.
-            if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
-                # per_adapter_step is set by SchedRLMultiLoraPipeline.run() via meta_info["global_step"].
+            if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+                # per_adapter_step is set by RLixMultiLoraPipeline.run() via meta_info["global_step"].
                 per_adapter_step = int(data.meta_info.get("global_step", 0))
                 checkpoint_version = int(data.meta_info.get("checkpoint_version", per_adapter_step))
                 valid_adapters = set((self.worker_config.model_args.adapters or {}).keys())
@@ -669,7 +669,7 @@ class InferWorker(Worker):
         generation_config["pad_token_id"] = self.tokenizer.pad_token_id
         data.meta_info["generation_config"] = generation_config
         request_id = data.meta_info.get("request_id")
-        schedrl_request_id = data.meta_info.get("schedrl_request_id")
+        rlix_request_id = data.meta_info.get("rlix_request_id")
         src_rank = data.meta_info.get("src_rank")
         global_step = data.meta_info.get("global_step")
         max_new_tokens = generation_config.get("max_new_tokens")
@@ -678,7 +678,7 @@ class InferWorker(Worker):
         if getattr(self, "rank_info", None) is not None and int(self.rank_info.tp_rank) == 0 and src_rank == 0:
             self.logger.info(
                 f"[InferWorker] generate_request enter"
-                f" request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" request_id={request_id} rlix_request_id={rlix_request_id!r}"
                 f" src_rank={src_rank} global_step={global_step} max_new_tokens={max_new_tokens}"
             )
 
@@ -689,13 +689,13 @@ class InferWorker(Worker):
             if elapsed_s >= 30.0:
                 self.logger.warning(
                     f"[InferWorker] generate_request slow"
-                    f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                    f" elapsed_s={elapsed_s:.3f} request_id={request_id} rlix_request_id={rlix_request_id!r}"
                     f" src_rank={src_rank} global_step={global_step}"
                 )
             else:
                 self.logger.info(
                     f"[InferWorker] generate_request exit"
-                    f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                    f" elapsed_s={elapsed_s:.3f} request_id={request_id} rlix_request_id={rlix_request_id!r}"
                     f" src_rank={src_rank} global_step={global_step}"
                 )
         data.meta_info["eos_token_id"] = self.tokenizer.eos_token_id

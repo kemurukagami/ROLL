@@ -91,28 +91,28 @@ class TrajEnvManager(BaseEnvManager):
             env=self.env
         )
 
-    def _maybe_set_schedrl_request_id(self, lm_input: DataProto) -> None:
-        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+    def _maybe_set_rlix_request_id(self, lm_input: DataProto) -> None:
+        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
             return
 
         pipeline_id = os.environ.get("PIPELINE_ID")
         if not pipeline_id:
-            raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+            raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
         if self.rollout_cache is None:
-            raise RuntimeError("SCHEDRL canonical request ID requires rollout_cache to be set")
+            raise RuntimeError("RLIX canonical request ID requires rollout_cache to be set")
         if self.episode_id is None:
-            raise RuntimeError("SCHEDRL canonical request ID requires episode_id to be set")
+            raise RuntimeError("RLIX canonical request ID requires episode_id to be set")
         if self.group_seed is None:
-            raise RuntimeError("SCHEDRL canonical request ID requires group_seed to be set")
+            raise RuntimeError("RLIX canonical request ID requires group_seed to be set")
 
         traj_group_id = f"{self.rollout_cache.tag}_{self.rollout_cache.group_id}_{self.episode_id}_{self.group_seed}"
         traj_id = f"{traj_group_id}_{self.rollout_cache.env_id}"
         turn_id = int(self.rollout_cache.step)
         attempt = int(getattr(self.rollout_cache, "attempt", 0))
 
-        from schedrl.protocol.request_id import build_request_id
+        from rlix.protocol.request_id import build_request_id
 
-        lm_input.meta_info["schedrl_request_id"] = build_request_id(
+        lm_input.meta_info["rlix_request_id"] = build_request_id(
             pipeline_id=str(pipeline_id),
             traj_id=str(traj_id),
             turn_id=turn_id,
@@ -159,7 +159,7 @@ class TrajEnvManager(BaseEnvManager):
                 elif stop_reason == GenerateStopReason.ABORT:
                     # Retry the same turn (same step) after abort. This is used to survive
                     # shrink/rebalance aborts. Each retry increments attempt so request_ids remain unique.
-                    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+                    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
                         self.rollout_cache.attempt += 1
             log_stats["step_time"].append(step_timer.last)
 
@@ -261,7 +261,7 @@ class TrajEnvManager(BaseEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
-        self._maybe_set_schedrl_request_id(lm_input)
+        self._maybe_set_rlix_request_id(lm_input)
 
         input_messages = [item for items in self.rollout_cache.history for item in items["messages"]]
 

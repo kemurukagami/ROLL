@@ -20,9 +20,9 @@ from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.pipeline.agentic.agentic_config import EnvManagerConfig
 from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
-from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
+from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 from roll.utils.logging import get_logger
-from schedrl.protocol.types import SCHEDULER_ACTOR_NAME, SCHEDRL_NAMESPACE
+from rlix.protocol.types import SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
 
 logger = get_logger()
 
@@ -378,20 +378,20 @@ class GroupQueueManager:
         self.rollout_complete = {}
 
         self.pipeline_id = os.environ.get("PIPELINE_ID") or None
-        self._schedrl_enabled = os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and self.mode == "train"
+        self._rlix_enabled = os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix" and self.mode == "train"
         self.adapter_id = self.env_manager_config.tags[0] if getattr(self.env_manager_config, "tags", None) else None
-        self._schedrl_scheduler = None
-        if self._schedrl_enabled:
+        self._rlix_scheduler = None
+        if self._rlix_enabled:
             if not self.pipeline_id:
-                raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+                raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
             try:
-                self._schedrl_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
+                self._rlix_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
             except Exception as e:
-                # Expectation: the central schedrl scheduler actor ('schedrl:scheduler')
+                # Expectation: the central rlix scheduler actor ('rlix:scheduler')
                 # must already be created before GroupQueueManager is instantiated.
                 # Fail loudly with a clear message to aid debugging of startup ordering.
                 raise RuntimeError(
-                    f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{SCHEDRL_NAMESPACE}'. "
+                    f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{RLIX_NAMESPACE}'. "
                     "GroupQueueManager expects the central scheduler actor to be present before startup; "
                     "ensure the orchestrator created it earlier or that startup ordering is correct."
                 ) from e
@@ -440,18 +440,18 @@ class GroupQueueManager:
         self.total = 0
         self.waiting = 0
 
-        # Progress tracking (SchedRL only; fork parity).
+        # Progress tracking (RLix only; fork parity).
         self._progress_last_bucket: Optional[int] = None
         self._progress_new_batch = False
         self._progress_total_required_estimated = self._estimate_total_required()
         self._progress_collected_estimated = 0
         self._progress_episode_non_null: Dict[Tuple[int, int], int] = {}
-        if self._schedrl_enabled:
+        if self._rlix_enabled:
             self._mark_new_batch()
             self._maybe_emit_progress(current_train_step=None)
 
     def _resolve_num_return_sequences(self) -> int:
-        # SchedRL progress should be expressed in "trajectory units" that match the rollout batch contract.
+        # RLix progress should be expressed in "trajectory units" that match the rollout batch contract.
         #
         # In ROLL's request scheduler, the effective number of finished samples required for a "batch" is
         # `batch_size * num_return_sequences` (not scaled by async_generation_ratio).
@@ -501,14 +501,14 @@ class GroupQueueManager:
         return total_required, collected, remaining, oldest_ts
 
     def _maybe_emit_progress(self, *, current_train_step: Optional[int]) -> None:
-        if not self._schedrl_enabled:
+        if not self._rlix_enabled:
             return
         if self.max_traj_per_env is None:
             return
-        if self._schedrl_scheduler is None:
-            raise RuntimeError("SCHEDRL progress enabled but schedrl:scheduler handle is missing")
+        if self._rlix_scheduler is None:
+            raise RuntimeError("RLIX progress enabled but rlix:scheduler handle is missing")
         if not self.pipeline_id:
-            raise RuntimeError("SCHEDRL progress enabled but PIPELINE_ID is missing")
+            raise RuntimeError("RLIX progress enabled but PIPELINE_ID is missing")
 
         total_required, collected, remaining, oldest_ts = self._compute_progress()
         if total_required <= 0:
@@ -531,7 +531,7 @@ class GroupQueueManager:
         self._progress_last_bucket = bucket
         self._progress_new_batch = False
 
-        from schedrl.protocol.types import ProgressReport
+        from rlix.protocol.types import ProgressReport
 
         report = ProgressReport(
             pipeline_id=str(self.pipeline_id),
@@ -550,7 +550,7 @@ class GroupQueueManager:
                 "adapter_id": self.adapter_id,
             },
         )
-        self._schedrl_scheduler.report_progress.remote(report)
+        self._rlix_scheduler.report_progress.remote(report)
 
     def collect_metrics(self):
         group_filter_count = 0
@@ -768,8 +768,8 @@ class RolloutScheduler(RolloutMockMixin):
                 "NUMEXPR_NUM_THREADS": "1",
                 "TOKENIZERS_PARALLELISM": "false",
         }
-        # Ensure per-pipeline env vars are visible in these control-plane actor processes in SchedRL mode.
-        env_vars.update(schedrl_env_vars())
+        # Ensure per-pipeline env vars are visible in these control-plane actor processes in RLix mode.
+        env_vars.update(rlix_env_vars())
         runtime_env = RuntimeEnv(env_vars=env_vars)
 
         self.logger.info(f"[RolloutScheduler] creating GroupQueueManager mode={self.mode}")
@@ -921,7 +921,7 @@ class RolloutScheduler(RolloutMockMixin):
         self.logger.info(f"[RolloutScheduler] advance_step start mode={self.mode} global_step={global_step}")
         await self.env_output_queue.advance_step.remote(global_step)
         self.logger.info(f"[RolloutScheduler] advance_step done mode={self.mode} global_step={global_step}")
-        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
+        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
             await self.generate_scheduler.resume.remote()
 
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))

@@ -1349,7 +1349,7 @@ class RequestScheduler:
         return set(self.active_dp_ranks)
 
     async def generate_one_request(self, data: DataProto):
-        schedrl_request_id = data.meta_info.get("schedrl_request_id")
+        rlix_request_id = data.meta_info.get("rlix_request_id")
         src_rank = data.meta_info.get("src_rank")
         global_step = data.meta_info.get("global_step")
         t0 = time.time()
@@ -1388,7 +1388,7 @@ class RequestScheduler:
         try:
             logger.info(
                 f"[RequestScheduler] dispatch generate_request"
-                f" request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" request_id={request_id} rlix_request_id={rlix_request_id!r}"
                 f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
                 f" active_dp_ranks={sorted(self.active_dp_ranks)}"
             )
@@ -1435,13 +1435,13 @@ class RequestScheduler:
         if elapsed_s >= 30.0:
             logger.warning(
                 f"[RequestScheduler] generate_one_request slow"
-                f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" elapsed_s={elapsed_s:.3f} request_id={request_id} rlix_request_id={rlix_request_id!r}"
                 f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
             )
         else:
             logger.info(
                 f"[RequestScheduler] generate_one_request done"
-                f" elapsed_s={elapsed_s:.3f} request_id={request_id} schedrl_request_id={schedrl_request_id!r}"
+                f" elapsed_s={elapsed_s:.3f} request_id={request_id} rlix_request_id={rlix_request_id!r}"
                 f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
             )
         return output
@@ -2057,15 +2057,15 @@ class RequestScheduler:
             # in active_dp_ranks (e.g., "restore routing to full set" semantics).
             if not skip_load:
                 self._validate_calculated_ranks(load_ranks, mode="expand")
-                # In SchedRL mode, delay vLLM KV cache init until after selective model update completes.
+                # In RLix mode, delay vLLM KV cache init until after selective model update completes.
                 # This avoids holding large KV allocations during weight sync (which needs extra headroom).
-                if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl" and load_ranks:
+                if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix" and load_ranks:
                     pipeline_id = os.environ.get("PIPELINE_ID") or None
                     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
                     if not pipeline_id:
-                        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
+                        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
                     if not ray_namespace:
-                        raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires ROLL_RAY_NAMESPACE to be set")
+                        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires ROLL_RAY_NAMESPACE to be set")
                     try:
                         model_update_service = ray.get_actor(
                             f"{pipeline_id}_model_update_service",

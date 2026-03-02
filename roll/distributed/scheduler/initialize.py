@@ -24,11 +24,11 @@ from roll.platforms import current_platform
 logger = get_logger()
 
 def _is_library_mode() -> bool:
-    # ENG-123: treat SCHEDRL_CONTROL_PLANE=schedrl as the source-of-truth for "SchedRL-owned cluster lifecycle".
-    # Keep SCHEDRL_LIBRARY_MODE as a backwards-compatible override.
-    if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+    # ENG-123: treat RLIX_CONTROL_PLANE=rlix as the source-of-truth for "RLix-owned cluster lifecycle".
+    # Keep RLIX_LIBRARY_MODE as a backwards-compatible override.
+    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
         return True
-    return os.environ.get("SCHEDRL_LIBRARY_MODE", "0") == "1"
+    return os.environ.get("RLIX_LIBRARY_MODE", "0") == "1"
 
 
 def start_ray_cluster():

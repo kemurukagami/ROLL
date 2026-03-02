@@ -96,7 +96,7 @@ def init_collective_group(
     assert rank >= 0
     assert rank < world_size
     logger.info(
-        "[schedrl][collective] init_enter "
+        "[rlix][collective] init_enter "
         f"group_name={group_name} backend={backend} rank={rank}/{world_size} master={master_addr}:{master_port} "
         f"timeout_s={timeout_s}"
     )
@@ -110,7 +110,7 @@ def init_collective_group(
         global_ranks=global_ranks,
         timeout_s=timeout_s,
     )
-    logger.info(f"[schedrl][collective] init_exit group_name={group_name} rank={rank}/{world_size}")
+    logger.info(f"[rlix][collective] init_exit group_name={group_name} rank={rank}/{world_size}")
 
 
 def allreduce(tensor, group_name: str = "default", op=ReduceOp.SUM):

@@ -1,8 +1,8 @@
-# Plan: Port Multi-LoRA Standalone Pipeline to ROLL_schedrl
+# Plan: Port Multi-LoRA Standalone Pipeline to ROLL_rlix
 
 ## Context
-Port `AgenticMultiLoraPipeline` from `ROLL_multi_lora` into `ROLL_schedrl` so it runs
-end-to-end as a standalone (non-SchedRL) pipeline. Strategy: selective copy of exactly
+Port `AgenticMultiLoraPipeline` from `ROLL_multi_lora` into `ROLL_rlix` so it runs
+end-to-end as a standalone (non-RLix) pipeline. Strategy: selective copy of exactly
 the LoRA-specific code blocks, not whole files (except one genuinely new file).
 
 **Internal routing key migration**: `domain` is removed as a LoRA routing fallback.
@@ -13,19 +13,19 @@ update to inject `lora_name` before deployment. The agentic pipeline is fully sa
 managers (Changes 4–8) inject `lora_name`, never `domain`.
 
 Source baseline: `external/ROLL_multi_lora` current HEAD.
-All edits are in: `external/ROLL_schedrl/`
+All edits are in: `external/ROLL_rlix/`
 
 ---
 
 ## Files Touched (16 total, ordered by dependency)
 
-| # | File (relative to `external/ROLL_schedrl/`) | Change |
+| # | File (relative to `external/ROLL_rlix/`) | Change |
 |---|-----|--------|
 | 1 | `roll/utils/lora_routing.py` | Add public `get_lora_name_array`; remove `domain` fallback from private helper; add `ensure_lora_name_in_batch` |
 | 2 | `roll/configs/model_args.py` | Add `adapter_name` to `LoraArguments`; add 2 formal fields + full normalization block to `ModelArguments` |
 | 3 | `roll/distributed/strategy/vllm_strategy.py` | Add module-level helper; add 7 methods; update `add_lora` signature; replace 2 routing blocks |
 | 4–8 | `roll/pipeline/agentic/env_manager/{traj,step,step_concat,vl_traj,agent_native}_env_manager.py` | Add `lora_name` injection in `format_messages` + `formulate_rollouts` + `create_placeholder_rollout`; fix numpy import for step_concat |
-| 9 | `roll/schedrl_adapter/multi_lora_pipeline.py` | Fix trained-adapter detection |
+| 9 | `roll/rlix_adapter/multi_lora_pipeline.py` | Fix trained-adapter detection |
 | 10 | `roll/pipeline/agentic/agentic_multi_lora_pipeline.py` | **New file** – whole-file copy + 2 revisions |
 | 11 | `examples/qwen2.5-0.5B-agentic/n-agent_train_sokoban_multi_lora_async.yaml` | **New file** – adapted YAML (filename matches source `_async` suffix) |
 | 12 | `roll/distributed/strategy/megatron_strategy.py` | Update LoRA docstrings: `domain` → `lora_name` |
@@ -158,7 +158,7 @@ Three edits:
 
 ### 2a – Add `adapter_name` field to `LoraArguments`
 
-ROLL_schedrl's `LoraArguments` is missing this field. Add before `additional_target`:
+ROLL_rlix's `LoraArguments` is missing this field. Add before `additional_target`:
 ```python
 adapter_name: str = field(
     default="default",
@@ -250,7 +250,7 @@ from roll.utils.lora_routing import get_lora_name_array, resolve_microbatch_lora
 
 ### 3b – Fix `is_lora` and `max_loras` in `initialize` method
 
-ROLL_schedrl's `initialize` directly sets `enable_prefix_caching` and `max_num_batched_tokens`
+ROLL_rlix's `initialize` directly sets `enable_prefix_caching` and `max_num_batched_tokens`
 in `vllm_config.update(...)` at the top (no `has_*` guards). ROLL_multi_lora introduces `has_*`
 boolean guards to avoid overriding user-set values. When copying the LoRA block, ALSO add the
 three `has_*` definitions immediately after `vllm_config = copy.deepcopy(...)` (or at the start
@@ -310,7 +310,7 @@ if self.is_lora:
     vllm_use_v1 = int(os.environ.get("VLLM_USE_V1", "1"))
     if vllm_use_v1 != 1:
         raise RuntimeError(
-            "LoRA mode in ROLL_schedrl requires VLLM_USE_V1=1. "
+            "LoRA mode in ROLL_rlix requires VLLM_USE_V1=1. "
             "Non-v1 engine path does not expose adapter-id APIs required by multi-LoRA routing."
         )
 ```
@@ -461,16 +461,16 @@ Uses `resolve_microbatch_lora_name`, `get_lora_id`, `_normalize_lora_int_ids_loa
 **Critical: do NOT copy the vocab validation block** (ROLL_multi_lora lines ~524–564) that
 precedes the LoRA block in ROLL_multi_lora's `generate_request`. That block references
 `self._allowed_token_ids` (direct attribute access) and `self._model_vocab_size` — neither
-is initialized in ROLL_schedrl's `VllmStrategy.__init__`. Copying it verbatim causes an
+is initialized in ROLL_rlix's `VllmStrategy.__init__`. Copying it verbatim causes an
 `AttributeError` (`_allowed_token_ids`) or a guaranteed `RuntimeError` (`_model_vocab_size`
 is None and the code raises on that). Only replace the dummy LoRA block; leave the rest of
-ROLL_schedrl's `generate_request` function body unchanged.
+ROLL_rlix's `generate_request` function body unchanged.
 
 **Also: do NOT copy any logging context** that references `_vllm_max_num_batched_tokens` or
 `_vllm_max_num_seqs` from ROLL_multi_lora — those attributes are initialized in ROLL_multi_lora's
-`initialize` but not in ROLL_schedrl's.
+`initialize` but not in ROLL_rlix's.
 
-After Change 1, `resolve_microbatch_lora_name` in ROLL_schedrl calls `_get_lora_name_array`
+After Change 1, `resolve_microbatch_lora_name` in ROLL_rlix calls `_get_lora_name_array`
 which now delegates to `get_lora_name_array` (strict lora_name-only). The copied LoRA block
 is therefore strict by default — no additional precondition needed.
 
@@ -617,7 +617,7 @@ lm_input.non_tensor_batch = {
 
 ---
 
-## Change 9 – `roll/schedrl_adapter/multi_lora_pipeline.py`
+## Change 9 – `roll/rlix_adapter/multi_lora_pipeline.py`
 
 **Targeted fix** – trained-adapter detection inside `run()`.
 
@@ -664,7 +664,7 @@ if not trained_adapters:
 
 ## Change 10 – New file `roll/pipeline/agentic/agentic_multi_lora_pipeline.py`
 
-**Whole-file copy** from `ROLL_multi_lora` — this file does not exist in ROLL_schedrl.
+**Whole-file copy** from `ROLL_multi_lora` — this file does not exist in ROLL_rlix.
 Then two revisions:
 
 **Revision A** – Harden `partial_gpu_mode` to hardcoded invariant.
@@ -724,7 +724,7 @@ only `lora_name` is valid — `domain` is no longer a LoRA routing key.
 
 Locate the docstring block that says:
 ```
-"""Adapter routing uses ``non_tensor_batch["domain"]`` (ROLL_schedrl
+"""Adapter routing uses ``non_tensor_batch["domain"]`` (ROLL_rlix
 convention) or ``non_tensor_batch["lora_name"]`` as fallback."""
 ```
 
@@ -1007,41 +1007,41 @@ vLLM routes to "default" LoRA adapter  (no regression for legacy single-LoRA con
 ```bash
 # 1. Public get_lora_name_array and ensure_lora_name_in_batch exist
 grep "^def get_lora_name_array\|^def ensure_lora_name_in_batch" \
-    external/ROLL_schedrl/roll/utils/lora_routing.py
+    external/ROLL_rlix/roll/utils/lora_routing.py
 
 # 2. Domain fallback removed from _get_lora_name_array
-grep -A5 "def _get_lora_name_array" external/ROLL_schedrl/roll/utils/lora_routing.py
+grep -A5 "def _get_lora_name_array" external/ROLL_rlix/roll/utils/lora_routing.py
 # Expected: no "domain" key reference in the body
 
 # 3. vllm_strategy uses adapters-based is_lora
-grep "adapters is not None" external/ROLL_schedrl/roll/distributed/strategy/vllm_strategy.py
+grep "adapters is not None" external/ROLL_rlix/roll/distributed/strategy/vllm_strategy.py
 
 # 4. module-level _normalize_lora_int_ids_loaded defined before class
 grep -n "_normalize_lora_int_ids_loaded\|^class VllmStrategy" \
-    external/ROLL_schedrl/roll/distributed/strategy/vllm_strategy.py
+    external/ROLL_rlix/roll/distributed/strategy/vllm_strategy.py
 # Expected: _normalize_lora_int_ids_loaded line# < class VllmStrategy line#
 
 # 5. No lora_naming/ensure_lora_name in agentic pipeline
-grep -r "lora_naming\|ensure_lora_name" external/ROLL_schedrl/roll/pipeline/agentic/
+grep -r "lora_naming\|ensure_lora_name" external/ROLL_rlix/roll/pipeline/agentic/
 
 # 6. vLLM plumbing: get_lora_id and list_loras in async_llm; custom_* in worker
-grep "def get_lora_id\|def list_loras" external/ROLL_schedrl/roll/third_party/vllm/async_llm.py
+grep "def get_lora_id\|def list_loras" external/ROLL_rlix/roll/third_party/vllm/async_llm.py
 grep "def custom_get_lora_id\|def custom_list_loras\|def custom_add_lora" \
-    external/ROLL_schedrl/roll/third_party/vllm/worker.py
+    external/ROLL_rlix/roll/third_party/vllm/worker.py
 # Expected: all 3 present; custom_add_lora signature includes adapter_name
 
 # 7. base_worker has get_lora_id, list_loras, wait_loras_ready wrappers
 grep "def get_lora_id\|def list_loras\|def wait_loras_ready" \
-    external/ROLL_schedrl/roll/pipeline/base_worker.py
+    external/ROLL_rlix/roll/pipeline/base_worker.py
 # Expected: all 3 present
 
 # 8. TensorLoraManager tracks _lora_names; no WorkerV1.custom_add_lora override
-grep "_lora_names" external/ROLL_schedrl/roll/third_party/vllm/worker.py
-grep "class WorkerV1" -A 20 external/ROLL_schedrl/roll/third_party/vllm/worker.py
+grep "_lora_names" external/ROLL_rlix/roll/third_party/vllm/worker.py
+grep "class WorkerV1" -A 20 external/ROLL_rlix/roll/third_party/vllm/worker.py
 # Expected: _lora_names present; WorkerV1 has no custom_add_lora
 ```
 
-**Runtime smoke (cd external/ROLL_schedrl first):**
+**Runtime smoke (cd external/ROLL_rlix first):**
 ```bash
 # 1. New imports resolve
 python -c "
@@ -1131,19 +1131,19 @@ print('add_lora backward-compat signature ok')
 2. `non_tensor_batch["lora_name"]` present after each `format_messages` call.
 3. vLLM `is_lora=True` and `max_loras >= 3` when 2 adapters configured.
 4. `train_step_lora` microbatches have `lora_name` key set.
-5. SchedRL control-plane `trained_adapters` is non-empty after first training step.
+5. RLix control-plane `trained_adapters` is non-empty after first training step.
 
 **Scope boundary checks (static):**
 ```bash
 # generate_request LoRA block does NOT reference _allowed_token_ids or _model_vocab_size
 grep "_allowed_token_ids\|_model_vocab_size" \
-    external/ROLL_schedrl/roll/distributed/strategy/vllm_strategy.py
-# Expected: zero matches (these attrs are not initialized in ROLL_schedrl VllmStrategy.__init__)
+    external/ROLL_rlix/roll/distributed/strategy/vllm_strategy.py
+# Expected: zero matches (these attrs are not initialized in ROLL_rlix VllmStrategy.__init__)
 
 # train_step_lora guards are present in both worker files
 grep -A5 "train_step_lora" \
-    external/ROLL_schedrl/roll/pipeline/base_worker.py \
-    external/ROLL_schedrl/roll/pipeline/sft/sft_worker.py | grep "lora_name"
+    external/ROLL_rlix/roll/pipeline/base_worker.py \
+    external/ROLL_rlix/roll/pipeline/sft/sft_worker.py | grep "lora_name"
 # Expected: matches showing the fail-fast guard in each file
 ```
 
@@ -1157,7 +1157,7 @@ The following fixes were applied after initial porting to make the smoke test pa
 ### 1) vLLM KV-cache startup safety
 
 File:
-- `external/ROLL_schedrl/examples/qwen2.5-0.5B-agentic/n-agent_train_sokoban_multi_lora_async.yaml`
+- `external/ROLL_rlix/examples/qwen2.5-0.5B-agentic/n-agent_train_sokoban_multi_lora_async.yaml`
 
 Change:
 - `actor_infer.strategy_args.strategy_config.gpu_memory_utilization` changed from `0.65` to `0.8`.
@@ -1168,7 +1168,7 @@ Reason:
 ### 2) GroupQueueManager actor-name collision fix
 
 File:
-- `external/ROLL_schedrl/roll/distributed/scheduler/rollout_scheduler.py`
+- `external/ROLL_rlix/roll/distributed/scheduler/rollout_scheduler.py`
 
 Change:
 - Group queue actor name now includes env manager name:
@@ -1181,7 +1181,7 @@ Reason:
 ### 3) Missing RolloutScheduler wrapper APIs for partial-GPU flow
 
 File:
-- `external/ROLL_schedrl/roll/distributed/scheduler/rollout_scheduler.py`
+- `external/ROLL_rlix/roll/distributed/scheduler/rollout_scheduler.py`
 
 Changes:
 - Added delegating async methods:
@@ -1196,7 +1196,7 @@ Reason:
 ### 4) Missing RequestScheduler methods used by shrink/expand barrier
 
 File:
-- `external/ROLL_schedrl/roll/distributed/scheduler/generate_scheduler.py`
+- `external/ROLL_rlix/roll/distributed/scheduler/generate_scheduler.py`
 
 Changes:
 - Added:
@@ -1210,7 +1210,7 @@ Reason:
 ### 5) Train/infer correction metadata fix (`train_infer_is_weight`)
 
 File:
-- `external/ROLL_schedrl/roll/pipeline/agentic/agentic_multi_lora_pipeline.py`
+- `external/ROLL_rlix/roll/pipeline/agentic/agentic_multi_lora_pipeline.py`
 
 Changes:
 - Set `batch.meta_info["loss_mask_keys"] = ["response_mask"]` before `_prepare_batch`.
@@ -1228,8 +1228,8 @@ Reason:
 
 Command:
 ```bash
-cd /workspace/SchedRL/external/ROLL_schedrl
-PYTHONPATH=/workspace/SchedRL/external/ROLL_schedrl /venv/main/bin/python \
+cd /workspace/RLix/external/ROLL_rlix
+PYTHONPATH=/workspace/RLix/external/ROLL_rlix /venv/main/bin/python \
   examples/start_agentic_pipeline.py \
   --config_path qwen2.5-0.5B-agentic \
   --config_name n-agent_train_sokoban_multi_lora_async

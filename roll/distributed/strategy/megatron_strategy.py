@@ -1506,7 +1506,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 MTPLossLoggingHelper.clean_loss_in_tracker()
                 metrics.update(mtp_total_loss_dict)
 
-        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") == "schedrl":
+        if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
             checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
             self._build_latest_bucket_cache(checkpoint_version=checkpoint_version, global_step=int(global_step))
             # fixme(tao) it need an if test, default to false, and only promt after cache explicitly  
@@ -2071,8 +2071,8 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 self._latest_cached = cache_key
 
     def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
-        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
-            raise RuntimeError("promote_active_checkpoint is only supported under SchedRL control plane")
+        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
+            raise RuntimeError("promote_active_checkpoint is only supported under RLix control plane")
 
         cache_key = (int(checkpoint_version), int(global_step))
         with self._cache_lock:
@@ -2120,8 +2120,8 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         is_leader: bool = False,
         adapters_to_sync: Optional[List[str]] = None,
     ) -> None:
-        if os.environ.get("SCHEDRL_CONTROL_PLANE", "") != "schedrl":
-            raise RuntimeError("selective_sync_active_cache is only supported under SchedRL control plane")
+        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
+            raise RuntimeError("selective_sync_active_cache is only supported under RLix control plane")
 
         tgt_dp_ranks = sorted(set(int(r) for r in tgt_dp_ranks))
         if not tgt_dp_ranks:
@@ -2135,7 +2135,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         sync_t0 = time.perf_counter()
         logger.info(
-            "[schedrl][selective_sync] enter "
+            "[rlix][selective_sync] enter "
             f"sync_id={sync_id} world_rank={dist.get_rank()} "
             f"tgt_dp_ranks={tgt_dp_ranks} tgt_num_gpus_per_worker={tgt_num_gpus_per_worker} "
             f"tgt_device_mapping={list(tgt_device_mapping)} "
@@ -2202,7 +2202,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     raise RuntimeError(f"active_cached={self._active_cached} missing from cache_map")
                 base_cached_buckets = list(self._cache_map[self._active_cached])
             logger.info(
-                "[schedrl][selective_sync] cache "
+                "[rlix][selective_sync] cache "
                 f"sync_id={sync_id} world_rank={world_rank} active_cached={self._active_cached} "
                 f"adapters_to_sync={adapters_to_sync} base_num_buckets={len(base_cached_buckets)} "
                 f"adapter_num_buckets={sum(len(v) for v in adapter_cached_buckets.values())}"
@@ -2222,7 +2222,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     broadcast_target_dp_ranks.add(int(dp_rank))
 
             logger.info(
-                "[schedrl][selective_sync] targets "
+                "[rlix][selective_sync] targets "
                 f"sync_id={sync_id} world_rank={world_rank} is_colocated={int(is_colocated)} "
                 f"ipc_target_dp_ranks={sorted(ipc_target_dp_ranks)} "
                 f"broadcast_target_dp_ranks={sorted(broadcast_target_dp_ranks)}"
@@ -2247,7 +2247,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 infer_parallel_size = dist.get_world_size(self._selective_sync_cpu_group)
                 infer_worker_idx = (int(world_rank) + int(device_start_diff)) // int(tgt_num_gpus_per_worker)
                 logger.info(
-                    "[schedrl][selective_sync] ipc "
+                    "[rlix][selective_sync] ipc "
                     f"sync_id={sync_id} world_rank={world_rank} co_infer_rank={co_infer_rank} "
                     f"infer_parallel_size={infer_parallel_size} infer_worker_idx={infer_worker_idx} "
                     f"device_start_diff={device_start_diff} device_end_diff={device_end_diff}"
@@ -2262,7 +2262,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                         for bucket_idx, serialized_tensors in enumerate(bucket_sequence):
                             infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
                             logger.info(
-                                "[schedrl][selective_sync] ipc_gather_enter "
+                                "[rlix][selective_sync] ipc_gather_enter "
                                 f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
                                 f"adapter={adapter_name} bucket_idx={bucket_idx} "
                                 f"serialized_len={len(serialized_tensors) if serialized_tensors is not None else 'None'}"
@@ -2275,7 +2275,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                             )
                             if co_infer_rank == 0:
                                 logger.info(
-                                    "[schedrl][selective_sync] ipc_apply_enter "
+                                    "[rlix][selective_sync] ipc_apply_enter "
                                     f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
                                     f"adapter={adapter_name} bucket_idx={bucket_idx}"
                                 )
@@ -2286,7 +2286,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                                     )
                                 )
                                 logger.info(
-                                    "[schedrl][selective_sync] ipc_apply_exit "
+                                    "[rlix][selective_sync] ipc_apply_exit "
                                     f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
                                     f"adapter={adapter_name} bucket_idx={bucket_idx}"
                                 )
@@ -2343,7 +2343,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 planned_ranks = sorted({int(td["rank"]) for td in comm_plan_args.get("tgt_devices", [])})
                 broadcast_workers = [tgt_workers[r] for r in planned_ranks]
                 logger.info(
-                    "[schedrl][selective_sync] broadcast_setup_from_comm_plan "
+                    "[rlix][selective_sync] broadcast_setup_from_comm_plan "
                     f"sync_id={sync_id} model_update_name={model_update_name} group_name={group_name} "
                     f"broadcast_dp_ranks={planned_ranks}"
                 )
@@ -2367,7 +2367,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                         shapes = [t.shape for _, t in named_params]
 
                         logger.info(
-                            "[schedrl][selective_sync] broadcast_bucket_enter "
+                            "[rlix][selective_sync] broadcast_bucket_enter "
                             f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
                             f"adapter={adapter_name} bucket_idx={bucket_idx} num_tensors={len(names)}"
                         )
@@ -2393,25 +2393,25 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                                 )
                             )
                         logger.info(
-                            "[schedrl][selective_sync] broadcast_wait_enter "
+                            "[rlix][selective_sync] broadcast_wait_enter "
                             f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
                             f"adapter={adapter_name} bucket_idx={bucket_idx} num_handles={len(handles)}"
                         )
                         for handle in handles:
                             handle.wait()
                         logger.info(
-                            "[schedrl][selective_sync] broadcast_wait_exit "
+                            "[rlix][selective_sync] broadcast_wait_exit "
                             f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
                             f"adapter={adapter_name} bucket_idx={bucket_idx}"
                         )
                         logger.info(
-                            "[schedrl][selective_sync] broadcast_apply_enter "
+                            "[rlix][selective_sync] broadcast_apply_enter "
                             f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
                             f"adapter={adapter_name} bucket_idx={bucket_idx} num_workers={len(broadcast_workers)}"
                         )
                         ray.get(recv_refs)
                         logger.info(
-                            "[schedrl][selective_sync] broadcast_apply_exit "
+                            "[rlix][selective_sync] broadcast_apply_exit "
                             f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
                             f"adapter={adapter_name} bucket_idx={bucket_idx}"
                         )
@@ -2455,26 +2455,26 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                         )
                 # Destroy groups before dist.barrier(): ncclCommDestroy blocks if called after barrier.
                 logger.info(
-                    "[schedrl][selective_sync] broadcast_teardown_enter "
+                    "[rlix][selective_sync] broadcast_teardown_enter "
                     f"sync_id={sync_id} group_name={group_name}"
                 )
                 collective.destroy_collective_group(group_name)
                 ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
                 logger.info(
-                    "[schedrl][selective_sync] broadcast_teardown_exit "
+                    "[rlix][selective_sync] broadcast_teardown_exit "
                     f"sync_id={sync_id} group_name={group_name}"
                 )
 
             # Critical: ensure all sender ranks complete this sync before allowing another to start.
-            logger.info("[schedrl][selective_sync] barrier_enter " f"sync_id={sync_id} world_rank={world_rank}")
+            logger.info("[rlix][selective_sync] barrier_enter " f"sync_id={sync_id} world_rank={world_rank}")
             _safe_dist_barrier()
             logger.info(
-                "[schedrl][selective_sync] barrier_exit "
+                "[rlix][selective_sync] barrier_exit "
                 f"sync_id={sync_id} world_rank={world_rank} elapsed_s={time.perf_counter() - sync_t0:.3f}"
             )
 
     def load_states(self, include=None, non_blocking=False):
-        # Per-adapter mode must honor include semantics so SchedRL can fully release GPU memory
+        # Per-adapter mode must honor include semantics so RLix can fully release GPU memory
         # during train->infer handoff (model + optimizer states), then restore on demand.
         if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
             include_states = []
@@ -2503,7 +2503,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.optimizer.reload_states(include=include, non_blocking=non_blocking)
 
     def offload_states(self, include=None, non_blocking=False, pin_memory=True):
-        # Per-adapter mode must honor include semantics so SchedRL can fully release GPU memory
+        # Per-adapter mode must honor include semantics so RLix can fully release GPU memory
         # during train->infer handoff (model + optimizer states), then restore on demand.
         if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
             include_states = []

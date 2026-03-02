@@ -10,7 +10,7 @@ import ray
 import torch
 from codetiming import Timer
 
-from schedrl.protocol.types import ActionResponse, Priority
+from schedrl.protocol.types import ADAPTER_ACTOR_NAME_PREFIX, ActionResponse, Priority, SCHEDULER_ACTOR_NAME, SCHEDRL_NAMESPACE
 
 from roll.schedrl_adapter.utils import _get_env_timeout_s
 
@@ -58,13 +58,13 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
         # Ray actor can run with max_concurrency>1; guard init so resize/run can't race it.
         self._init_lock = threading.Lock()
         try:
-            self._schedrl_scheduler = ray.get_actor("schedrl:scheduler", namespace="schedrl")
+            self._schedrl_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
         except Exception as e:
             # Expectation: the central schedrl scheduler actor ('schedrl:scheduler')
             # must already be created before the pipeline is instantiated.
             # Fail loudly with a clear message to aid debugging of startup ordering.
             raise RuntimeError(
-                "Failed to resolve schedrl:scheduler in namespace 'schedrl'. "
+                f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{SCHEDRL_NAMESPACE}'. "
                 "The pipeline expects the central scheduler actor to be present before startup; "
                 "ensure the orchestrator created it earlier or that startup ordering is correct."
             ) from e
@@ -85,7 +85,7 @@ class SchedRLConcurrentPipeline(AgenticPipeline):
             return self._adapter_handle
         # Namespace convention mirrors adapter.py:_get_pipeline_namespace().
         namespace = f"pipeline_{self._pipeline_id}_NS"
-        actor_name = f"schedrl:adapter:{self._pipeline_id}"
+        actor_name = f"{ADAPTER_ACTOR_NAME_PREFIX}{self._pipeline_id}"
         try:
             self._adapter_handle = ray.get_actor(actor_name, namespace=namespace)
         except Exception as e:

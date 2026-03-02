@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 import ray
 
 from schedrl.protocol.request_id import validate_pipeline_id
-from schedrl.protocol.types import ActionResponse
+from schedrl.protocol.types import ActionResponse, PIPELINE_ACTOR_NAME_PREFIX
 
 
 def _get_pipeline_namespace(pipeline_id: str) -> str:
@@ -193,7 +193,7 @@ class SchedRLAdapter:
 
         from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
         self._coordinator = Coordinator.options(
-            name=f"schedrl:pipeline:{self._pipeline_id}",
+            name=f"{PIPELINE_ACTOR_NAME_PREFIX}{self._pipeline_id}",
             namespace=self._ray_namespace,
             get_if_exists=True,
             max_restarts=0,
@@ -299,7 +299,7 @@ class SchedRLAdapter:
         with self._resize_sync_lock:
             # NOTE: adapter does not coordinate train/val request schedulers directly; it delegates to the
             # per-pipeline coordinator actor (single serialization boundary owned by pipeline runtime).
-            resize_actor_name = f"schedrl:pipeline:{self._pipeline_id}"
+            resize_actor_name = f"{PIPELINE_ACTOR_NAME_PREFIX}{self._pipeline_id}"
             try:
                 resize_actor = ray.get_actor(resize_actor_name, namespace=self._ray_namespace)
             except Exception as e:

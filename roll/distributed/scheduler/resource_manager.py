@@ -2,12 +2,13 @@ import dataclasses
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 
-import os
 import ray
 from ray.util.placement_group import PlacementGroup
 
 from roll.platforms import current_platform
 from roll.utils.ray_utils import get_visible_gpus, get_node_rank
+# todo(tao) fixme: we shall make schedrl optional, not installed won't causing import error
+from schedrl.protocol.types import ROLL_RESOURCE_MANAGER_ACTOR_NAME, SCHEDRL_NAMESPACE
 
 
 class ResourceManager:
@@ -50,8 +51,6 @@ class ResourceManager:
         self.num_nodes = num_nodes
         self.gpu_per_node = num_gpus_per_node
         self.num_gpus = self.gpu_per_node * self.num_nodes
-        self._pipeline_id = os.environ.get("PIPELINE_ID") or None
-        self._pg_name_prefix = f"schedrl_pg:{self._pipeline_id}:" if self._pipeline_id else None
 
         if self.gpu_per_node > 0:
             assert self.num_gpus <= available_gpu, f"num_gpus {self.num_gpus} > available_gpu {available_gpu}"
@@ -62,10 +61,7 @@ class ResourceManager:
                 bundles.append({ray_device_key: self.gpu_per_node, "CPU": max(node_cpu / 2, 1)})
 
             self.placement_groups = [
-                ray.util.placement_group(
-                    [bundle],
-                    **({"name": f"{self._pg_name_prefix}{i}"} if self._pg_name_prefix else {}),
-                )
+                ray.util.placement_group([bundle])
                 for i, bundle in enumerate(bundles)
             ]
             ray.get([pg.ready() for pg in self.placement_groups])
@@ -94,10 +90,7 @@ class ResourceManager:
             node_cpu = int(node["Resources"]["CPU"])
             bundles = [{"CPU": node_cpu}] * self.num_nodes
             self.placement_groups = [
-                ray.util.placement_group(
-                    [bundle],
-                    **({"name": f"{self._pg_name_prefix}cpu:{i}"} if self._pg_name_prefix else {}),
-                )
+                ray.util.placement_group([bundle])
                 for i, bundle in enumerate(bundles)
             ]
             ray.get([pg.ready() for pg in self.placement_groups])
@@ -190,8 +183,9 @@ class ResourceManager:
 # Singleton actor + proxy for SchedRL control-plane mode
 # ---------------------------------------------------------------------------
 
-_ROLL_RM_ACTOR_NAME = "schedrl:roll_resource_manager"
-_ROLL_RM_NAMESPACE = "schedrl"
+# Use imported constants from schedrl.protocol.types for consistency
+_ROLL_RM_ACTOR_NAME = ROLL_RESOURCE_MANAGER_ACTOR_NAME
+_ROLL_RM_NAMESPACE = SCHEDRL_NAMESPACE
 
 
 def get_or_create_roll_resource_manager_actor(num_gpus_per_node):

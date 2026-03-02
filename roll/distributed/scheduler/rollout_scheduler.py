@@ -22,6 +22,7 @@ from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
 from roll.utils.constants import RAY_NAMESPACE, schedrl_env_vars
 from roll.utils.logging import get_logger
+from schedrl.protocol.types import SCHEDULER_ACTOR_NAME, SCHEDRL_NAMESPACE
 
 logger = get_logger()
 
@@ -384,13 +385,13 @@ class GroupQueueManager:
             if not self.pipeline_id:
                 raise RuntimeError("SCHEDRL_CONTROL_PLANE=schedrl requires PIPELINE_ID to be set")
             try:
-                self._schedrl_scheduler = ray.get_actor("schedrl:scheduler", namespace="schedrl")
+                self._schedrl_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=SCHEDRL_NAMESPACE)
             except Exception as e:
                 # Expectation: the central schedrl scheduler actor ('schedrl:scheduler')
                 # must already be created before GroupQueueManager is instantiated.
                 # Fail loudly with a clear message to aid debugging of startup ordering.
                 raise RuntimeError(
-                    "Failed to resolve schedrl:scheduler in namespace 'schedrl'. "
+                    f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{SCHEDRL_NAMESPACE}'. "
                     "GroupQueueManager expects the central scheduler actor to be present before startup; "
                     "ensure the orchestrator created it earlier or that startup ordering is correct."
                 ) from e

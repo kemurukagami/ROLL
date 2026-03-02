@@ -22,6 +22,7 @@ from dacite import from_dict
 from hydra import compose, initialize
 from hydra.core.global_hydra import GlobalHydra
 from omegaconf import OmegaConf
+from schedrl.protocol.types import ADAPTER_ACTOR_NAME_PREFIX, SCHEDRL_NAMESPACE
 
 
 def _repo_root() -> Path:
@@ -179,7 +180,7 @@ def main() -> None:
         # Actors that specify their own runtime_env override this, but it catches
         # any actor that does not set an explicit runtime_env.
         ray.init(
-            namespace="schedrl",
+            namespace=SCHEDRL_NAMESPACE,
             ignore_reinit_error=True,
             log_to_driver=True,
             runtime_env={"env_vars": {
@@ -252,7 +253,7 @@ def main() -> None:
         ray.get(orchestrator.admit_pipeline.remote(pipeline_id=str(pipeline_id)))
 
         adapter = AdapterActor.options(
-            name=f"schedrl:adapter:{pipeline_id}",
+            name=f"{ADAPTER_ACTOR_NAME_PREFIX}{pipeline_id}",
             namespace=ray_namespace,
             get_if_exists=True,
             max_restarts=0,

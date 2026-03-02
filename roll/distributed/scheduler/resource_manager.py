@@ -296,4 +296,7 @@ class RollResourceManagerProxy:
         return allocated_pg
 
     def destroy_placement_group(self):
-        pass  # singleton owns PGs; orchestrator tears them down via actor kill
+        raise NotImplementedError(
+            "RollResourceManagerProxy is a read-only proxy to a shared singleton ResourceManager actor. "
+            "Placement groups are owned by the singleton actor; teardown is handled by the orchestrator."
+        )

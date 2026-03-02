@@ -38,6 +38,7 @@ from roll.pipeline.agentic.utils import (
     get_agentic_response_level_mask,
 )
 from roll.schedrl_adapter.concurrent_pipeline import SchedRLConcurrentPipeline
+from roll.schedrl_adapter.utils import _get_env_timeout_s
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     agg_loss,
@@ -51,18 +52,6 @@ from roll.utils.lora_routing import normalize_domain
 from roll.utils.train_infer_corrections import apply_train_infer_correction_to_batch
 
 logger = get_logger()
-
-
-def _get_env_timeout_s(var_name: str, default_s: float) -> float:
-    """Read a timeout in seconds from an env var; fall back to default_s if unset or invalid."""
-    raw = os.environ.get(var_name)
-    if raw is None:
-        return default_s
-    try:
-        val = float(raw)
-    except ValueError:
-        return default_s
-    return val if val > 0 else default_s
 
 
 class SchedRLMultiLoraPipeline(SchedRLConcurrentPipeline):

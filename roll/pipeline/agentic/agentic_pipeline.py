@@ -234,26 +234,6 @@ class AgenticPipeline(BasePipeline):
         else:
             self.partial_gpu_mode = False
 
-    def _dp_ranks_to_target_gpus(self, *, dp_ranks: List[int]) -> List[int]:
-        if not isinstance(dp_ranks, list) or not dp_ranks:
-            raise ValueError("dp_ranks must be a non-empty list[int]")
-        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
-        if gpus_per_dp_rank <= 0:
-            raise RuntimeError("Invalid infer gpus_per_dp_rank")
-        device_mapping = list(self._infer_device_mapping)
-        if len(device_mapping) % gpus_per_dp_rank != 0:
-            raise RuntimeError("actor_infer.device_mapping length must be divisible by gpus_per_dp_rank")
-
-        max_dp = len(device_mapping) // gpus_per_dp_rank
-        out: List[int] = []
-        for dp_rank in dp_ranks:
-            r = int(dp_rank)
-            if not (0 <= r < max_dp):
-                raise ValueError(f"dp_rank {r} out of range [0, {max_dp})")
-            start = r * gpus_per_dp_rank
-            out.extend(device_mapping[start : start + gpus_per_dp_rank])
-        return sorted(set(int(x) for x in out))
-
     def _target_gpus_to_dp_ranks_to_remove(self, *, target_gpus: List[int]) -> List[int]:
         if not isinstance(target_gpus, list) or not target_gpus:
             raise ValueError("target_gpus must be a non-empty list[int]")

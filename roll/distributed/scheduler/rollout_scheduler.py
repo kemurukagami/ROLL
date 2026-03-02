@@ -1069,13 +1069,4 @@ class RolloutScheduler(RolloutMockMixin):
         # an unnecessary hop and obscures which actor owns the authoritative state.
         """
         return await self.generate_scheduler.get_active_dp_ranks.remote()
-    def get_generate_scheduler_name(self) -> str:
-        """Return the name of the RequestScheduler actor (for verification)."""
-        # Note: self.generate_scheduler is an ActorHandle, but we want the name it was created with.
-        # However, we can't easily get the name from the handle itself in a clean way across Ray versions.
-        # But we can get it from the internal _actor_name if available, or just return the handle representation.
-        # For simplicity in this specific verification, we'll return the name we expect if it's a shared actor.
-        # Actually, let's just return the actor handle's task name or similar if possible, 
-        # but better to just return the name we stored.
-        return getattr(self.generate_scheduler, "_actor_name", "unknown")
 

@@ -59,7 +59,6 @@ def rlix_env_vars() -> dict[str, str]:
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
         "RLIX_CONTROL_PLANE": "rlix",
-        "RLIX_LIBRARY_MODE": os.environ.get("RLIX_LIBRARY_MODE", "1"),
         # Keep imports working when Ray workers start outside the repo root.
         "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
         # Limit math library threads per actor to avoid hitting container pids.max.

@@ -26,20 +26,13 @@ from ray._private.log_monitor import (
 from ray._private.worker import print_to_stdstream, logger as monitor_logger, print_worker_logs
 
 from roll.distributed.scheduler.driver_utils import get_driver_rank, wait_for_nodes, get_driver_world_size
+from roll.distributed.scheduler.initialize import do_time_sharing
 from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 from roll.utils.logging import get_logger
 
 logger = get_logger()
 
 EXCEPTION_MONITOR_ACTOR_NAME = "ExceptionMonitor"
-
-
-def _rlix_disable_ray_cluster_lifecycle() -> bool:
-    # ENG-123: do not let per-pipeline workers stop the job-global Ray cluster.
-    # Use RLIX_CONTROL_PLANE as the source-of-truth (RLIX_LIBRARY_MODE may be false in future service mode).
-    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
-        return True
-    return os.environ.get("RLIX_LIBRARY_MODE", "0") == "1"
 
 
 class StdPublisher:
@@ -226,7 +219,7 @@ class LogMonitorListener:
             time.sleep(0.1)
 
     def stop(self):
-        if _rlix_disable_ray_cluster_lifecycle():
+        if do_time_sharing():
             StdPublisher.close_file_handlers()
             time.sleep(0.2)
             try:
@@ -251,7 +244,7 @@ class LogMonitorListener:
         subprocess.run(cmd, shell=True, capture_output=True)
 
     def start(self):
-        if _rlix_disable_ray_cluster_lifecycle():
+        if do_time_sharing():
             return
         atexit.register(self.stop)
 

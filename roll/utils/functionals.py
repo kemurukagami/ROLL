@@ -928,9 +928,11 @@ def postprocess_generate(
         batch["infer_logprobs"] = logprobs
     meta_info = dict(prompts.meta_info) if prompts.meta_info is not None else {}
 
+    # Propagate non_tensor_batch (e.g., lora_name for multi-LoRA routing) from prompt to output.
+    # The prompt has N entries; the output has N*num_return_sequences entries.
+    # Values already at output size are copied as-is; values at prompt size are repeated once per return sequence.
     non_tensor_batch = {}
     if prompts.non_tensor_batch:
-        # `prompts` is batch_size=N; output is batch_size=N*num_return_sequences.
         input_batch_size = int(prompts.batch.batch_size[0]) if prompts.batch is not None else 0
         if input_batch_size <= 0:
             input_batch_size = output_batch_size // int(num_return_sequences)
@@ -942,6 +944,7 @@ def postprocess_generate(
             if len(val) == output_batch_size:
                 non_tensor_batch[key] = val
             elif len(val) == input_batch_size:
+                # Repeat each per-prompt value once per return sequence to align with output batch.
                 non_tensor_batch[key] = np.repeat(val, int(num_return_sequences))
             else:
                 raise ValueError(

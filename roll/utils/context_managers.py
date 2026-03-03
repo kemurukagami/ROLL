@@ -201,6 +201,7 @@ def state_offload_manger(strategy, metrics: Dict, metric_infix: str, is_offload_
         metrics[f"time/{metric_infix}/execute"] = execute_timer.last
         metrics[f"time/{metric_infix}/onload"] = onload_timer.last
         metrics[f"time/{metric_infix}/offload"] = offload_timer.last
+    # Use pop(key, None) so cleanup is safe even when the yield body raises an exception.
     os.environ.pop("roll_EXEC_FUNC_NAME", None)
 
 

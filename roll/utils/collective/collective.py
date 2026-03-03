@@ -16,10 +16,11 @@ class GroupManager:
 
     def __init__(self):
         """
-        基于torch ProcessGroup 实现
+        ProcessGroup manager backed by torch.distributed.
         ref: https://github.com/ray-project/ray/blob/master/python/ray/util/collective/collective.py
         """
         self._name_group_map = {}
+        # Reverse map: group object → name. Needed for backend inspection via get_group_backend().
         self._group_name_map = {}
 
     def create_collective_group(
@@ -33,6 +34,8 @@ class GroupManager:
         global_ranks=None,
         timeout_s: Optional[float] = None,
     ):
+        # Convert seconds to timedelta; None keeps the PyTorch default (1800s).
+        # Configurable timeout lets callers tune for slow cross-node initializations.
         timeout = None if timeout_s is None else timedelta(seconds=float(timeout_s))
         group = init_custom_process_group(
             backend=backend,
@@ -53,6 +56,7 @@ class GroupManager:
     def get_group_by_name(self, group_name):
         """Get the collective group handle by its name."""
         if not self.is_group_exist(group_name):
+            # Fail fast: returning None here caused silent hangs in downstream collective ops.
             raise KeyError("The group '{}' is not initialized.".format(group_name))
         return self._name_group_map[group_name]
 
@@ -66,6 +70,7 @@ class GroupManager:
         try:
             dist.destroy_process_group(g)
         except Exception as e:
+            # Wrap with group name so callers can identify which group failed.
             raise RuntimeError(f"Failed to destroy process group: group_name={group_name}") from e
         # clean up the dicts
         del self._group_name_map[g]
@@ -83,6 +88,8 @@ def init_collective_group(
     backend: Union[str, Backend] = current_platform.communication_backend,
     group_name: str = "default",
     global_ranks: Optional[list] = None,
+    # Per-group timeout (seconds). None uses PyTorch's default (1800s).
+    # Set explicitly for groups that span slow cross-node links.
     timeout_s: Optional[float] = None,
 ):
     global _group_mgr

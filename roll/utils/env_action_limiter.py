@@ -68,14 +68,16 @@ class LimiterClient:
     
     def __init__(self, tag: str = "default", max_concurrent_calls: int = 10):
         self.tag = tag
+        # Scope limiter actors per pipeline so concurrent pipelines don't share rate limits.
         self.pipeline_id = os.environ.get("PIPELINE_ID") or ""
         self.limiter = None
         self.max_concurrent_calls = max_concurrent_calls
         self._initialize_limiter()
-    
+
     def _initialize_limiter(self):
         """Initialize global rate limiter"""
         if self.pipeline_id:
+            # Prefix with pipeline_id so each pipeline gets its own Ray actor instance.
             limiter_name = f"{self.pipeline_id}_GlobalLimiter_{self.tag}"
         else:
             limiter_name = f"GlobalLimiter_{self.tag}"
@@ -83,6 +85,7 @@ class LimiterClient:
             name=limiter_name,
             get_if_exists=True,
             namespace=RAY_NAMESPACE,
+            # Ray doesn't inherit runtime_env env vars from parent actors; propagate explicitly.
             runtime_env={"env_vars": rlix_env_vars()},
         ).remote(max_concurrent_calls=self.max_concurrent_calls)
 
@@ -124,6 +127,7 @@ def get_global_limiter(tag: str = "default", max_concurrent_calls: int = 10) -> 
     """Get API rate limiter instance for specified tag"""
     global _global_limiters
     pipeline_id = os.environ.get("PIPELINE_ID") or ""
+    # Use pipeline_id:tag as the cache key so each pipeline gets an isolated singleton.
     key = f"{pipeline_id}:{tag}" if pipeline_id else tag
     if key not in _global_limiters:
         _global_limiters[key] = LimiterClient(tag=tag, max_concurrent_calls=max_concurrent_calls)

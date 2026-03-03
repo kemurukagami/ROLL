@@ -944,7 +944,9 @@ def postprocess_generate(
             if len(val) == output_batch_size:
                 non_tensor_batch[key] = val
             elif len(val) == input_batch_size:
-                # Repeat each per-prompt value once per return sequence to align with output batch.
+                # np.repeat groups responses by prompt: repeat(["A","B"], K) → ["A","A","A","B","B","B"].
+                # This matches the output tensor layout where rows i*K..(i+1)*K all belong to prompt i.
+                # np.tile would interleave instead: ["A","B","A","B"] — misaligning lora_name with output rows.
                 non_tensor_batch[key] = np.repeat(val, int(num_return_sequences))
             else:
                 raise ValueError(

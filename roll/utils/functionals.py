@@ -933,9 +933,9 @@ def postprocess_generate(
     # Values already at output size are copied as-is; values at prompt size are repeated once per return sequence.
     non_tensor_batch = {}
     if prompts.non_tensor_batch:
-        input_batch_size = int(prompts.batch.batch_size[0]) if prompts.batch is not None else 0
-        if input_batch_size <= 0:
-            input_batch_size = output_batch_size // int(num_return_sequences)
+        if prompts.batch is None:
+            raise RuntimeError("postprocess_generate: prompts.batch is None but non_tensor_batch is set; all callers must provide a tensor batch.")
+        input_batch_size = int(prompts.batch.batch_size[0])
         for key, val in prompts.non_tensor_batch.items():
             if val is None:
                 continue

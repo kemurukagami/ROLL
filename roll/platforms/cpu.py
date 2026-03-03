@@ -1,6 +1,7 @@
 import os
 
 from .platform import Platform
+from ..utils.constants import DO_TIME_SHARING
 from ..utils.logging import get_logger
 
 
@@ -9,11 +10,11 @@ logger = get_logger()
 
 class CpuPlatform(Platform):
     """Platform for nodes without GPU/NPU accelerators (e.g., scheduler/coordinator nodes).
-    
+
     In RLix mode (time-sharing), CPU actors spawn GPU workers on other nodes and need to
     configure GPU visibility for those child workers. The device_control_env_var and
     ray_experimental_noset attributes are only applied in this mode via update_env_vars_for_visible_devices.
-    
+
     In standalone mode, CPU actors don't spawn GPU workers, so these attributes are unused.
     """
     device_name: str = "CPU"
@@ -24,7 +25,7 @@ class CpuPlatform(Platform):
 
     # GPU visibility attributes: only needed in RLix mode where CPU actors spawn GPU workers.
     # In standalone mode, these are None and update_env_vars_for_visible_devices() early-exits.
-    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+    if DO_TIME_SHARING:
         device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
         ray_experimental_noset: str = "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
     else:

@@ -15,6 +15,7 @@ from roll.distributed.executor.model_update_group import ModelUpdateGroup
 from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.scheduler.resource_manager import ResourceManager
 from roll.utils.checkpoint_manager import CheckpointManager, download_model
+from roll.utils.constants import DO_TIME_SHARING
 from roll.utils.functionals import reduce_metrics
 from roll.utils.logging import get_logger
 from roll.utils.tracking import create_tracker
@@ -30,7 +31,7 @@ class BasePipeline:
     def __init__(self, pipeline_config):
         set_seed(seed=pipeline_config.seed)
         self.pipeline_config = pipeline_config
-        if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+        if DO_TIME_SHARING:
             from roll.distributed.scheduler.resource_manager import (
                 get_or_create_roll_resource_manager_actor,
                 RollResourceManagerProxy,

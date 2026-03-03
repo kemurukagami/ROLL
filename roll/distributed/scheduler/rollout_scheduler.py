@@ -20,7 +20,7 @@ from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.pipeline.agentic.agentic_config import EnvManagerConfig
 from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
-from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
+from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE, rlix_env_vars
 from roll.utils.logging import get_logger
 from rlix.protocol.types import SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
 
@@ -378,12 +378,12 @@ class GroupQueueManager:
         self.rollout_complete = {}
 
         self.pipeline_id = os.environ.get("PIPELINE_ID") or None
-        self._rlix_enabled = os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix" and self.mode == "train"
+        self._rlix_enabled = DO_TIME_SHARING and self.mode == "train"
         self.adapter_id = self.env_manager_config.tags[0] if getattr(self.env_manager_config, "tags", None) else None
         self._rlix_scheduler = None
         if self._rlix_enabled:
             if not self.pipeline_id:
-                raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
+                raise RuntimeError("DO_TIME_SHARING mode requires PIPELINE_ID to be set")
             try:
                 self._rlix_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
             except Exception as e:
@@ -921,7 +921,7 @@ class RolloutScheduler(RolloutMockMixin):
         self.logger.info(f"[RolloutScheduler] advance_step start mode={self.mode} global_step={global_step}")
         await self.env_output_queue.advance_step.remote(global_step)
         self.logger.info(f"[RolloutScheduler] advance_step done mode={self.mode} global_step={global_step}")
-        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
+        if not DO_TIME_SHARING:
             await self.generate_scheduler.resume.remote()
 
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))

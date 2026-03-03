@@ -22,7 +22,7 @@ from roll.pipeline.agentic.env_manager.token_mask_utils import split_by_token, \
     token_ids_to_assistant_mask
 from roll.pipeline.agentic.env_manager.traj_env_manager import TrajEnvManager
 from roll.pipeline.agentic.llm_proxy import BaseLLMProxy, create_llm_proxy
-from roll.utils.constants import EpisodeStopReason, GenerateStopReason, RAY_NAMESPACE
+from roll.utils.constants import DO_TIME_SHARING, EpisodeStopReason, GenerateStopReason, RAY_NAMESPACE
 from roll.utils.env_action_limiter import get_global_limiter
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.logging import get_logger
@@ -185,7 +185,7 @@ class VLTrajEnvManager(TrajEnvManager):
                     self.stop_reason = EpisodeStopReason.MAX_LENGTH
                 elif generation_stop_reason == GenerateStopReason.ABORT:
                     self.stop_reason = EpisodeStopReason.ABORT
-                    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+                    if DO_TIME_SHARING:
                         self.rollout_cache.attempt += 1
             log_stats["current_step"].append(self.current_step)
             log_stats["generate_time"].append(generate_timer.last)

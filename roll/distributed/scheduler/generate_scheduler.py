@@ -36,7 +36,7 @@ from roll.utils.taskgroups import TaskGroup # TODO use official TaskGroup after 
 from roll.utils.metrics.metrics_manager import DurationTracker
 from roll.utils.import_utils import safe_import_class
 from roll.utils.logging import get_logger
-from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE
 
 
 logger = get_logger()
@@ -2059,13 +2059,13 @@ class RequestScheduler:
                 self._validate_calculated_ranks(load_ranks, mode="expand")
                 # In RLix mode, delay vLLM KV cache init until after selective model update completes.
                 # This avoids holding large KV allocations during weight sync (which needs extra headroom).
-                if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix" and load_ranks:
+                if DO_TIME_SHARING and load_ranks:
                     pipeline_id = os.environ.get("PIPELINE_ID") or None
                     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE") or None
                     if not pipeline_id:
-                        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
+                        raise RuntimeError("DO_TIME_SHARING mode requires PIPELINE_ID to be set")
                     if not ray_namespace:
-                        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires ROLL_RAY_NAMESPACE to be set")
+                        raise RuntimeError("DO_TIME_SHARING mode requires ROLL_RAY_NAMESPACE to be set")
                     try:
                         model_update_service = ray.get_actor(
                             f"{pipeline_id}_model_update_service",

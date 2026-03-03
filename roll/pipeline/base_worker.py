@@ -23,6 +23,7 @@ from roll.models.model_providers import (
 )
 from roll.platforms import current_platform
 from roll.utils.checkpoint_manager import download_model
+from roll.utils.constants import DO_TIME_SHARING
 from roll.utils.context_managers import state_offload_manger, log_gpu_memory_usage
 from roll.utils.dynamic_batching import make_mini_batch_iter_for_dynamic_batching
 from roll.utils.functionals import agg_loss, append_to_dict, compute_approx_kl, masked_mean, postprocess_generate, reduce_metrics
@@ -168,9 +169,9 @@ class ActorWorker(Worker):
             # Use append_to_dict to match train_step accumulation pattern (consistent with reducers).
             append_to_dict(metrics, lora_metrics)
             # Build CPU bucket cache for dirty adapters while GPU weights are still resident.
-            # Only applicable when RLix selective sync is enabled (RLIX_CONTROL_PLANE=rlix).
+            # Only applicable when RLix selective sync is enabled (DO_TIME_SHARING mode).
             # Must run before state_offload_manger offloads weights back to CPU.
-            if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+            if DO_TIME_SHARING:
                 # per_adapter_step is set by RLixMultiLoraPipeline.run() via meta_info["global_step"].
                 per_adapter_step = int(data.meta_info.get("global_step", 0))
                 checkpoint_version = int(data.meta_info.get("checkpoint_version", per_adapter_step))

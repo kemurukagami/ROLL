@@ -17,16 +17,11 @@ from roll.distributed.scheduler.driver_utils import (
     wait_for_nodes,
 )
 from roll.distributed.scheduler.log_monitor import LogMonitorListener
-from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE
 from roll.utils.logging import get_logger
 from roll.platforms import current_platform
 
 logger = get_logger()
-# todo(tao) refactor this into util or constants ?
-
-def do_time_sharing() -> bool:
-    """Check if running in time-sharing mode (multiple pipelines sharing GPU via RLix scheduler)."""
-    return os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix"
 
 
 def start_ray_cluster():
@@ -65,7 +60,7 @@ def start_ray_cluster():
 
 
 def init():
-    if do_time_sharing():
+    if DO_TIME_SHARING:
         runtime_env = {
             "env_vars": current_platform.get_custom_env_vars(),
         }

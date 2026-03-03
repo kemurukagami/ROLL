@@ -16,7 +16,7 @@ from roll.pipeline.agentic.env_manager.base_env_manager import RolloutCache
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.env_manager.token_mask_utils import convert_list_content_str
 from roll.pipeline.agentic.env_manager.traj_env_manager import TrajEnvManager
-from roll.utils.constants import GenerateStopReason, EpisodeStopReason
+from roll.utils.constants import DO_TIME_SHARING, GenerateStopReason, EpisodeStopReason
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.hash_utils import compute_object_hash
 from roll.utils.lora_routing import normalize_domain
@@ -75,7 +75,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                     self.stop_reason = EpisodeStopReason.MAX_LENGTH
                 elif stop_reason == GenerateStopReason.ABORT:
                     self.stop_reason = EpisodeStopReason.ABORT
-                    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+                    if DO_TIME_SHARING:
                         self.rollout_cache.attempt += 1
             self.log_stats["current_step"].append(self.current_step)
             self.log_stats["generate_time"].append(round(generate_timer.last))

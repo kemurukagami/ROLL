@@ -6,6 +6,7 @@ import os
 # Validate required env vars at import time so that misconfigured Ray workers
 # crash immediately with a clear message rather than failing deep in actor init.
 _RLIX_CONTROL_PLANE = os.environ.get("RLIX_CONTROL_PLANE", "")
+DO_TIME_SHARING = _RLIX_CONTROL_PLANE == "rlix"  # True when running under RLix scheduler
 if _RLIX_CONTROL_PLANE == "rlix":
     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
     if not ray_namespace:
@@ -39,19 +40,19 @@ def rlix_env_vars() -> dict[str, str]:
 
     Use this when creating child actors from within a pipeline actor; Ray does not reliably
     inherit runtime_env env vars from parent actors.
-    
+
     Only propagates env vars that are explicitly set; no defaults are applied here.
     Defaults should be configured by the orchestrator or container environment.
     """
-    if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
+    if not DO_TIME_SHARING:
         return {}
     # In RLix mode, roll.* import already validated these exist; keep them explicit here too.
     pipeline_id = os.environ.get("PIPELINE_ID")
     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
     if not pipeline_id:
-        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
+        raise RuntimeError("DO_TIME_SHARING mode requires PIPELINE_ID to be set")
     if not ray_namespace:
-        raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires ROLL_RAY_NAMESPACE to be set")
+        raise RuntimeError("DO_TIME_SHARING mode requires ROLL_RAY_NAMESPACE to be set")
     
     env_vars: dict[str, str] = {
         "PIPELINE_ID": pipeline_id,

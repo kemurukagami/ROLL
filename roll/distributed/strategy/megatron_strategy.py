@@ -63,6 +63,7 @@ from roll.third_party.megatron.offload_states_patch import (
 from roll.third_party.megatron.optimizer import get_megatron_optimizer
 from roll.third_party.megatron.tensor_parallel import vocab_parallel_entropy
 from roll.utils.constants import (
+    DO_TIME_SHARING,
     DIST_OPTIMIZER_DIR,
     IGNORE_INDEX,
     OPTIMIZER_NAME,
@@ -1506,7 +1507,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 MTPLossLoggingHelper.clean_loss_in_tracker()
                 metrics.update(mtp_total_loss_dict)
 
-        if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+        if DO_TIME_SHARING:
             checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
             self._build_latest_bucket_cache(checkpoint_version=checkpoint_version, global_step=int(global_step))
             # fixme(tao) it need an if test, default to false, and only promt after cache explicitly  
@@ -2071,7 +2072,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 self._latest_cached = cache_key
 
     def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
-        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
+        if not DO_TIME_SHARING:
             raise RuntimeError("promote_active_checkpoint is only supported under RLix control plane")
 
         cache_key = (int(checkpoint_version), int(global_step))
@@ -2120,7 +2121,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         is_leader: bool = False,
         adapters_to_sync: Optional[List[str]] = None,
     ) -> None:
-        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
+        if not DO_TIME_SHARING:
             raise RuntimeError("selective_sync_active_cache is only supported under RLix control plane")
 
         tgt_dp_ranks = sorted(set(int(r) for r in tgt_dp_ranks))

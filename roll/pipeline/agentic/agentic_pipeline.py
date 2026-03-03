@@ -27,7 +27,7 @@ from roll.pipeline.agentic.utils import (
     get_agentic_response_level_mask,
 )
 from roll.pipeline.base_pipeline import BasePipeline
-from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
+from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE, rlix_env_vars
 from roll.utils.dynamic_batching import dynamic_batching_shard
 from roll.utils.functionals import (
     RunningMoments,
@@ -59,7 +59,7 @@ class AgenticPipeline(BasePipeline):
 
         # Derived configuration for partial GPU mode (auto-detected from device_mapping)
         self.partial_gpu_mode: bool = False
-        rlix_mode = os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix"
+        rlix_mode = DO_TIME_SHARING
 
         self.kl_ctrl = get_kl_controller(
             init_kl_coef=self.pipeline_config.init_kl_coef,

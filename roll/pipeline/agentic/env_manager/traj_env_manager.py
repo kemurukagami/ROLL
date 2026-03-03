@@ -22,7 +22,7 @@ from roll.pipeline.agentic.tools.tool_env_wrapper import tool_wrapper
 from roll.distributed.scheduler.generate_scheduler import RequestScheduler
 from roll.distributed.scheduler.protocol import DataProto
 from roll.pipeline.agentic.agentic_config import EnvManagerConfig, AgenticConfig
-from roll.utils.constants import GenerateStopReason
+from roll.utils.constants import DO_TIME_SHARING, GenerateStopReason
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.logging import get_logger
 from roll.utils.lora_routing import normalize_domain
@@ -92,12 +92,12 @@ class TrajEnvManager(BaseEnvManager):
         )
 
     def _maybe_set_rlix_request_id(self, lm_input: DataProto) -> None:
-        if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
+        if not DO_TIME_SHARING:
             return
 
         pipeline_id = os.environ.get("PIPELINE_ID")
         if not pipeline_id:
-            raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
+            raise RuntimeError("DO_TIME_SHARING mode requires PIPELINE_ID to be set")
         if self.rollout_cache is None:
             raise RuntimeError("RLIX canonical request ID requires rollout_cache to be set")
         if self.episode_id is None:
@@ -159,7 +159,7 @@ class TrajEnvManager(BaseEnvManager):
                 elif stop_reason == GenerateStopReason.ABORT:
                     # Retry the same turn (same step) after abort. This is used to survive
                     # shrink/rebalance aborts. Each retry increments attempt so request_ids remain unique.
-                    if os.environ.get("RLIX_CONTROL_PLANE", "") == "rlix":
+                    if DO_TIME_SHARING:
                         self.rollout_cache.attempt += 1
             log_stats["step_time"].append(step_timer.last)
 

@@ -48,18 +48,18 @@ class Platform:
     # Examples: "GPU", "NPU"
     ray_device_key: str
 
-    # platform-agnostic way to specify the device control environment variable,
-    # .e.g. CUDA_VISIBLE_DEVICES for CUDA.
+    # Platform-specific device visibility environment variable.
     # hint: search for "get_visible_accelerator_ids_env_var" in
     # https://github.com/ray-project/ray/tree/master/python/ray/_private/accelerators # noqa
     # Examples: "CUDA_VISIBLE_DEVICES", "ASCEND_RT_VISIBLE_DEVICES"
-    device_control_env_var: str
+    # Set to None for platforms that don't control GPU visibility (e.g., CpuPlatform in standalone mode).
+    device_control_env_var: str | None
 
-    # Optional Ray experimental config
-    # Some accelerators require specific flags in Ray start parameters;
-    # leave blank if not needed
+    # Ray experimental flag to prevent auto-setting device visibility.
+    # Required when spawning workers with specific GPU assignments via placement groups.
     # Example: "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
-    ray_experimental_noset: str
+    # Set to None for platforms that don't control GPU visibility.
+    ray_experimental_noset: str | None
 
     # Communication backend for distributed training
     # Examples: "nccl", "hccl"
@@ -132,7 +132,11 @@ class Platform:
         Behavior:
             - Sets the platform-specific visibility environment variable.
             - Sets the corresponding Ray experimental flag if needed.
+            - Skips if platform doesn't support device visibility (None attributes).
         """
+        # Skip if platform doesn't support device visibility control (e.g., CpuPlatform in standalone mode).
+        if cls.device_control_env_var is None or cls.ray_experimental_noset is None:
+            return
         visible_devices_env_vars = {
             cls.device_control_env_var: ",".join(map(str, gpu_ranks)),
             cls.ray_experimental_noset: "1",

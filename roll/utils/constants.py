@@ -3,6 +3,8 @@ import logging
 import os
 
 
+# Validate required env vars at import time so that misconfigured Ray workers
+# crash immediately with a clear message rather than failing deep in actor init.
 _RLIX_CONTROL_PLANE = os.environ.get("RLIX_CONTROL_PLANE", "")
 if _RLIX_CONTROL_PLANE == "rlix":
     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")
@@ -37,6 +39,9 @@ def rlix_env_vars() -> dict[str, str]:
 
     Use this when creating child actors from within a pipeline actor; Ray does not reliably
     inherit runtime_env env vars from parent actors.
+    
+    Only propagates env vars that are explicitly set; no defaults are applied here.
+    Defaults should be configured by the orchestrator or container environment.
     """
     if os.environ.get("RLIX_CONTROL_PLANE", "") != "rlix":
         return {}
@@ -47,28 +52,29 @@ def rlix_env_vars() -> dict[str, str]:
         raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires PIPELINE_ID to be set")
     if not ray_namespace:
         raise RuntimeError("RLIX_CONTROL_PLANE=rlix requires ROLL_RAY_NAMESPACE to be set")
-    grpc_pool_size = os.environ.get("RAY_grpc_server_thread_pool_size", "4")
-    omp_threads = os.environ.get("OMP_NUM_THREADS", "1")
-    logging.getLogger(__name__).info(
-        "[rlix_env_vars] pid=%d RAY_grpc_server_thread_pool_size=%s OMP_NUM_THREADS=%s",
-        os.getpid(),
-        grpc_pool_size,
-        omp_threads,
-    )
-    return {
+    
+    env_vars: dict[str, str] = {
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
         "RLIX_CONTROL_PLANE": "rlix",
-        # Keep imports working when Ray workers start outside the repo root.
-        "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
-        # Limit math library threads per actor to avoid hitting container pids.max.
-        "OMP_NUM_THREADS": omp_threads,
-        "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "1"),
-        "OPENBLAS_NUM_THREADS": os.environ.get("OPENBLAS_NUM_THREADS", "1"),
-        # Limit gRPC sync thread pool per actor to avoid hitting container pids.max.
-        # Default is 32; 4 is sufficient for RL pipeline actor communication throughput.
-        "RAY_grpc_server_thread_pool_size": grpc_pool_size,
     }
+    
+    # Propagate PYTHONPATH if set (for imports when Ray workers start outside repo root).
+    if pythonpath := os.environ.get("PYTHONPATH"):
+        env_vars["PYTHONPATH"] = pythonpath
+    
+    # Propagate thread-limiting vars only if explicitly set (to avoid PID limits in containers).
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", 
+                "RAY_grpc_server_thread_pool_size"):
+        if value := os.environ.get(var):
+            env_vars[var] = value
+    
+    logging.getLogger(__name__).info(
+        "[rlix_env_vars] pid=%d propagating %d env vars",
+        os.getpid(),
+        len(env_vars),
+    )
+    return env_vars
 
 
 class GenerateStopReason(enum.Enum):

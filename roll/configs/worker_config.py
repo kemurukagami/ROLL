@@ -246,6 +246,8 @@ class WorkerConfig:
                     self.device_mapping = ast.literal_eval(self.device_mapping)
                 except (ValueError, SyntaxError):
                     # Backward compatibility: many configs use "list(range(...))".
+                    # RISK: __builtins__={} reduces but does not fully sandbox eval;
+                    # acceptable only because input is a local config file, not user input.
                     self.device_mapping = eval(
                         self.device_mapping,
                         {"__builtins__": {}},

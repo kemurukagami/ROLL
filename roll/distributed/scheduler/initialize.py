@@ -22,6 +22,7 @@ from roll.utils.logging import get_logger
 from roll.platforms import current_platform
 
 logger = get_logger()
+# todo(tao) refactor this into util or constants ?
 
 def do_time_sharing() -> bool:
     """Check if running in time-sharing mode (multiple pipelines sharing GPU via RLix scheduler)."""

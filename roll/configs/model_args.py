@@ -13,6 +13,9 @@ class LoraArguments:
     Arguments pertaining to the LoRA training.
     """
 
+    #todo(tao) rename as lora_name systematically
+    # Unique identifier for this adapter, used as routing key in multi-LoRA dispatch.
+    # Names are normalized via normalize_domain() to lowercase slugs (e.g., "Math/v2" -> "math_v2").
     adapter_name: str = field(
         default="default",
         metadata={"help": "The name of the adapter to be injected."},
@@ -67,6 +70,9 @@ class ModelArguments(LoraArguments):
             "help": "Path to the model weight or identifier from huggingface.co/models or modelscope.cn/models."
         },
     )
+    # Multi-LoRA support: maps normalized adapter names to their LoraArguments configs.
+    # Single-LoRA configs using legacy top-level lora_rank/lora_target are auto-converted
+    # to adapters={"default": LoraArguments(...)} in __post_init__.
     adapters: Optional[Dict[str, LoraArguments]] = field(
         default=None,
         metadata={"help": "List of LoRA adapter configurations."},
@@ -129,18 +135,76 @@ class ModelArguments(LoraArguments):
         default=1,
         metadata={"help": "The group size for Ulysses attention."},
     )
-    # True when adapters were auto-derived from legacy top-level lora_rank/lora_target fields.
-    _derived_adapters_from_legacy_lora_fields: bool = field(default=False, repr=False)
+    # Maps raw adapter names (as written in YAML) to their normalized slugs.
+    # Used for reverse lookups when routing tags come from external sources that
+    # may use the original non-normalized spelling.
     adapter_name_map: dict[str, str] = field(default_factory=dict, init=False)
 
-    def __post_init__(self):
-        def split_arg(arg):
-            if isinstance(arg, str):
-                return [item.strip() for item in arg.split(",")]
-            return arg
+    @property
+    def _is_single_lora(self) -> bool:
+        """True when using legacy top-level lora fields (no explicit adapters dict).
 
-        # Keep legacy top-level LoRA fields functional by canonicalizing to adapters.
-        if self.adapters is None and self.lora_rank is not None and self.lora_target is not None:
+        Internal only: meaningful before __post_init__ canonicalizes single-LoRA
+        into an adapters dict. After init, use is_multi_lora to distinguish.
+        """
+        return self.adapters is None and self.lora_rank is not None and self.lora_target is not None
+
+    @property
+    def is_multi_lora(self) -> bool:
+        """True when the config carries multiple named LoRA adapters."""
+        return self.adapters is not None and len(self.adapters) > 1
+
+    @staticmethod
+    def _split_arg(arg):
+        """Split a comma-separated string into a list of stripped items."""
+        if isinstance(arg, str):
+            return [item.strip() for item in arg.split(",")]
+        return arg
+
+    def _normalize_adapters(self) -> None:
+        """Normalize adapter names to lowercase slugs and apply per-adapter defaults."""
+        if self.adapters is None:
+            return
+
+        normalized_adapters: dict[str, LoraArguments] = {}
+        raw_to_final: dict[str, str] = {}
+        seen_bases: set[str] = set()
+        for raw_adapter_name, adapter_config in self.adapters.items():
+            base = normalize_domain(raw_adapter_name)
+            # Fail fast on normalization collisions to keep tag->adapter mapping deterministic.
+            if base in seen_bases:
+                raise RuntimeError(
+                    f"Adapter name collision: '{raw_adapter_name}' normalizes to '{base}' "
+                    "which conflicts with an earlier adapter. Use distinct adapter names."
+                )
+            seen_bases.add(base)
+            adapter_config.adapter_name = base
+            if adapter_config.lora_alpha is None or adapter_config.lora_alpha <= 0:
+                adapter_config.lora_alpha = adapter_config.lora_rank * 2
+            if adapter_config.lora_target is not None and not any(
+                c in adapter_config.lora_target for c in ["*", "$", "|", "("]
+            ):
+                adapter_config.lora_target = self._split_arg(adapter_config.lora_target)
+            adapter_config.additional_target = self._split_arg(adapter_config.additional_target)
+            normalized_adapters[base] = adapter_config
+            raw_to_final[str(raw_adapter_name)] = base
+        self.adapters = normalized_adapters
+        self.adapter_name_map = raw_to_final
+
+    def __post_init__(self):
+        # --- LoRA mode dispatch ---
+        # Multi-LoRA: adapters dict is set explicitly in config.
+        # Only normalize the per-adapter configs; top-level lora_rank/lora_alpha are ignored.
+        # Empty adapters dict ({}) is treated as config error — fail fast to catch typos.
+        if self.adapters is not None:
+            if len(self.adapters) == 0:
+                raise ValueError("adapters dict is empty; remove it or add at least one adapter.")
+            self._normalize_adapters()
+
+        # Single-LoRA: top-level lora_rank + lora_target set, no adapters dict.
+        # Canonicalize into a single-entry adapters dict for uniform downstream access.
+        elif self._is_single_lora:
+            self.lora_alpha = self.lora_alpha or self.lora_rank * 2
             self.adapters = {
                 "default": LoraArguments(
                     adapter_name="default",
@@ -150,40 +214,16 @@ class ModelArguments(LoraArguments):
                     lora_target=self.lora_target,
                 )
             }
-            # Mark that this config used legacy single-LoRA fields and was normalized to adapters.
-            self._derived_adapters_from_legacy_lora_fields = True
+            self._normalize_adapters()
 
-        self.lora_alpha = self.lora_alpha or self.lora_rank * 2
+        # No-LoRA: neither adapters nor lora_target set. Nothing to do.
+
+        # --- Fields that apply regardless of LoRA mode ---
         if self.lora_target is not None and not any(c in self.lora_target for c in ["*", "$", "|", "("]):
             # split when lora_target is not regex expression
-            self.lora_target = split_arg(self.lora_target)
-        self.freeze_module_prefix: Optional[List[str]] = split_arg(self.freeze_module_prefix)
-        self.additional_target: Optional[List[str]] = split_arg(self.additional_target)
-        if self.adapters is not None:
-            normalized_adapters: dict[str, LoraArguments] = {}
-            raw_to_final: dict[str, str] = {}
-            seen_bases: set[str] = set()
-            for raw_adapter_name, adapter_config in self.adapters.items():
-                base = normalize_domain(raw_adapter_name)
-                # Fail fast on normalization collisions to keep tag->adapter mapping deterministic.
-                if base in seen_bases:
-                    raise RuntimeError(
-                        f"Adapter name collision: '{raw_adapter_name}' normalizes to '{base}' "
-                        "which conflicts with an earlier adapter. Use distinct adapter names."
-                    )
-                seen_bases.add(base)
-                adapter_config.adapter_name = base
-                if adapter_config.lora_alpha is None or adapter_config.lora_alpha <= 0:
-                    adapter_config.lora_alpha = adapter_config.lora_rank * 2
-                if adapter_config.lora_target is not None and not any(
-                    c in adapter_config.lora_target for c in ["*", "$", "|", "("]
-                ):
-                    adapter_config.lora_target = split_arg(adapter_config.lora_target)
-                adapter_config.additional_target = split_arg(adapter_config.additional_target)
-                normalized_adapters[base] = adapter_config
-                raw_to_final[str(raw_adapter_name)] = base
-            self.adapters = normalized_adapters
-            self.adapter_name_map = raw_to_final
+            self.lora_target = self._split_arg(self.lora_target)
+        self.freeze_module_prefix: Optional[List[str]] = self._split_arg(self.freeze_module_prefix)
+        self.additional_target: Optional[List[str]] = self._split_arg(self.additional_target)
 
         dtype_mapping = {
             "fp32": torch.float32,

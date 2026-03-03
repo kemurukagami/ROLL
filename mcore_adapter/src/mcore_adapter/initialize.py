@@ -53,6 +53,8 @@ def _initialize_distributed(args: "TrainingArguments"):
             rank=int(os.getenv("RANK", "0")),
             world_size=int(os.getenv("WORLD_SIZE", "1")),
             timeout=args.ddp_timeout_delta,
+            # Explicitly bind NCCL to this GPU from the start; avoids ambiguous
+            # device selection when multiple GPUs are visible to the process.
             device_id=torch.device(args.device),
         )
     # Set the tensor model-parallel, pipeline model-parallel, and

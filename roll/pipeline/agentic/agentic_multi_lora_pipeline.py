@@ -16,7 +16,12 @@ from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.scheduler.rollout_scheduler import RolloutScheduler
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.agentic.agentic_config import AgenticConfig, EnvManagerConfig
-from roll.pipeline.agentic.agentic_pipeline import compute_rollout_traj_metrics, compute_train_data_metrics
+from roll.pipeline.agentic.agentic_pipeline import (
+    compute_rollout_traj_metrics,
+    compute_train_data_metrics,
+    target_gpus_to_dp_ranks_to_remove,
+    target_gpus_to_dp_ranks_to_add,
+)
 from roll.pipeline.agentic.utils import (
     agentic_compute_advantage,
     compute_discounted_returns,
@@ -325,6 +330,9 @@ class AgenticMultiLoraPipeline(BasePipeline):
             gpus_per_dp_rank = tp_size * pp_size
             freed_gpus = train_devices | critic_devices
             self._validate_minimum_active_ranks(infer_dp_size, infer_devices, list(freed_gpus), gpus_per_dp_rank)
+            # Store TP/PP-aware attributes for GPU→dp_rank translation in shrink/expand.
+            self._infer_gpus_per_dp_rank = gpus_per_dp_rank
+            self._infer_device_mapping = list(self.actor_infer.worker_config.device_mapping)
             logger.info(f"Partial GPU mode validated: infer_dp_size={infer_dp_size}, freed_gpus={sorted(freed_gpus)}")
             return True
 
@@ -670,39 +678,29 @@ class AgenticMultiLoraPipeline(BasePipeline):
                                             len(active_tags),
                                             len(pending_by_tag),
                                         )
+                                    # Translate target_gpus to dp_ranks using TP/PP-aware mapping.
+                                    dp_ranks = target_gpus_to_dp_ranks_to_remove(
+                                        target_gpus=target_gpus,
+                                        gpus_per_dp_rank=self._infer_gpus_per_dp_rank,
+                                        device_mapping=self._infer_device_mapping,
+                                    )
                                     # Multi-scheduler safety: shrink (routing update + abort/drain) must be applied to
                                     # every RequestScheduler that can dispatch to the soon-to-be-offloaded ranks.
-                                    #
-                                    # Barrier is applied to the target dp_ranks only:
-                                    # 1) shrink ALL schedulers with skip_offload=True so none can route to offload ranks
-                                    # 2) wait until ALL schedulers report zero in-flight on those ranks
-                                    # 3) offload ONCE (scheduler[0]) for those ranks
+                                    # 2-phase pattern: all schedulers except first do routing-only shrink,
+                                    # then first scheduler does routing + physical offload.
                                     schedulers = list(self.rollout_schedulers.values())
-                                    offload_ranks = ray.get(schedulers[0].get_offload_ranks_for_target_gpus.remote(target_gpus))
-                                    shrink_metrics_list = ray.get(
-                                        [sched.shrink_sampler.remote(target_gpus, skip_offload=True) for sched in schedulers]
-                                    )
-
-                                    drain_timeout_s = float(os.environ.get("ROLL_VLLM_DRAIN_TIMEOUT_S", "30"))
-                                    deadline = time.monotonic() + max(1.0, drain_timeout_s)
-                                    while True:
-                                        inflight_list = ray.get(
-                                            [sched.get_inflight_counts.remote(offload_ranks) for sched in schedulers]
+                                    if len(schedulers) > 1:
+                                        phase1_metrics = ray.get(
+                                            [sched.shrink_sampler.remote(dp_ranks, skip_offload=True) for sched in schedulers[1:]]
                                         )
-                                        if all(all(v == 0 for v in inflight.values()) for inflight in inflight_list):
-                                            break
-                                        if time.monotonic() >= deadline:
-                                            raise RuntimeError(
-                                                "PartialGPU shrink timed out waiting for in-flight drain on offload ranks: "
-                                                f"offload_ranks={offload_ranks} inflight={inflight_list}"
-                                            )
-                                        time.sleep(0.2)
-
-                                    offload_metrics = ray.get(schedulers[0].offload_dp_ranks.remote(offload_ranks))
+                                    else:
+                                        phase1_metrics = []
+                                    # Phase 2: first scheduler stops routing + does physical offload.
+                                    phase2_metrics = ray.get(schedulers[0].shrink_sampler.remote(dp_ranks, skip_offload=False))
+                                    shrink_metrics_list = [phase2_metrics] + phase1_metrics
 
                                     for idx, shrink_metrics in enumerate(shrink_metrics_list):
                                         tick_metrics.update({f"shrink/{idx}/{k}": v for k, v in shrink_metrics.items()})
-                                    tick_metrics.update({f"shrink/offload/{k}": v for k, v in offload_metrics.items()})
                                     if os.environ.get("ROLL_LOG_PARTIAL_GPU_OPS", "0") == "1":
                                         logger.info(
                                             "PartialGPU tick=%s shrink done: metrics=%s",
@@ -888,14 +886,21 @@ class AgenticMultiLoraPipeline(BasePipeline):
                                             global_tick,
                                             target_gpus,
                                         )
-                                    # Expand should (1) reload offloaded inference workers and (2) restore routing state.
-                                    # Only the first scheduler performs the actual load; others only update routing.
-                                    expand_metrics_list = ray.get(
-                                        [
-                                            sched.expand_sampler.remote(target_gpus, skip_load=(idx != 0))
-                                            for idx, sched in enumerate(self.rollout_schedulers.values())
-                                        ]
+                                    # Translate target_gpus to dp_ranks using TP/PP-aware mapping.
+                                    dp_ranks = target_gpus_to_dp_ranks_to_add(
+                                        target_gpus=target_gpus,
+                                        gpus_per_dp_rank=self._infer_gpus_per_dp_rank,
+                                        device_mapping=self._infer_device_mapping,
                                     )
+                                    # Expand sequentially: first scheduler loads model states, then others
+                                    # update routing only. Parallel expand would allow routing to new ranks
+                                    # before model states are loaded (mirrors agentic_pipeline._expand_workers).
+                                    scheds = list(self.rollout_schedulers.values())
+                                    first_metrics = ray.get(scheds[0].expand_sampler.remote(dp_ranks, skip_load=False))
+                                    rest_metrics = ray.get(
+                                        [sched.expand_sampler.remote(dp_ranks, skip_load=True) for sched in scheds[1:]]
+                                    )
+                                    expand_metrics_list = [first_metrics] + rest_metrics
                                     for idx, expand_metrics in enumerate(expand_metrics_list):
                                         tick_metrics.update({f"expand/{idx}/{k}": v for k, v in expand_metrics.items()})
                                         for name in dirty_adapters:

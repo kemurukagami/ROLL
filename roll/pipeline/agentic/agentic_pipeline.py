@@ -46,6 +46,96 @@ from roll.utils.offload_states import OffloadStateType
 logger = get_logger()
 
 
+def target_gpus_to_dp_ranks_to_remove(
+    *, target_gpus: List[int], gpus_per_dp_rank: int, device_mapping: List[int]
+) -> List[int]:
+    """Translate target GPU IDs to DP ranks for shrink (intersection semantics).
+
+    A DP rank is included if ANY of its GPUs overlap with target_gpus.
+    This is used for shrink operations where we want to offload any rank
+    that touches the training GPU set.
+
+    Args:
+        target_gpus: GPU IDs to shrink from (e.g., training GPUs)
+        gpus_per_dp_rank: Number of GPUs per DP rank (tp_size * pp_size)
+        device_mapping: Full device mapping for the infer cluster
+
+    Returns:
+        List of DP ranks that have any overlap with target_gpus
+    """
+    if not isinstance(target_gpus, list) or not target_gpus:
+        raise ValueError("target_gpus must be a non-empty list[int]")
+    gpus_per_dp_rank = int(gpus_per_dp_rank)
+    device_mapping = list(device_mapping)
+    if len(device_mapping) % gpus_per_dp_rank != 0:
+        raise RuntimeError("device_mapping length must be divisible by gpus_per_dp_rank")
+    target = set(int(x) for x in target_gpus)
+    min_gpu = min(target)
+    max_gpu = max(target)
+    if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
+        logger.warning(
+            f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
+            f"({gpus_per_dp_rank}). DP rank boundary violation detected "
+            f"for target GPUs {sorted(target)}. "
+            f"Rollout DP ranks may not cleanly map to training GPUs."
+        )
+    max_dp = len(device_mapping) // gpus_per_dp_rank
+    out: List[int] = []
+    for dp_rank in range(max_dp):
+        start = dp_rank * gpus_per_dp_rank
+        dp_gpus = set(int(x) for x in device_mapping[start : start + gpus_per_dp_rank])
+        if dp_gpus.intersection(target):
+            out.append(dp_rank)
+    if not out:
+        raise RuntimeError("No dp ranks matched target_gpus for shrink")
+    return out
+
+
+def target_gpus_to_dp_ranks_to_add(
+    *, target_gpus: List[int], gpus_per_dp_rank: int, device_mapping: List[int]
+) -> List[int]:
+    """Translate target GPU IDs to DP ranks for expand (subset semantics).
+
+    A DP rank is included only if ALL its GPUs are in target_gpus.
+    This is used for expand operations where we only want to activate ranks
+    whose full GPU slice is available.
+
+    Args:
+        target_gpus: Available GPU IDs (e.g., all infer GPUs after model_update)
+        gpus_per_dp_rank: Number of GPUs per DP rank (tp_size * pp_size)
+        device_mapping: Full device mapping for the infer cluster
+
+    Returns:
+        List of DP ranks whose GPU slice is fully contained in target_gpus
+    """
+    if not isinstance(target_gpus, list) or not target_gpus:
+        raise ValueError("target_gpus must be a non-empty list[int]")
+    gpus_per_dp_rank = int(gpus_per_dp_rank)
+    device_mapping = list(device_mapping)
+    if len(device_mapping) % gpus_per_dp_rank != 0:
+        raise RuntimeError("device_mapping length must be divisible by gpus_per_dp_rank")
+    target = set(int(x) for x in target_gpus)
+    min_gpu = min(target)
+    max_gpu = max(target)
+    if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
+        logger.warning(
+            f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
+            f"({gpus_per_dp_rank}). DP rank boundary violation detected "
+            f"for target GPUs {sorted(target)}. "
+            f"Rollout DP ranks may not cleanly map to training GPUs."
+        )
+    max_dp = len(device_mapping) // gpus_per_dp_rank
+    out: List[int] = []
+    for dp_rank in range(max_dp):
+        start = dp_rank * gpus_per_dp_rank
+        dp_gpus = set(int(x) for x in device_mapping[start : start + gpus_per_dp_rank])
+        if dp_gpus and dp_gpus.issubset(target):
+            out.append(dp_rank)
+    if not out:
+        raise RuntimeError("No dp ranks matched target_gpus for expand")
+    return out
+
+
 def is_lora_training(pipeline_config: AgenticConfig) -> bool:
     return pipeline_config.actor_train.model_args.lora_target is not None
 
@@ -235,62 +325,20 @@ class AgenticPipeline(BasePipeline):
             self.partial_gpu_mode = False
 
     def _target_gpus_to_dp_ranks_to_remove(self, *, target_gpus: List[int]) -> List[int]:
-        if not isinstance(target_gpus, list) or not target_gpus:
-            raise ValueError("target_gpus must be a non-empty list[int]")
-        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
-        device_mapping = list(self._infer_device_mapping)
-        if len(device_mapping) % gpus_per_dp_rank != 0:
-            raise RuntimeError("actor_infer.device_mapping length must be divisible by gpus_per_dp_rank")
-        target = set(int(x) for x in target_gpus)
-        # Check target GPU alignment with rollout DP granularity
-        min_gpu = min(target)
-        max_gpu = max(target)
-        if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
-            logger.warning(
-                f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
-                f"({gpus_per_dp_rank}). DP rank boundary violation detected "
-                f"for target GPUs {sorted(target)}. "
-                f"Rollout DP ranks may not cleanly map to training GPUs."
-            )
-        max_dp = len(device_mapping) // gpus_per_dp_rank
-        out: List[int] = []
-        for dp_rank in range(max_dp):
-            start = dp_rank * gpus_per_dp_rank
-            dp_gpus = set(int(x) for x in device_mapping[start : start + gpus_per_dp_rank])
-            if dp_gpus.intersection(target):
-                out.append(dp_rank)
-        if not out:
-            raise RuntimeError("No dp ranks matched target_gpus for shrink")
-        return out
+        # Delegate to standalone util function, passing instance attributes.
+        return target_gpus_to_dp_ranks_to_remove(
+            target_gpus=target_gpus,
+            gpus_per_dp_rank=self._infer_gpus_per_dp_rank,
+            device_mapping=self._infer_device_mapping,
+        )
 
     def _target_gpus_to_dp_ranks_to_add(self, *, target_gpus: List[int]) -> List[int]:
-        if not isinstance(target_gpus, list) or not target_gpus:
-            raise ValueError("target_gpus must be a non-empty list[int]")
-        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
-        device_mapping = list(self._infer_device_mapping)
-        if len(device_mapping) % gpus_per_dp_rank != 0:
-            raise RuntimeError("actor_infer.device_mapping length must be divisible by gpus_per_dp_rank")
-        target = set(int(x) for x in target_gpus)
-        # Check target GPU alignment with rollout DP granularity
-        min_gpu = min(target)
-        max_gpu = max(target)
-        if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
-            logger.warning(
-                f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
-                f"({gpus_per_dp_rank}). DP rank boundary violation detected "
-                f"for target GPUs {sorted(target)}. "
-                f"Rollout DP ranks may not cleanly map to training GPUs."
-            )
-        max_dp = len(device_mapping) // gpus_per_dp_rank
-        out: List[int] = []
-        for dp_rank in range(max_dp):
-            start = dp_rank * gpus_per_dp_rank
-            dp_gpus = set(int(x) for x in device_mapping[start : start + gpus_per_dp_rank])
-            if dp_gpus and dp_gpus.issubset(target):
-                out.append(dp_rank)
-        if not out:
-            raise RuntimeError("No dp ranks matched target_gpus for expand")
-        return out
+        # Delegate to standalone util function, passing instance attributes.
+        return target_gpus_to_dp_ranks_to_add(
+            target_gpus=target_gpus,
+            gpus_per_dp_rank=self._infer_gpus_per_dp_rank,
+            device_mapping=self._infer_device_mapping,
+        )
 
     def _shrink_workers(self, *, dp_ranks_to_remove: List[int]) -> Dict[str, Any]:
         """Pipeline-local shrink helper (ENG-123).

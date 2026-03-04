@@ -874,18 +874,6 @@ class RolloutScheduler(RolloutMockMixin):
         # Delegate resume so partial-GPU pipeline can re-enable request dispatch after expand.
         await self.generate_scheduler.resume.remote()
 
-    async def get_inflight_counts(self, dp_ranks: List[int]) -> Dict[int, int]:
-        # Delegate to RequestScheduler so caller observes in-flight state from routing owner.
-        return await self.generate_scheduler.get_inflight_counts.remote(dp_ranks)
-
-    async def get_offload_ranks_for_target_gpus(self, target_gpus: List[int]) -> List[int]:
-        # Delegate rank-mapping logic to RequestScheduler for consistency with shrink/expand semantics.
-        return await self.generate_scheduler.get_offload_ranks_for_target_gpus.remote(target_gpus)
-
-    async def offload_dp_ranks(self, dp_ranks: List[int]) -> Dict[str, Any]:
-        # Delegate physical offload to RequestScheduler to keep model-state transitions centralized.
-        return await self.generate_scheduler.offload_dp_ranks.remote(dp_ranks)
-
     async def _run_rollout_loop(self, seed):
         self.logger.info(f"[RolloutScheduler] start _run_rollout_loop seed={seed} mode={self.mode}")
         await asyncio.gather(*self.es_manager.run_rollout_loop(seed, blocking=False))

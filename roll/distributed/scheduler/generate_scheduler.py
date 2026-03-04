@@ -5,7 +5,6 @@ import random
 import math
 import uuid
 import time
-import sys
 import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
@@ -36,7 +35,7 @@ from roll.utils.taskgroups import TaskGroup # TODO use official TaskGroup after 
 from roll.utils.metrics.metrics_manager import DurationTracker
 from roll.utils.import_utils import safe_import_class
 from roll.utils.logging import get_logger
-from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE
+from roll.utils.constants import DO_TIME_SHARING
 
 
 logger = get_logger()
@@ -105,10 +104,8 @@ class LoadBalancer:
             self._dp_rank = dp_rank
 
         def __del__(self):
-            # Avoid raising inside __del__ (exceptions here are noisy and unreliable).
-            # If a Lease is GC'ed with remaining credit, it indicates a bug in the caller.
-            if getattr(self, "lease", 0) != 0:
-                sys.stderr.write(f"[roll][ERROR] LoadBalancer.Lease GC'ed with remaining lease={self.lease}\n")
+            # User must call clear or consume all lease to give back credit explicitly.
+            assert self.lease == 0
 
         def clear(self):
             assert self.lease >= 0
@@ -157,13 +154,6 @@ class LoadBalancer:
         Dispatching n sample of a prompt to the same worker using best fit strategy (using
         linear search for simplicity), blocking wait if no worker is available.
         """
-        if not isinstance(credit, int) or credit <= 0:
-            raise ValueError(f"credit must be positive int, got {credit!r}")
-        if credit > self.max_running_requests:
-            raise ValueError(
-                f"credit={credit} exceeds max_running_requests={self.max_running_requests}; "
-                "increase max_running_requests or reduce per-request credit"
-            )
         while True:
             while self._suspend:
                 self.suspend_event.clear()
@@ -173,11 +163,10 @@ class LoadBalancer:
             for dp_rank, running_requests in self.workers.items():
                 if running_requests >= self.max_running_requests:
                     continue
-                if running_requests + credit > self.max_running_requests:
-                    continue
                 if target == -1 or running_requests < self.workers[target]:
                     target = dp_rank
             if target != -1:
+                # FIXME may send more than max_running_requests (i.e. workers[target] + credit > max_running_requests)
                 self.workers[target] += credit
                 self.running_request += credit
                 return self.Lease(self, lease=credit, dp_rank=target)
@@ -189,19 +178,12 @@ class LoadBalancer:
         For multi-turn rollout.
         """
         assert dp_rank in self.workers
-        if not isinstance(credit, int) or credit <= 0:
-            raise ValueError(f"credit must be positive int, got {credit!r}")
-        if credit > self.max_running_requests:
-            raise ValueError(
-                f"credit={credit} exceeds max_running_requests={self.max_running_requests}; "
-                "increase max_running_requests or reduce per-request credit"
-            )
         while True:
             while self._suspend:
                 self.suspend_event.clear()
                 await self.suspend_event.wait()
 
-            if self.workers[dp_rank] + credit <= self.max_running_requests:
+            if self.workers[dp_rank] < self.max_running_requests:
                 self.workers[dp_rank] += credit
                 self.running_request += credit
                 return
@@ -625,6 +607,13 @@ class Scheduler:
 
 @ray.remote
 class GlobalCounter:
+    """Monotonically increasing counter as a Ray actor.
+
+    Used to assign unique global IDs across distributed workers without coordination cost.
+    get_value() returns the current counter and increments it atomically (single-actor
+    execution guarantees no races).
+    """
+
     def __init__(self):
         self._value = 0
 
@@ -1102,8 +1091,8 @@ class DynamicSamplingScheduler(RolloutMockMixin, Scheduler):
             while True:
                 try:
                     prompt_id = await self.replay_buffer.poll()
-                except asyncio.CancelledError:
-                    logger.info("stop sending_request coroutine (shutdown)")
+                except:
+                    logger.info(f"stop sending_request coroutine")
                     break
                 task = tg.create_task(RolloutContext.process_new_prompt(scheduler=self, prompt_id=prompt_id))
                 self.running_tasks[prompt_id] = task
@@ -1114,8 +1103,8 @@ class DynamicSamplingScheduler(RolloutMockMixin, Scheduler):
 
     def get_next_dataset_item(self):
         if self.dataset_iter is None:
-            rng = random.Random(int(self.pipeline_config.seed) + int(self.dataset_epoch))
-            rng.shuffle(self.indices)
+            random.seed(self.pipeline_config.seed + self.dataset_epoch)
+            random.shuffle(self.indices)
             self.dataset_iter = iter(self.indices)
             logger.info(f"{'-'.join(self.reward_clusters.keys())} dataset epoch: {self.dataset_epoch}")
 
@@ -1123,8 +1112,8 @@ class DynamicSamplingScheduler(RolloutMockMixin, Scheduler):
             dataset_item = self.dataset[next(self.dataset_iter)]
         except StopIteration:
             self.dataset_epoch += 1
-            rng = random.Random(int(self.pipeline_config.seed) + int(self.dataset_epoch))
-            rng.shuffle(self.indices)
+            random.seed(self.pipeline_config.seed + self.dataset_epoch)
+            random.shuffle(self.indices)
             self.dataset_iter = iter(self.indices)
             dataset_item = self.dataset[next(self.dataset_iter)]
             logger.info(f"{'-'.join(self.reward_clusters.keys())} dataset epoch: {self.dataset_epoch}")
@@ -1243,14 +1232,14 @@ class RolloutContext:
         # the real sampling_start_step can be different from self.sampling_start_step.
         try:
             sampling_start_step = await self._scheduler.replay_buffer.begin(prompt_id=self.prompt_id)
-        except BaseException:
+        except:
             self._lease.clear()
             raise
         self.sampling_start_step = sampling_start_step
 
         try:
             yield
-        except BaseException:
+        except:
             self._lease.clear()
             raise
         finally:
@@ -1259,11 +1248,6 @@ class RolloutContext:
                 len(self._scheduler.running_requests[self._lease._dp_rank][self.prompt_id]) == 0
             ), f"User should gather all running requests: {self._scheduler.running_requests[self._lease._dp_rank][self.prompt_id]=}"
             self._scheduler.running_requests[self._lease._dp_rank].pop(self.prompt_id, None)
-            if self._lease is not None:
-                # Always release remaining lease credit back to LoadBalancer.
-                # In the happy path, this is a no-op if the lease has been fully consumed.
-                self._lease.clear()
-                self._lease = None
             self._in_do_generate_and_reward = False
 
     async def generate(
@@ -1349,7 +1333,6 @@ class RequestScheduler:
         return set(self.active_dp_ranks)
 
     async def generate_one_request(self, data: DataProto):
-        rlix_request_id = data.meta_info.get("rlix_request_id")
         src_rank = data.meta_info.get("src_rank")
         global_step = data.meta_info.get("global_step")
         t0 = time.time()
@@ -1386,12 +1369,6 @@ class RequestScheduler:
         self.running_requests[dp_rank].add(request_id)
 
         try:
-            logger.info(
-                f"[RequestScheduler] dispatch generate_request"
-                f" request_id={request_id} rlix_request_id={rlix_request_id!r}"
-                f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
-                f" active_dp_ranks={sorted(self.active_dp_ranks)}"
-            )
             response_data = await self.infer_cluster.workers[dp_rank].generate_request.remote(data=data)
         finally:
             self.running_requests[dp_rank].remove(request_id)
@@ -1430,20 +1407,6 @@ class RequestScheduler:
         request_repeat = data.repeat(repeat_times=len(output_tokens))
         output.non_tensor_batch = request_repeat.non_tensor_batch
         output.meta_info = request_repeat.meta_info
-
-        elapsed_s = time.time() - t0
-        if elapsed_s >= 30.0:
-            logger.warning(
-                f"[RequestScheduler] generate_one_request slow"
-                f" elapsed_s={elapsed_s:.3f} request_id={request_id} rlix_request_id={rlix_request_id!r}"
-                f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
-            )
-        else:
-            logger.info(
-                f"[RequestScheduler] generate_one_request done"
-                f" elapsed_s={elapsed_s:.3f} request_id={request_id} rlix_request_id={rlix_request_id!r}"
-                f" src_rank={src_rank} dp_rank={dp_rank} global_step={global_step}"
-            )
         return output
 
     async def abort_request(self):
@@ -1476,42 +1439,6 @@ class RequestScheduler:
             return
         self.need_suspend = False
         self.suspend_notifier.set()
-
-    def get_inflight_counts(self, dp_ranks: List[int]) -> Dict[int, int]:
-        # Report per-rank in-flight counts so pipeline can wait for safe offload barriers.
-        ranks = self._validate_dp_ranks_input(dp_ranks, mode="get_inflight_counts")
-        return {int(rank): len(self.running_requests[int(rank)]) for rank in ranks}
-
-    def get_offload_ranks_for_target_gpus(self, target_gpus: List[int]) -> List[int]:
-        # Translate target GPU IDs into DP ranks that currently overlap those devices.
-        self._validate_target_gpus(target_gpus, mode="shrink")
-        target_gpus_set = set(target_gpus)
-        offload_ranks = [
-            dp_rank
-            for dp_rank in range(self.infer_cluster.world_size)
-            if set(self._get_gpus_for_dp_rank(dp_rank)).intersection(target_gpus_set)
-        ]
-        self._validate_calculated_ranks(offload_ranks, mode="shrink")
-        return offload_ranks
-
-    async def offload_dp_ranks(self, dp_ranks: List[int]) -> Dict[str, Any]:
-        # Physical offload happens only after all schedulers stop routing and drain in-flight requests.
-        offload_ranks = self._validate_dp_ranks_input(dp_ranks, mode="offload_dp_ranks")
-        start_time = time.time()
-        async with self.routing_lock:
-            # Re-check under routing_lock so shrink/expand cannot race this active-state validation.
-            for rank in offload_ranks:
-                if rank in self.active_dp_ranks:
-                    raise ValueError(
-                        f"offload_dp_ranks: dp_rank {rank} is still active; "
-                        "call shrink_workers(..., skip_offload=True) first"
-                    )
-            # Use explicit keyword args so Ray signature binding stays stable across wrapped actor methods.
-            offload_refs = self.infer_cluster.offload_states_partial(
-                target_dp_ranks=offload_ranks, blocking=False
-            )
-            await asyncio.gather(*[asyncio.wrap_future(ref.future()) for ref in offload_refs])
-        return {"offload_duration_ms": (time.time() - start_time) * 1000, "offload_ranks": offload_ranks}
 
     def _get_gpus_for_dp_rank(self, dp_rank: int) -> List[int]:
         """Map DP rank to GPU IDs using cluster's device info.
@@ -1620,6 +1547,14 @@ class RequestScheduler:
 
         Raises:
             RuntimeError: If shrink operation fails
+
+        Side Effects:
+            - Sets need_suspend=True and clears suspend_notifier if shrinking to zero
+              active ranks (blocks future generate_one_request() until expansion).
+            - On exception: rolls back active_dp_ranks and need_suspend, re-sets
+              suspend_notifier to unblock waiters.
+            - See FIXME (G02-RULE-26.2) in this method for known locking constraints on
+              abort RPCs under routing_lock.
         """
         keep_ranks = list(self.active_dp_ranks - set(shrink_dp_ranks))
         old_active_ranks = self.active_dp_ranks.copy()
@@ -1647,6 +1582,10 @@ class RequestScheduler:
 
 
 
+            # FIXME(G02-RULE-26.2): abort RPCs and this drain loop run while routing_lock is held,
+            # blocking generate_one_request for the full drain duration. Fix: split into
+            # _shrink_routing_state (sync, under lock) + drain outside lock + brief re-lock to clear mappings.
+            # Acceptable for now because aborts are infrequent and expected to complete quickly.
             await asyncio.gather(*abort_futures)
 
             while True:
@@ -1654,7 +1593,7 @@ class RequestScheduler:
                 if remain == 0:
                     break
                 logger.info(f"Shrink: waiting for {len(shrink_dp_ranks)} workers {remain=} to finish abort")
-                await asyncio.sleep(3)
+                await asyncio.sleep(0.5)
 
             # Clear ALL mappings pointing to shrinking workers (not just in-flight)
             shrink_dp_ranks_set = set(shrink_dp_ranks)
@@ -1720,18 +1659,16 @@ class RequestScheduler:
         Algorithm: Round-robin selection across old workers
         1. Calculate proportional src_ranks to abort: src_ranks_to_keep = ceil(total * old_count / new_count)
         2. Group existing src_ranks by dp_rank (only old workers)
-        3. Round-robin iterate over old workers using cycle()
+        3. Round-robin iterate over old workers using while loop with empty-streak guard
         4. Select one src_rank at a time until remaining_to_abort reaches 0
         5. Abort ALL requests from selected src_ranks
         6. Clear src_rank mappings for reallocation to new workers
 
         Implementation Notes:
-        - Uses cycle() for infinite round-robin iteration over old workers
-        - Check at line 1146 (if not dp_rank in old_active_dp_ranks) is redundant
-          since dp_rank_to_src_ranks already contains only old workers, but kept as defensive guard
-        - Loop terminates when remaining_to_abort <= 0 or all worker lists are exhausted
-        - If all workers exhausted before reaching target, loop may cycle indefinitely
-          (no explicit check for empty state, but pop(0) will eventually empty all lists)
+        - Round-robin uses a while loop with empty_streak detection (not cycle()) to
+          terminate cleanly when all worker lists are exhausted before the abort target
+        - Calls self.resume() automatically when expanding from zero active ranks
+          (was_empty check), unblocking suspended generate_one_request() callers
 
         Args:
             expand_dp_ranks: DP ranks to add to active set (already validated)
@@ -1916,6 +1853,22 @@ class RequestScheduler:
                     raise ValueError(f"[expand] DP rank {dp_rank} already active")
 
     def _validate_dp_ranks_input(self, dp_ranks: List[int], *, mode: str) -> List[int]:
+        """Validate and normalize a dp_ranks list input.
+
+        Checks: non-empty list[int], each value in [0, world_size), no duplicates.
+        Returns a normalized list of plain ints (coerces numpy ints etc.).
+
+        Args:
+            dp_ranks: Candidate DP ranks to validate.
+            mode: Label used in error messages ("shrink" or "expand").
+
+        Returns:
+            Normalized list[int] with duplicates rejected.
+
+        Raises:
+            ValueError: If list is empty, values out of range, or contains duplicates.
+            TypeError: If any element is not an int.
+        """
         if not isinstance(dp_ranks, list) or not dp_ranks:
             raise ValueError(f"{mode}: dp_ranks must be a non-empty list[int]")
         out: List[int] = []
@@ -1933,16 +1886,22 @@ class RequestScheduler:
         """Complete atomic shrink operation: validate → rebalance → offload → update routing.
 
         Orchestrates the full worker shrink process:
-        1. Validates target_gpus input
-        2. Calculates DP ranks to offload based on GPU overlap
-        3. Validates calculated ranks against active state
+        1. Validates dp_ranks input (type, range, duplicates)
+        2. If skip_offload=True: filters to only currently-active ranks (idempotent no-op
+           if all ranks already inactive)
+        3. If skip_offload=False: validates ranks are active (strict check)
         4. Atomically (under routing_lock):
-           - Rebalances routing (aborts requests on shrinking workers)
-           - Offloads model states from shrinking workers
-        5. Returns metrics for monitoring
+           - Rebalances routing: aborts in-flight requests on shrinking workers and drains
+             their queues (abort RPCs and drain also run under routing_lock — see FIXME
+             comment in _rebalance_on_shrink for G02-RULE-26.2)
+        5. If skip_offload=False: offloads model states from shrinking workers to CPU
+        6. Returns metrics for monitoring
 
         Args:
-            target_gpus: GPU IDs to free (e.g., [4, 5, 6, 7] to free second half of 8 GPUs)
+            dp_ranks: DP ranks to deactivate/offload.
+            skip_offload: If True, skip physical model offload and treat already-inactive
+                ranks as a no-op. Use when another coupled scheduler will handle the offload,
+                or during init-time shrink where ranks are not yet loaded.
 
         Returns:
             Metrics dict containing:
@@ -1952,20 +1911,25 @@ class RequestScheduler:
                 - "offload_ranks": List of DP ranks that were offloaded
 
         Raises:
-            ValueError: If target_gpus invalid (empty, duplicates) or
-                       calculated ranks invalid (not active, out of range)
+            ValueError: If dp_ranks invalid (empty, duplicates, out of range) or
+                       ranks not active (when skip_offload=False)
             RuntimeError: If rebalance or offload operations fail
 
         Example:
-            # Shrink to free GPUs [4, 5, 6, 7] (second half of 8-GPU setup)
-            result = await scheduler.shrink_workers([4, 5, 6, 7])
+            # Full shrink with offload
+            result = await scheduler.shrink_workers([2, 3])
             # Returns: {"aborted": 10, "remapped": 5, "shrink_duration_ms": 2340.5, "offload_ranks": [2, 3]}
+
+            # Routing-only shrink (another scheduler handles offload)
+            result = await scheduler.shrink_workers([2, 3], skip_offload=True)
 
         Side Effects:
             - Updates active_dp_ranks (removes offload_ranks)
             - Aborts in-flight requests on shrinking workers
             - Clears src_rank mappings for remapped environments
-            - Offloads model states from shrinking workers to CPU
+            - Offloads model states from shrinking workers to CPU (unless skip_offload=True)
+            - Serialized under _op_lock (prevents concurrent shrink/expand)
+            - If skip_offload=True and ranks already inactive: returns zero-metrics immediately
         """
         async with self._op_lock:
             start_time = time.time()
@@ -2010,18 +1974,20 @@ class RequestScheduler:
         """Complete atomic expand operation: validate → load → rebalance → update routing.
 
         Orchestrates the full worker expand process:
-        1. Validates target_gpus input
-        2. Calculates DP ranks to restore based on GPU overlap
-        3. Validates calculated ranks against active state (skip if skip_load=True)
+        1. Validates dp_ranks input (type, range, duplicates)
+        2. If skip_load=True: filters to only currently-inactive ranks (no-op if all
+           already active). Skips model loading; only updates routing state.
+        3. If skip_load=False: validates ranks are inactive (strict check)
         4. Atomically (under routing_lock):
            - Loads model states on expanding workers (skip if skip_load=True)
            - Rebalances routing (proportionally redistributes requests)
         5. Returns metrics for monitoring
 
         Args:
-            target_gpus: GPU IDs to restore (e.g., [4, 5, 6, 7] to restore second half of 8 GPUs)
-            skip_load: If True, skip model loading and validation (use when model_update already loaded states).
-                      This only updates active_dp_ranks to restore routing state without re-loading models.
+            dp_ranks: DP ranks to restore to active set.
+            skip_load: If True, skip model loading (use when model_update already synced
+                weights). In DO_TIME_SHARING mode (when skip_load=False), triggers selective
+                model weight sync via ModelUpdateService before loading vLLM states.
 
         Returns:
             Metrics dict containing:
@@ -2031,31 +1997,46 @@ class RequestScheduler:
                 - "load_ranks": List of DP ranks that were restored
 
         Raises:
-            ValueError: If target_gpus invalid (empty, duplicates) or
-                       calculated ranks invalid (already active, out of range)
+            ValueError: If dp_ranks invalid (empty, duplicates, out of range) or
+                       ranks already active (when skip_load=False)
             RuntimeError: If load or rebalance operations fail
 
         Example:
-            # Expand to restore GPUs [4, 5, 6, 7] (second half of 8-GPU setup)
-            result = await scheduler.expand_workers([4, 5, 6, 7])
+            # Full expand with load
+            result = await scheduler.expand_workers([2, 3])
             # Returns: {"aborted": 3, "remapped": 3, "expand_duration_ms": 1850.2, "load_ranks": [2, 3]}
 
-            # After model_update already loaded states to all GPUs, just restore routing:
-            result = await scheduler.expand_workers([4, 5, 6, 7], skip_load=True)
+            # After model_update already loaded states, just restore routing:
+            result = await scheduler.expand_workers([2, 3], skip_load=True)
 
         Side Effects:
             - Updates active_dp_ranks (adds load_ranks)
             - Loads model states from CPU to expanding workers (unless skip_load=True)
             - Aborts some requests from old workers for proportional rebalancing
             - Clears src_rank mappings for rebalanced environments (will route to new workers)
+            - Serialized under _op_lock (prevents concurrent shrink/expand)
+            - If skip_load=True and ranks already active: returns zero-metrics immediately
+            - In DO_TIME_SHARING mode: syncs selected worker weights via ModelUpdateService
+              before loading vLLM states (avoids holding KV cache during weight sync)
         """
         async with self._op_lock:
             start_time = time.time()
             load_ranks = self._validate_dp_ranks_input(dp_ranks, mode="expand")
 
-            # Skip validation when skip_load=True because callers may pass ranks that are already active
-            # in active_dp_ranks (e.g., "restore routing to full set" semantics).
-            if not skip_load:
+            # Mirror shrink_workers(skip_offload=True): filter to only inactive ranks so already-active
+            # ranks are a no-op. Rebalancing still runs to update active_dp_ranks and trigger resume().
+            if skip_load:
+                inactive_ranks = set(range(self.infer_cluster.world_size)) - self.active_dp_ranks
+                load_ranks = [r for r in load_ranks if r in inactive_ranks]
+                if not load_ranks:
+                    return {
+                        "aborted": 0,
+                        "remapped": 0,
+                        "expand_duration_ms": (time.time() - start_time) * 1000,
+                        "load_ranks": [],
+                    }
+
+            else:
                 self._validate_calculated_ranks(load_ranks, mode="expand")
                 # In RLix mode, delay vLLM KV cache init until after selective model update completes.
                 # This avoids holding large KV allocations during weight sync (which needs extra headroom).

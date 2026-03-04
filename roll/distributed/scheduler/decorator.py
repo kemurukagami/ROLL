@@ -118,7 +118,7 @@ def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
         if (
             _dispatch_first
             and isinstance(arg[local_dp_rank], DataProto)
-            and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0)
+            and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0)
         ):
             return DataProto(batch=None, meta_info=arg[local_dp_rank].meta_info)
         return arg[local_dp_rank]

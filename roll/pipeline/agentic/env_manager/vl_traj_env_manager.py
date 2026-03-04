@@ -271,7 +271,6 @@ class VLTrajEnvManager(TrajEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
-        self._maybe_set_rlix_request_id(lm_input)
 
         lm_output: DataProto = self.llm_proxy.generate(messages=messages,
                                                        lm_input=lm_input,

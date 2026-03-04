@@ -177,7 +177,6 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         generation_config = self.worker_config.generating_args.to_dict()
         generation_config["max_new_tokens"] = min(max_new_tokens, self.pipeline_config.sequence_length)
         lm_input.meta_info["src_rank"] = self.env_config["env_id"]
-        self._maybe_set_rlix_request_id(lm_input)
 
         content = self.rollout_cache.history[-1]
         input_messages = content['observation']

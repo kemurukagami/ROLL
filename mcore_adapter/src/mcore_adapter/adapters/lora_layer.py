@@ -21,7 +21,6 @@ from megatron.core.parallel_state import (
     get_expert_tensor_parallel_world_size,
     get_tensor_model_parallel_world_size,
 )
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
@@ -33,72 +32,6 @@ from peft.tuners.tuners_utils import BaseTunerLayer, check_adapters_to_merge
 from peft.utils import transpose
 
 from ..platforms import current_platform
-
-
-def _type_tuple(*candidates):
-    return tuple(candidate for candidate in candidates if isinstance(candidate, type))
-
-
-_TE_GROUPED_TYPES = _type_tuple(TEGroupedLinear, TEColumnParallelGroupedLinear, TERowParallelGroupedLinear)
-_ROW_PARALLEL_TYPES = _type_tuple(TERowParallelLinear, TERowParallelGroupedLinear, RowParallelLinear)
-_COLUMN_PARALLEL_TYPES = _type_tuple(
-    TEColumnParallelLinear,
-    TEColumnParallelGroupedLinear,
-    TELayerNormColumnParallelLinear,
-    ColumnParallelLinear,
-)
-_LAYERNORM_COLUMN_TYPES = _type_tuple(TELayerNormColumnParallelLinear)
-_DENSE_LINEAR_TYPES = _type_tuple(TELinear, nn.Linear)
-_DIRECT_LINEAR_TYPES = _type_tuple(TELinear, TEGroupedLinear, ColumnParallelLinear, RowParallelLinear, nn.Linear)
-
-
-def _make_dense_linear(input_size: int, output_size: int, bias: bool, **kwargs):
-    if isinstance(TELinear, type):
-        return TELinear(
-            input_size=input_size,
-            output_size=output_size,
-            bias=bias,
-            parallel_mode=None,
-            skip_weight_param_allocation=False,
-            **kwargs,
-        )
-    return nn.Linear(input_size, output_size, bias=bias)
-
-
-def _make_row_parallel_linear(input_size: int, output_size: int, bias: bool, **kwargs):
-    if isinstance(TERowParallelLinear, type):
-        return TERowParallelLinear(
-            input_size=input_size,
-            output_size=output_size,
-            bias=bias,
-            input_is_parallel=True,
-            **kwargs,
-        )
-    return RowParallelLinear(
-        input_size=input_size,
-        output_size=output_size,
-        bias=bias,
-        input_is_parallel=True,
-        **kwargs,
-    )
-
-
-def _make_column_parallel_linear(input_size: int, output_size: int, bias: bool, **kwargs):
-    if isinstance(TEColumnParallelLinear, type):
-        return TEColumnParallelLinear(
-            input_size=input_size,
-            output_size=output_size,
-            bias=bias,
-            gather_output=False,
-            **kwargs,
-        )
-    return ColumnParallelLinear(
-        input_size=input_size,
-        output_size=output_size,
-        bias=bias,
-        gather_output=False,
-        **kwargs,
-    )
 
 
 class LoraParallelLinear(MegatronModule, LoraLayer):
@@ -122,7 +55,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         if use_dora:
             raise ValueError(f"{self.__class__.__name__} does not support DoRA yet, please set it to False")
-        self.is_grouped = isinstance(base_layer, _TE_GROUPED_TYPES)
+        self.is_grouped = isinstance(base_layer, TEGroupedLinear)
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
         self.is_expert = getattr(base_layer, "is_expert", False)
@@ -182,9 +115,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         # Disable ub_overlap for parallel layers
         for lora in [lora_a, lora_b]:
-            if isinstance(lora, _ROW_PARALLEL_TYPES + _COLUMN_PARALLEL_TYPES) and getattr(
-                lora, "parallel_mode", None
-            ) is None:
+            if isinstance(lora, (TERowParallelLinear, TEColumnParallelLinear)) and lora.parallel_mode is None:
                 lora.ub_overlap_rs_fprop = False
                 lora.ub_overlap_ag_dgrad = False
                 lora.ub_overlap_ag_fprop = False
@@ -216,11 +147,11 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         if adapter_name in self.lora_A.keys():
             lora_a = self.lora_A[adapter_name]
             lora_b = self.lora_B[adapter_name]
-            if isinstance(lora_a, _TE_GROUPED_TYPES):
+            if isinstance(lora_a, TEGroupedLinear):
                 weights_a = [getattr(lora_a, f"weight{i}") for i in range(lora_a.num_gemms)]
             else:
                 weights_a = [lora_a.weight]
-            if isinstance(lora_b, _TE_GROUPED_TYPES):
+            if isinstance(lora_b, TEGroupedLinear):
                 weights_b = [getattr(lora_b, f"weight{i}") for i in range(lora_b.num_gemms)]
             else:
                 weights_b = [lora_b.weight]
@@ -274,30 +205,27 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             self.base_layer.__class__.gating = origin_gating
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any):
+        previous_dtype = x.dtype
         if self.disable_adapters and self.merged:
             self.unmerge()
 
-        if isinstance(self.base_layer, _LAYERNORM_COLUMN_TYPES):
+        if isinstance(self.base_layer, TELayerNormColumnParallelLinear):
             if self.disable_adapters or self.merged:
                 self.base_layer.return_layernorm_output = False
                 result, bias = self.base_layer(x, *args, **kwargs)
             else:
                 self.base_layer.return_layernorm_output = True
                 (result, x), bias = self.base_layer(x, *args, **kwargs)
-        elif isinstance(self.base_layer, _DIRECT_LINEAR_TYPES + _ROW_PARALLEL_TYPES + _COLUMN_PARALLEL_TYPES):
+        elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):
             with self._patch_router_gating():
                 result, bias = self.base_layer(x, *args, **kwargs)
         else:
             raise ValueError(f"Unsupported base layer type: {type(self.base_layer)}")
-        output_dtype = result.dtype
 
         if not isinstance(self.base_layer, TopKRouter) and not self.disable_adapters and not self.merged:
-            parallel_mode = getattr(self.base_layer, "parallel_mode", None)
-            is_column_parallel = parallel_mode == "column" or isinstance(self.base_layer, _COLUMN_PARALLEL_TYPES)
-            is_row_parallel = parallel_mode == "row" or isinstance(self.base_layer, _ROW_PARALLEL_TYPES)
-            if self.sequence_parallel and is_column_parallel:
+            if self.sequence_parallel and self.base_layer.parallel_mode == "column":
                 x = gather_from_sequence_parallel_region(x)
             for active_adapter in self.active_adapters:
                 if active_adapter not in self.lora_A.keys():
@@ -306,19 +234,17 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora_B = self.lora_B[active_adapter]
                 dropout = self.lora_dropout[active_adapter]
                 scaling = self.scaling[active_adapter]
-                dtype = lora_A.weight0.dtype if isinstance(lora_A, _TE_GROUPED_TYPES) else lora_A.weight.dtype
+                dtype = lora_A.weight0.dtype if isinstance(lora_A, TEGroupedLinear) else lora_A.weight.dtype
                 x = x.to(dtype)
 
                 lora_result = (
-                    lora_A(dropout(x), *args, **kwargs)
-                    if isinstance(lora_A, _TE_GROUPED_TYPES)
-                    else lora_A(dropout(x))
+                    lora_A(dropout(x), *args, **kwargs) if isinstance(lora_A, TEGroupedLinear) else lora_A(dropout(x))
                 )
                 if isinstance(lora_result, tuple):
                     lora_result = lora_result[0]
                 lora_result = (
                     lora_B(lora_result, *args, **kwargs)
-                    if isinstance(lora_B, _TE_GROUPED_TYPES)
+                    if isinstance(lora_B, TEGroupedLinear)
                     else lora_B(lora_result)
                 )
                 if isinstance(lora_result, tuple):
@@ -326,13 +252,14 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 if scaling != 1.0:
                     lora_result = lora_result * scaling
 
-                if self.sequence_parallel and is_row_parallel:
+                if self.sequence_parallel and self.base_layer.parallel_mode == "row":
                     lora_result = scatter_to_sequence_parallel_region(lora_result)
-                if lora_result.dtype != output_dtype:
-                    lora_result = lora_result.to(output_dtype)
+                # Cast per-adapter result before accumulating; each adapter may compute in its own weight dtype.
+                if lora_result.dtype != previous_dtype:
+                    lora_result = lora_result.to(previous_dtype)
                 result = result + lora_result
 
-        result = result.to(output_dtype)
+        result = result.to(previous_dtype)
         return result, bias
 
     def merge(self, safe_merge: bool = False, adapter_names: Optional[list[str]] = None) -> None:
@@ -414,7 +341,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 sharded_state_dict.update(sharded_state_dict_default(m, _prefix, sharded_offsets, metadata))
 
         if prefix.endswith("linear_fc1."):
-            if isinstance(self.base_layer, _TE_GROUPED_TYPES) and self.config.gated_linear_unit:
+            if isinstance(self.base_layer, TEGroupedLinear) and self.config.gated_linear_unit:
                 num_global_experts = get_expert_model_parallel_world_size() * self.base_layer.num_gemms
                 local_expert_indices_offset = get_expert_model_parallel_rank() * self.base_layer.num_gemms
                 ep_axis = len(sharded_offsets)
@@ -463,8 +390,22 @@ class LoraRouterParallelLinear(LoraParallelLinear):
 
     def _create_lora_layers(self, r, lora_bias, **kwargs):
         router_shape = self.base_layer.weight.shape
-        lora_a = _make_dense_linear(input_size=router_shape[1], output_size=r, bias=lora_bias, **kwargs)
-        lora_b = _make_dense_linear(input_size=r, output_size=router_shape[0], bias=lora_bias, **kwargs)
+        lora_a = TELinear(
+            input_size=router_shape[1],
+            output_size=r,
+            bias=lora_bias,
+            parallel_mode=None,
+            skip_weight_param_allocation=False,
+            **kwargs,
+        )
+        lora_b = TELinear(
+            input_size=r,
+            output_size=router_shape[0],
+            bias=lora_bias,
+            parallel_mode=None,
+            skip_weight_param_allocation=False,
+            **kwargs,
+        )
         return lora_a, lora_b
 
 
@@ -472,7 +413,7 @@ class LoraRowParallelLinear(LoraParallelLinear):
     """LoRA layer for row parallel linear layers"""
 
     def _create_lora_layers(self, r, lora_bias, **kwargs):
-        in_features = self.in_features if isinstance(self.base_layer, RowParallelLinear) else self.in_features * self.tp_size
+        in_features = self.in_features * self.tp_size
 
         if self.is_grouped:
             if not isinstance(TEGroupedLinear, type):
@@ -494,20 +435,22 @@ class LoraRowParallelLinear(LoraParallelLinear):
                 **kwargs,
             )
         else:
-            lora_a = _make_row_parallel_linear(
+            lora_a = TERowParallelLinear(
                 input_size=in_features,
                 output_size=r,
                 bias=False,
+                input_is_parallel=True,
                 **kwargs,
             )
-            lora_b = _make_dense_linear(
+            lora_b = TELinear(
                 input_size=r,
                 output_size=self.out_features,
                 bias=lora_bias,
+                parallel_mode=None,
+                skip_weight_param_allocation=False,
                 **kwargs,
             )
-            if hasattr(self.base_layer, "parallel_mode"):
-                lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+            lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
 
         return lora_a, lora_b
 
@@ -516,9 +459,7 @@ class LoraColumnParallelLinear(LoraParallelLinear):
     """LoRA layer for column parallel linear layers"""
 
     def _create_lora_layers(self, r, lora_bias, **kwargs):
-        out_features = (
-            self.out_features if isinstance(self.base_layer, ColumnParallelLinear) else self.out_features * self.tp_size
-        )
+        out_features = self.out_features * self.tp_size
 
         if self.is_grouped:
             if not isinstance(TEGroupedLinear, type):
@@ -540,20 +481,22 @@ class LoraColumnParallelLinear(LoraParallelLinear):
                 **kwargs,
             )
         else:
-            lora_a = _make_dense_linear(
+            lora_a = TELinear(
                 input_size=self.in_features,
                 output_size=r,
                 bias=lora_bias,
+                parallel_mode=None,
+                skip_weight_param_allocation=False,
                 **kwargs,
             )
-            lora_b = _make_column_parallel_linear(
+            lora_b = TEColumnParallelLinear(
                 input_size=r,
                 output_size=out_features,
                 bias=lora_bias,
+                gather_output=False,
                 **kwargs,
             )
-            if hasattr(self.base_layer, "parallel_mode"):
-                lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+            lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
 
         return lora_a, lora_b
 
@@ -573,21 +516,27 @@ def dispatch_megatron(
 
     if isinstance(target_base_layer, TopKRouter):
         new_module = LoraRouterParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
-    elif isinstance(target_base_layer, _ROW_PARALLEL_TYPES):
+    elif isinstance(target_base_layer, (TERowParallelLinear, TERowParallelGroupedLinear)):
         new_module = LoraRowParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
-    elif isinstance(target_base_layer, _COLUMN_PARALLEL_TYPES):
+    elif isinstance(
+        target_base_layer, (TEColumnParallelLinear, TEColumnParallelGroupedLinear, TELayerNormColumnParallelLinear)
+    ):
         new_module = LoraColumnParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
-    elif isinstance(target_base_layer, _DIRECT_LINEAR_TYPES):
+    elif isinstance(target_base_layer, (TELinear, TEGroupedLinear)):
         # default to column parallel linear for non-parallel linear layers
         new_module = LoraColumnParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
+    else:
+        # Fail fast: non-TE layers are not supported for LoRA. This prevents silent skip
+        # where peft would leave the module unchanged (no LoRA applied) with no error.
+        raise RuntimeError(
+            f"LoRA on {type(target_base_layer).__name__} is not supported. "
+            "Use transformer_impl=transformer_engine."
+        )
 
     return new_module
 
 
 def patch_TELinear():
-    if not isinstance(TELinear, type):
-        return
-
     def __repr__(self):
         return (
             f"{type(self).__name__}(in_features={self.in_features}, "
@@ -598,9 +547,6 @@ def patch_TELinear():
 
 
 def patch_TEGroupedLinear():
-    if not isinstance(TEGroupedLinear, type):
-        return
-
     def sharded_state_dict(
         self,
         prefix: str = "",

@@ -1,44 +1,18 @@
 import re
 from typing import Callable
 
-import torch.nn as nn
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.moe.router import TopKRouter
 from transformers import PreTrainedModel
-
-
-def _type_tuple(*candidates):
-    return tuple(candidate for candidate in candidates if isinstance(candidate, type))
-
-
-_LINEAR_TYPES = _type_tuple(
-    TELinear,
-    TEGroupedLinear,
-    TELayerNormColumnParallelLinear,
-    ColumnParallelLinear,
-    RowParallelLinear,
-    nn.Linear,
-)
-
-
-def _has_materialized_weight(module) -> bool:
-    weight = getattr(module, "weight", None)
-    if weight is not None:
-        return True
-    num_gemms = int(getattr(module, "num_gemms", 0) or 0)
-    for i in range(num_gemms):
-        if getattr(module, f"weight{i}", None) is not None:
-            return True
-    return False
 
 
 def set_linear_is_expert(model):
     for n, module in model.named_modules():
         if (
             ".experts." in n
-            and isinstance(module, _LINEAR_TYPES)
+            and isinstance(module, (TELinear, TELayerNormColumnParallelLinear))
+            or isinstance(module, TEGroupedLinear)
         ):
             module.is_expert = True
 
@@ -63,7 +37,9 @@ def find_layers(model: "PreTrainedModel", cond: Callable):
 
 
 def find_all_linear_modules(model):
-    return find_layers(model, lambda module: isinstance(module, _LINEAR_TYPES) and _has_materialized_weight(module))
+    return find_layers(
+        model, lambda module: isinstance(module, (TELinear, TEGroupedLinear, TELayerNormColumnParallelLinear))
+    )
 
 
 def find_all_embedding_modules(model):

@@ -22,7 +22,7 @@ from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
 from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE, rlix_env_vars
 from roll.utils.logging import get_logger
-from rlix.protocol.types import SCHEDULER_ACTOR_NAME, RLIX_NAMESPACE
+from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, get_pipeline_namespace, ProgressReport
 
 logger = get_logger()
 
@@ -207,12 +207,17 @@ class EnvActivityMonitor:
 
 @dataclass
 class GroupData:
+    """Holds state for a single episode (group of rollouts).
+
+    Created when an episode starts, tracks all rollouts submitted by env workers
+    until the group_size is reached. Used for progress tracking and FIFO ordering.
+    """
     group_id: int
     episode_id: int
     create_step: int
-    created_at: float
+    created_at: float  # Timestamp for FIFO priority; used to detect oldest unfinished episode
     rollouts: List[DataProto] = field(default_factory=list)
-    running_rollouts: int = 0 
+    running_rollouts: int = 0  # Count of envs currently processing this episode 
 
 class GroupQueue:
     def __init__(
@@ -328,6 +333,25 @@ class GroupQueue:
         return None
 
     def put(self, episode_id, start_step, rollout) -> Dict[str, Any]:
+        """Submit a rollout from an env worker to this episode's group.
+
+        Args:
+            episode_id: Episode this rollout belongs to
+            start_step: Training step when this rollout was generated
+            rollout: Rollout data (None indicates env is exiting)
+
+        Returns:
+            Dict with keys:
+                - "status": One of "ignored", "exit", "filtered", "completed", "partial"
+                - "non_null_added": 1 if rollout is not None, else 0
+
+            Status meanings:
+                - "ignored": Episode was already removed (outdated)
+                - "exit": All rollouts in group are None (env shutdown)
+                - "filtered": Group rejected by GroupFilter (e.g., reward threshold)
+                - "completed": Group reached group_size and passed filter
+                - "partial": Group not yet complete
+        """
         if episode_id not in self.groups:  # ignore rollouts from outdated episode
             return {"status": "ignored", "non_null_added": 0}
         group = self.groups[episode_id]
@@ -369,8 +393,18 @@ class GroupQueue:
 
 @ray.remote
 class GroupQueueManager:
+    """Central coordinator for collecting rollouts from environment workers.
+
+    Manages per-group GroupQueues, tracks progress for RLix scheduler integration,
+    and provides batch retrieval for RolloutScheduler.get_batch().
+
+    In time-sharing mode (DO_TIME_SHARING=True), reports progress to the
+    RlixCoordinator at 2% bucket granularity for GPU scheduling decisions.
+    """
+
     def __init__(self, config, env_manager_config: EnvManagerConfig, mode):
         self.mode = mode
+        self.config = config
         self.env_manager_config = env_manager_config
         self.group_size = self.env_manager_config.group_size
         self.progress_bar = tqdm(desc=f"{self.mode} rollout progress(total trajectory)", mininterval=self.env_manager_config.max_traj_per_env)
@@ -378,23 +412,22 @@ class GroupQueueManager:
         self.rollout_complete = {}
 
         self.pipeline_id = os.environ.get("PIPELINE_ID") or None
-        self._rlix_enabled = DO_TIME_SHARING and self.mode == "train"
-        self.adapter_id = self.env_manager_config.tags[0] if getattr(self.env_manager_config, "tags", None) else None
-        self._rlix_scheduler = None
+        # Both train and val modes report to coordinator so gap_ratio accounts for all infer capacity.
+        self._rlix_enabled = bool(DO_TIME_SHARING)
+        self.adapter_id = self.env_manager_config.tags[0] if getattr(self.env_manager_config, "tags", None) else None # lora adapter
+        self._rlix_coordinator = None
         if self._rlix_enabled:
             if not self.pipeline_id:
                 raise RuntimeError("DO_TIME_SHARING mode requires PIPELINE_ID to be set")
+            coordinator_name = f"{COORDINATOR_ACTOR_NAME_PREFIX}{self.pipeline_id}"
+            coordinator_namespace = get_pipeline_namespace(self.pipeline_id)
             try:
-                self._rlix_scheduler = ray.get_actor(SCHEDULER_ACTOR_NAME, namespace=RLIX_NAMESPACE)
-            except Exception as e:
-                # Expectation: the central rlix scheduler actor ('rlix:scheduler')
-                # must already be created before GroupQueueManager is instantiated.
-                # Fail loudly with a clear message to aid debugging of startup ordering.
+                self._rlix_coordinator = ray.get_actor(coordinator_name, namespace=coordinator_namespace)
+            except Exception as exc:
                 raise RuntimeError(
-                    f"Failed to resolve {SCHEDULER_ACTOR_NAME} in namespace '{RLIX_NAMESPACE}'. "
-                    "GroupQueueManager expects the central scheduler actor to be present before startup; "
-                    "ensure the orchestrator created it earlier or that startup ordering is correct."
-                ) from e
+                    f"Failed to resolve coordinator {coordinator_name!r} in namespace {coordinator_namespace!r}. "
+                    "GroupQueueManager expects the coordinator actor to exist before startup."
+                ) from exc
 
         group_filter_cls = safe_import_class(env_manager_config.group_filter_cls)
         assert group_filter_cls
@@ -440,12 +473,14 @@ class GroupQueueManager:
         self.total = 0
         self.waiting = 0
 
-        # Progress tracking (RLix only; fork parity).
-        self._progress_last_bucket: Optional[int] = None
-        self._progress_new_batch = False
-        self._progress_total_required_estimated = self._estimate_total_required()
-        self._progress_collected_estimated = 0
-        self._progress_episode_non_null: Dict[Tuple[int, int], int] = {}
+        # === RLix Progress Tracking ===
+        # Tracks rollout collection progress for time-sharing scheduler decisions.
+        # Progress is reported at 2% bucket granularity to minimize coordinator overhead.
+        self._progress_last_bucket: Optional[int] = None  # Last emitted 2% bucket (0-50); emits only on change
+        self._progress_new_batch = False  # True when new batch starts; forces immediate emit
+        self._progress_total_required_estimated = self._estimate_total_required()  # Target: batch_size * num_return_sequences
+        self._progress_collected_estimated = 0  # Trajectories collected so far (clamped to total_required)
+        self._progress_episode_non_null: Dict[Tuple[int, int], int] = {}  # Per-episode count for rollback on filter/reject
         if self._rlix_enabled:
             self._mark_new_batch()
             self._maybe_emit_progress(current_train_step=None)
@@ -471,6 +506,16 @@ class GroupQueueManager:
         return n
 
     def _estimate_total_required(self) -> int:
+        """Calculate total trajectories required per training step.
+
+        Formula: rollout_batch_size * num_return_sequences
+
+        Note: Does NOT depend on async_generation_ratio. Async controls
+        overlap/pausing behavior, not the required sample count for a batch.
+
+        Returns:
+            0 if max_traj_per_env is None (unbounded mode), else positive int.
+        """
         if self.max_traj_per_env is None:
             return 0
         # Denominator for progress is the per-step rollout batch target (trajectory units).
@@ -482,7 +527,32 @@ class GroupQueueManager:
         self._progress_total_required_estimated = self._estimate_total_required()
         self._progress_new_batch = True
 
+    def _reset_progress_for_new_batch(self, current_train_step: Optional[int]) -> None:
+        """Reset progress tracking and emit report for a new batch cycle.
+
+        Called at the start of each training step (advance_step) or when clearing
+        state after suspension/rollback (clear). Only tracks progress in bounded mode.
+
+        Args:
+            current_train_step: The training step number, or None if unknown.
+        """
+        if self.max_traj_per_env is not None:
+            self._progress_collected_estimated = 0
+            self._progress_episode_non_null.clear()
+        self._mark_new_batch()
+        self._maybe_emit_progress(current_train_step=current_train_step)
+
     def _compute_progress(self) -> Tuple[int, int, int, Optional[float]]:
+        """Compute current progress state for this scheduler stream.
+
+        Returns:
+            Tuple of (total_required, collected, remaining, oldest_unfinished_ts):
+                - total_required: Target trajectories for this step
+                - collected: Trajectories collected (clamped to total_required)
+                - remaining: max(total_required - collected, 0)
+                - oldest_unfinished_ts: Creation time of oldest incomplete episode,
+                  used for FIFO priority and hang detection; None if no incomplete episodes.
+        """
         if self.max_traj_per_env is None:
             # Unbounded mode: do not report progress in Phase 3.
             return 0, 0, 0, None
@@ -490,23 +560,38 @@ class GroupQueueManager:
         total_required = self._progress_total_required_estimated
         collected = min(self._progress_collected_estimated, total_required)
 
-        oldest_ts: Optional[float] = None
-        for group_queue in self.group_queue.values():
-            for group in group_queue.groups.values():
-                if len(group.rollouts) < self.group_size:
-                    if oldest_ts is None or group.created_at < oldest_ts:
-                        oldest_ts = group.created_at
+        oldest_ts: Optional[float] = min(
+            (group.created_at
+             for gq in self.group_queue.values()
+             for group in gq.groups.values()
+             if len(group.rollouts) < self.group_size),
+            default=None,
+        )
 
         remaining = max(total_required - collected, 0)
         return total_required, collected, remaining, oldest_ts
 
     def _maybe_emit_progress(self, *, current_train_step: Optional[int]) -> None:
+        """Emit progress report to coordinator if conditions are met.
+
+        Emits when:
+            - 2% bucket changed (bucket != self._progress_last_bucket), OR
+            - Batch complete (remaining == 0), OR
+            - New batch started (self._progress_new_batch == True)
+
+        Uses fire-and-forget RPC to avoid blocking rollout collection.
+        Coordinator aggregates reports from all streams (train, val, LoRAs)
+        and forwards a single aggregated report to the central scheduler.
+
+        Args:
+            current_train_step: Current training step (for metrics), or None if unknown.
+        """
         if not self._rlix_enabled:
             return
         if self.max_traj_per_env is None:
             return
-        if self._rlix_scheduler is None:
-            raise RuntimeError("RLIX progress enabled but rlix:scheduler handle is missing")
+        if self._rlix_coordinator is None:
+            raise RuntimeError("RLIX progress enabled but coordinator handle is missing")
         if not self.pipeline_id:
             raise RuntimeError("RLIX progress enabled but PIPELINE_ID is missing")
 
@@ -521,7 +606,6 @@ class GroupQueueManager:
         should_emit = (
             bucket != self._progress_last_bucket
             or remaining == 0
-            or collected >= total_required
             or self._progress_new_batch
         )
         if not should_emit:
@@ -531,14 +615,12 @@ class GroupQueueManager:
         self._progress_last_bucket = bucket
         self._progress_new_batch = False
 
-        from rlix.protocol.types import ProgressReport
-
         report = ProgressReport(
             pipeline_id=str(self.pipeline_id),
             queued_trajectories=0,
             inflight_trajectories=0,
             step_target_trajectories=int(total_required),
-            percent_completed=float(collected) / float(max(total_required, 1)),
+            percent_completed=percent_completed,
             oldest_unfinished_creation_ts=oldest_ts,
             fifo_timestamp=time.time(),
             metrics={
@@ -550,7 +632,8 @@ class GroupQueueManager:
                 "adapter_id": self.adapter_id,
             },
         )
-        self._rlix_scheduler.report_progress.remote(report)
+        # Fire-and-forget to coordinator; coordinator aggregates and forwards to rlix scheduler.
+        self._rlix_coordinator.report_progress_from_scheduler.remote(report)
 
     def collect_metrics(self):
         group_filter_count = 0
@@ -560,26 +643,35 @@ class GroupQueueManager:
         return {"scheduler/group_filter_count": group_filter_count}
 
     def clear(self):
+        """Reset scheduler state for a new training step or after suspension.
+
+        Cancels pending batch retrieval tasks, clears all group queue state,
+        and resets progress tracking. Called when rolling back to a checkpoint
+        or when starting fresh after a suspend operation.
+        """
         self.rollout_complete = {}
         for get_task in self.pending_gets:
             get_task.cancel()
         self.pending_gets = set()
         for group_queue in self.group_queue.values():
             group_queue.clear()
-        if self.max_traj_per_env is not None:
-            self._progress_collected_estimated = 0
-            self._progress_episode_non_null.clear()
-        self._mark_new_batch()
-        self._maybe_emit_progress(current_train_step=None)
+        self._reset_progress_for_new_batch(current_train_step=None)
 
     def advance_step(self, step):
+        """Advance to a new training step, resetting progress for a fresh batch cycle.
+
+        Propagates step advancement to all group queues and resets progress tracking
+        to start collecting a new batch. Emits a progress report marking the start
+        of the new batch.
+
+        Args:
+            step: The new training step number, or None if step is unknown.
+        """
         for group_queue in self.group_queue.values():
             group_queue.advance_step(step)
-        if self.max_traj_per_env is not None:
-            self._progress_collected_estimated = 0
-            self._progress_episode_non_null.clear()
-        self._mark_new_batch()
-        self._maybe_emit_progress(current_train_step=int(step) if step is not None else None)
+        self._reset_progress_for_new_batch(
+            current_train_step=int(step) if step is not None else None
+        )
 
     async def get_episode_id(self, group_id, env_id=None):
         """
@@ -628,18 +720,25 @@ class GroupQueueManager:
 
         self.waiting += 1
         put_result = self.group_queue[group_id].put(episode_id, start_step, rollout)
+
+        # === Progress Tracking (bounded mode only) ===
+        # Track collected trajectories for RLix scheduler progress reports.
+        # Must handle rollback when groups are filtered/rejected.
         if self.max_traj_per_env is not None:
             status = str(put_result.get("status", ""))
             non_null_added = int(put_result.get("non_null_added", 0))
             episode_key = (group_id, episode_id)
 
+            # Increment progress for each valid trajectory added to the episode
             if non_null_added:
                 self._progress_episode_non_null[episode_key] = self._progress_episode_non_null.get(episode_key, 0) + 1
                 self._progress_collected_estimated += non_null_added
 
+            # Rollback progress if episode was rejected (filtered) or env exited
             if status in {"filtered", "exit"}:
                 rolled_back = self._progress_episode_non_null.pop(episode_key, 0)
                 self._progress_collected_estimated = max(self._progress_collected_estimated - rolled_back, 0)
+            # Episode completed: stop tracking but keep the count (already added to progress)
             elif status == "completed":
                 self._progress_episode_non_null.pop(episode_key, None)
         self.waiting -= 1
@@ -721,7 +820,18 @@ class GroupQueueManager:
         return ret
 
 class RolloutScheduler(RolloutMockMixin):
-    """
+    """Orchestrates rollout generation for a single mode (train or val).
+
+    Coordinates three main components:
+        1. GroupQueueManager: Collects rollouts from env workers
+        2. RequestScheduler: Routes GPU inference requests
+        3. Cluster (EnvManager): Runs environment rollout loops
+
+    In time-sharing mode, integrates with RLix scheduler for GPU allocation:
+        - Reports progress to RlixCoordinator for scheduling decisions
+        - Supports shrink/expand for GPU reassignment between pipelines
+        - Uses async __init__ to allow concurrent pipeline startup
+
     Usage:
         # User should control load_states/offload_states in pipeline by themselves.
         actor_infer
@@ -736,11 +846,24 @@ class RolloutScheduler(RolloutMockMixin):
             rollout()
         ray.get(train_rollout_scheduler.shutdown.remote())
     """
-    async def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, request_scheduler=None, collator=None):
+    async def __init__(self, config, env_manager_config: EnvManagerConfig, resource_manager, infer_cluster, mode, collator=None):
+        """Initialize the rollout scheduler actor.
+
+        NOTE: This is an async __init__. Avoid blocking calls here.
+        Env worker initialization is deferred to get_batch() to allow
+        concurrent pipeline startup in multi-pipeline scenarios.
+
+        Args:
+            config: Pipeline configuration (e.g., PPOConfig)
+            env_manager_config: Environment manager configuration
+            resource_manager: Ray placement group resource manager
+            infer_cluster: Inference cluster for GPU routing
+            mode: "train" or "val"
+            collator: Optional data collator for preprocessing
+        """
         # NOTE: This actor is async. Avoid blocking calls in __init__ and log each construction phase
         # to pinpoint startup stalls (e.g., placement group allocation, child actor creation).
-        self.logger = logger
-        self.logger.info(f"[RolloutScheduler] __init__ enter mode={mode}")
+        logger.info(f"[RolloutScheduler] __init__ enter mode={mode}")
         self.config = config
         self.env_manager_config = env_manager_config
         self.resource_manager = resource_manager
@@ -752,27 +875,8 @@ class RolloutScheduler(RolloutMockMixin):
 
         env_num = self.env_manager_config.world_size * self.env_manager_config.max_env_num_per_worker
 
-        # Ray creates separate worker processes for these control-plane actors (queue + request scheduler).
-        # In this environment we hit OS thread limits during import-time TorchInductor initialization inside
-        # those workers. Disable torch.compile / inductor compile workers and cap common thread pools.
-        env_vars = {
-                "TORCH_COMPILE_DISABLE": "1",
-                # TorchInductor async compile uses a subprocess pool when compile_threads > 1.
-                # In this environment that can fail with EAGAIN (fork/pthread_create) and crash Ray workers.
-                "TORCHINDUCTOR_COMPILE_THREADS": "1",
-                # Reduce Ray core worker RPC thread footprint (helps avoid hitting OS thread limits).
-                "RAY_num_server_call_thread": "1",
-                "OMP_NUM_THREADS": "1",
-                "MKL_NUM_THREADS": "1",
-                "OPENBLAS_NUM_THREADS": "1",
-                "NUMEXPR_NUM_THREADS": "1",
-                "TOKENIZERS_PARALLELISM": "false",
-        }
-        # Ensure per-pipeline env vars are visible in these control-plane actor processes in RLix mode.
-        env_vars.update(rlix_env_vars())
-        runtime_env = RuntimeEnv(env_vars=env_vars)
+        runtime_env = RuntimeEnv(env_vars=rlix_env_vars())
 
-        self.logger.info(f"[RolloutScheduler] creating GroupQueueManager mode={self.mode}")
         self.env_output_queue = GroupQueueManager.options(
             name=(
                 # Include env-manager name so multiple train schedulers (one per tag) do not collide on actor name.
@@ -791,41 +895,36 @@ class RolloutScheduler(RolloutMockMixin):
             self.env_manager_config,
             mode
         )
-        self.logger.info(f"[RolloutScheduler] created GroupQueueManager mode={self.mode}")
 
-        if request_scheduler is not None:
-            self.generate_scheduler = request_scheduler
-            self.logger.info(f"[RolloutScheduler] using SHARED RequestScheduler mode={self.mode}")
-        else:
-            self.logger.info(f"[RolloutScheduler] creating RequestScheduler mode={self.mode}")
-            self.generate_scheduler = RequestScheduler.options(
-                    name=(
-                        f"{self.pipeline_id}_request_scheduler_{mode}"
-                        if self.pipeline_id
-                        else f"RequestScheduler-{self.env_manager_config.name}-{mode}"
-                    ),
-                    namespace=RAY_NAMESPACE,
-                    scheduling_strategy=NodeAffinitySchedulingStrategy(
-                        node_id=ray.get_runtime_context().get_node_id(),
-                        soft=False,
-                    ),
-                    runtime_env=runtime_env,
-                    max_concurrency=env_num + 1,  # reserve extra one for suspend/resume
-                ).remote(infer_cluster=self.infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
-            self.logger.info(f"[RolloutScheduler] created RequestScheduler mode={self.mode}")
+        self.generate_scheduler = RequestScheduler.options(
+                name=(
+                    f"{self.pipeline_id}_request_scheduler_{mode}"
+                    if self.pipeline_id
+                    else f"RequestScheduler-{self.env_manager_config.name}-{mode}"
+                ),
+                namespace=RAY_NAMESPACE,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(
+                    node_id=ray.get_runtime_context().get_node_id(),
+                    soft=False,
+                ),
+                runtime_env=runtime_env,
+                max_concurrency=env_num + 1,  # reserve extra one for suspend/resume
+            ).remote(infer_cluster=self.infer_cluster, pipeline_config=config, resource_manager=self.resource_manager)
+        logger.info(f"[RolloutScheduler] created RequestScheduler mode={self.mode}")
 
-        self.logger.info(f"[RolloutScheduler] creating env Cluster mode={self.mode} name={self.env_manager_config.name}")
+        logger.info(f"[RolloutScheduler] creating env Cluster mode={self.mode} name={self.env_manager_config.name}")
         self.es_manager: Any = Cluster(
             name=self.env_manager_config.name,
             worker_cls=self.env_manager_config.worker_cls,
             resource_manager=self.resource_manager,
             worker_config=self.env_manager_config,
+            # resolve_topology=False: env cluster doesn't need rank2devices/worker2nodes info.
+            # Skipping topology resolution avoids blocking ray.get() in this async actor constructor.
             resolve_topology=False,
         )
-        self.logger.info(f"[RolloutScheduler] created env Cluster mode={self.mode} name={self.env_manager_config.name}")
+        logger.info(f"[RolloutScheduler] created env Cluster mode={self.mode} name={self.env_manager_config.name}")
         # Do not block with ray.get() inside this async actor's constructor.
         # We kick off initialization on env workers and await it in get_batch().
-        self.logger.info(f"[RolloutScheduler] submitting env initialize mode={self.mode}")
         self._es_initialize_refs = self.es_manager.initialize(
             pipeline_config=self.config,
             generate_scheduler=self.generate_scheduler,
@@ -835,7 +934,7 @@ class RolloutScheduler(RolloutMockMixin):
             blocking=False,
         )
         self._es_initialized = False
-        self.logger.info(
+        logger.info(
             f"[RolloutScheduler] submitted env initialize mode={self.mode} "
             f"num_refs={len(self._es_initialize_refs) if self._es_initialize_refs else 0}"
         )
@@ -847,7 +946,7 @@ class RolloutScheduler(RolloutMockMixin):
 
         # Initialize rollout mock mechanism from mixin
         self._init_rollout_mock()
-        self.logger.info(f"[RolloutScheduler] __init__ exit mode={self.mode}")
+        logger.info(f"[RolloutScheduler] __init__ exit mode={self.mode}")
 
     async def shutdown(self, timeout: float = 10.0):
         if self.rollout_task is None:
@@ -875,7 +974,7 @@ class RolloutScheduler(RolloutMockMixin):
         await self.generate_scheduler.resume.remote()
 
     async def _run_rollout_loop(self, seed):
-        self.logger.info(f"[RolloutScheduler] start _run_rollout_loop seed={seed} mode={self.mode}")
+        logger.info(f"[RolloutScheduler] start _run_rollout_loop seed={seed} mode={self.mode}")
         await asyncio.gather(*self.es_manager.run_rollout_loop(seed, blocking=False))
 
     async def _get_batch(self, batch_size, global_step):
@@ -883,53 +982,42 @@ class RolloutScheduler(RolloutMockMixin):
 
     async def get_batch(self, data: DataProto, batch_size):
         global_step = data.meta_info["global_step"]
-        self.logger.info(f"[RolloutScheduler] get_batch enter mode={self.mode} global_step={global_step} batch_size={batch_size}")
+        logger.info(f"[RolloutScheduler] get_batch enter mode={self.mode} global_step={global_step} batch_size={batch_size}")
 
         # MOCK MODE: Load pre-recorded data, skip rollout (from mixin)
         if self._should_load_mock(global_step):
             return await self._load_mock_batch(global_step)
 
         if not self._es_initialized:
-            self.logger.info(f"[RolloutScheduler] awaiting env worker initialize mode={self.mode}")
+            logger.info(f"[RolloutScheduler] awaiting env worker initialize mode={self.mode}")
             init_refs = self._es_initialize_refs or []
             await asyncio.gather(*init_refs)
             self._es_initialized = True
-            self.logger.info(f"[RolloutScheduler] env worker initialize done mode={self.mode}")
+            logger.info(f"[RolloutScheduler] env worker initialize done mode={self.mode}")
 
         # start env manager
         if self.rollout_task is None:
             seed = random.randint(0, 1000000) if self.mode == "train" else self.config.seed
             self.rollout_task = asyncio.create_task(self._run_rollout_loop(seed))
-            self.logger.info(f"[RolloutScheduler] created rollout_task seed={seed} mode={self.mode}")
 
-        self.logger.info(f"[RolloutScheduler] update_step start mode={self.mode} global_step={global_step}")
+        logger.info(f"[RolloutScheduler] update_step start mode={self.mode} global_step={global_step}")
         await asyncio.gather(*self.es_manager.update_step(global_step, blocking=False))
-        self.logger.info(f"[RolloutScheduler] update_step done mode={self.mode} global_step={global_step}")
+        logger.info(f"[RolloutScheduler] update_step done mode={self.mode} global_step={global_step}")
 
-        self.logger.info(f"[RolloutScheduler] advance_step start mode={self.mode} global_step={global_step}")
+        logger.info(f"[RolloutScheduler] advance_step start mode={self.mode} global_step={global_step}")
         await self.env_output_queue.advance_step.remote(global_step)
-        self.logger.info(f"[RolloutScheduler] advance_step done mode={self.mode} global_step={global_step}")
+        logger.info(f"[RolloutScheduler] advance_step done mode={self.mode} global_step={global_step}")
+        # In time-sharing mode (DO_TIME_SHARING=True), external RLix coordinator controls suspend/resume.
+        # In standalone mode, this scheduler must resume generate_scheduler before each batch.
         if not DO_TIME_SHARING:
             await self.generate_scheduler.resume.remote()
 
         get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
-        self.logger.info(f"[RolloutScheduler] wait for env_output_queue.get_batch mode={self.mode} global_step={global_step}")
-        wait_timeout_s = float(os.environ.get("ROLL_ROLLOUT_GET_BATCH_TIMEOUT_S", "1800"))
-        done, _ = await asyncio.wait(
-            {get_task, self.rollout_task},
-            return_when=asyncio.FIRST_COMPLETED,
-            timeout=wait_timeout_s,
-        )
-        if not done:
-            raise RuntimeError(
-                f"[RolloutScheduler] get_batch timed out after {wait_timeout_s}s "
-                f"(mode={self.mode}, global_step={global_step}, batch_size={batch_size}). "
-                f"Likely stuck: env rollout loop not producing rollouts, or GroupQueueManager waiting for episodes."
-            )
+        await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)
         if self.rollout_task.done() and self.rollout_task.exception() is not None:
             await self.rollout_task
         data_batch = await get_task
-        self.logger.info(
+        logger.info(
             f"[RolloutScheduler] env_output_queue.get_batch returned mode={self.mode} "
             f"global_step={global_step} items={len(data_batch) if data_batch else 0}"
         )
@@ -959,15 +1047,23 @@ class RolloutScheduler(RolloutMockMixin):
         return batch
 
     async def shrink_sampler(self, dp_ranks: List[int], skip_offload: bool = False) -> Dict[str, Any]:
-        """Thin wrapper: Delegate shrink operation to RequestScheduler.
+        """Offload model weights from specified DP ranks and deactivate them for routing.
+
+        Called by RLix scheduler during GPU reassignment. After shrink,
+        the specified DP ranks will not receive inference requests.
+
+        This is a thin wrapper delegating to RequestScheduler.shrink_workers()
+        for atomic execution under routing_lock.
 
         v4.6 ARCHITECTURAL CHANGE: RolloutScheduler no longer performs validation,
         calculation, or state management. All worker lifecycle operations are now
         owned by RequestScheduler for atomic execution under routing_lock.
 
         Args:
-            dp_ranks: DP ranks to offload / deactivate for routing
-            skip_offload: If True, skip physical offload (use when another coupled scheduler already offloaded).
+            dp_ranks: DP ranks to offload (e.g., [0, 1] for first two ranks)
+            skip_offload: If True, skip physical weight offload. Use when
+                another coupled scheduler (e.g., critic) already offloaded
+                the same GPUs, avoiding redundant offload operations.
 
         Returns:
             Dict with metrics from RequestScheduler.shrink_workers():
@@ -1001,16 +1097,22 @@ class RolloutScheduler(RolloutMockMixin):
         return result
 
     async def expand_sampler(self, dp_ranks: List[int], skip_load: bool = False) -> Dict[str, Any]:
-        """Thin wrapper: Delegate expand operation to RequestScheduler.
+        """Load model weights to specified DP ranks and activate them for routing.
+
+        Called by RLix scheduler during GPU reassignment. After expand,
+        the specified DP ranks will receive inference requests again.
+
+        This is a thin wrapper delegating to RequestScheduler.expand_workers()
+        for atomic execution under routing_lock.
 
         v4.6 ARCHITECTURAL CHANGE: RolloutScheduler no longer performs validation,
         calculation, or state management. All worker lifecycle operations are now
         owned by RequestScheduler for atomic execution under routing_lock.
 
         Args:
-            dp_ranks: DP ranks to load / activate for routing
-            skip_load: If True, skip model loading (use when model_update already loaded states).
-                      This only updates active_dp_ranks to restore routing state.
+            dp_ranks: DP ranks to load/activate (e.g., [0, 1] for first two ranks)
+            skip_load: If True, skip model loading (use when model_update already
+                loaded states). This only updates active_dp_ranks to restore routing.
 
         Returns:
             Dict with metrics from RequestScheduler.expand_workers():
@@ -1041,20 +1143,15 @@ class RolloutScheduler(RolloutMockMixin):
         # Delegate complete expand operation to RequestScheduler (atomic under routing_lock)
         result = await self.generate_scheduler.expand_workers.remote(dp_ranks, skip_load)
 
-        # Add timing from RolloutScheduler perspective
-        result["rollout_scheduler_duration_ms"] = (time.time() - start_time) * 1000
+                # Add timing from RolloutScheduler perspective
 
-        return result
+                result["rollout_scheduler_duration_ms"] = (time.time() - start_time) * 1000
 
-    async def get_active_dp_ranks(self) -> Set[int]:
-        """Return the current active DP ranks from the underlying RequestScheduler.
+        
 
-        Used for state verification after initialization shrink operations.
+                return result
 
-        # FIXME: remove this method and have all callers look up RequestScheduler directly
-        # via ray.get_actor(f"RequestScheduler-{pipeline_id}", namespace=RAY_NAMESPACE)
-        # and call get_active_dp_ranks() on it. The RolloutScheduler indirection adds
-        # an unnecessary hop and obscures which actor owns the authoritative state.
-        """
-        return await self.generate_scheduler.get_active_dp_ranks.remote()
+        
+
+        
 

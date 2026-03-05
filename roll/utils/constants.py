@@ -36,13 +36,14 @@ IGNORE_INDEX = -100
 
 
 def rlix_env_vars() -> dict[str, str]:
-    """Env vars that must be present in all per-pipeline Ray actor processes in RLix mode.
+    """Env vars for all per-pipeline Ray actor processes in RLix mode.
 
     Use this when creating child actors from within a pipeline actor; Ray does not reliably
     inherit runtime_env env vars from parent actors.
 
-    Only propagates env vars that are explicitly set; no defaults are applied here.
-    Defaults should be configured by the orchestrator or container environment.
+    Only propagates vars that are explicitly set in the environment; no defaults are applied.
+    Thread/compile-limiting vars (OMP_NUM_THREADS, TORCH_COMPILE_DISABLE, etc.) are included
+    when set — configure them in the container or orchestrator environment.
     """
     if not DO_TIME_SHARING:
         return {}
@@ -53,23 +54,28 @@ def rlix_env_vars() -> dict[str, str]:
         raise RuntimeError("DO_TIME_SHARING mode requires PIPELINE_ID to be set")
     if not ray_namespace:
         raise RuntimeError("DO_TIME_SHARING mode requires ROLL_RAY_NAMESPACE to be set")
-    
+
     env_vars: dict[str, str] = {
         "PIPELINE_ID": pipeline_id,
         "ROLL_RAY_NAMESPACE": ray_namespace,
         "RLIX_CONTROL_PLANE": "rlix",
     }
-    
+
     # Propagate PYTHONPATH if set (for imports when Ray workers start outside repo root).
     if pythonpath := os.environ.get("PYTHONPATH"):
         env_vars["PYTHONPATH"] = pythonpath
-    
-    # Propagate thread-limiting vars only if explicitly set (to avoid PID limits in containers).
-    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", 
-                "RAY_grpc_server_thread_pool_size"):
+
+    # Propagate thread/compile-limiting vars only if explicitly set in the environment.
+    # These cap thread pools and disable TorchInductor subprocess spawning in control-plane actors.
+    for var in (
+        "OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS", "RAY_grpc_server_thread_pool_size",
+        "RAY_num_server_call_thread", "TORCH_COMPILE_DISABLE",
+        "TORCHINDUCTOR_COMPILE_THREADS", "TOKENIZERS_PARALLELISM",
+    ):
         if value := os.environ.get(var):
             env_vars[var] = value
-    
+
     logging.getLogger(__name__).info(
         "[rlix_env_vars] pid=%d propagating %d env vars",
         os.getpid(),

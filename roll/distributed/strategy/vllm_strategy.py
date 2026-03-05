@@ -599,13 +599,10 @@ class VllmStrategy(InferenceStrategy):
     async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
         await self.model.update_parameter_in_bucket(serialized_named_tensors, is_lora)
 
-    async def destroy_collective_group(self, group_name: str):
-        await self.model.destroy_collective_group(group_name)
-
-    async def teardown_collective_groups(self, model_update_name: str, group_names: List[str]) -> None:
+    async def destroy_collective_group(self, group_name: str, model_update_name: str | None = None) -> None:
+        # vLLM has no model_update_comm_plan bookkeeping; model_update_name is unused.
         del model_update_name
-        for name in group_names:
-            await self.model.destroy_collective_group(name)
+        await self.model.destroy_collective_group(group_name)
 
     async def add_lora(self, adapter_name: str = "default", peft_config: dict = None):
         # Backward-compatible: single-LoRA callers may pass only peft_config and rely on adapter_name default.

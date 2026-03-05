@@ -2460,7 +2460,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     f"sync_id={sync_id} group_name={group_name}"
                 )
                 collective.destroy_collective_group(group_name)
-                ray.get([w.teardown_collective_groups.remote(model_update_name, [group_name]) for w in broadcast_workers])
+                ray.get([w.destroy_collective_group.remote(group_name, model_update_name) for w in broadcast_workers])
                 logger.info(
                     "[rlix][selective_sync] broadcast_teardown_exit "
                     f"sync_id={sync_id} group_name={group_name}"

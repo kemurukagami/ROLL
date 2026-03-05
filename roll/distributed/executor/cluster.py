@@ -20,7 +20,7 @@ from roll.distributed.scheduler.decorator import (
     dispatch_one_to_all,
 )
 from roll.platforms import current_platform
-from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.constants import RAY_NAMESPACE, rlix_env_vars
 from roll.distributed.scheduler.resource_manager import ResourceManager
 from roll.utils.import_utils import safe_import_class
 from roll.utils.logging import get_logger
@@ -37,8 +37,6 @@ class Cluster:
         worker_cls: Union[RemoteFunctionNoArgs[Worker], Type[Worker], str],
         resource_manager: ResourceManager,
         worker_config: WorkerConfig,
-        *,
-        resolve_topology: bool = True,
     ):
 
         self.cluster_name = name
@@ -59,7 +57,6 @@ class Cluster:
         self.master_addr = None
         self.master_port = None
         self.world_size = self.worker_config.world_size
-        self._resolve_topology = bool(resolve_topology)
 
         self._create_workers()
         self._bind_worker_method()
@@ -68,20 +65,10 @@ class Cluster:
 
         self.rank2worker = {k: self.workers[k] for k in range(len(self.workers))}
         self.worker2rank = {self.workers[k]: k for k in range(len(self.workers))}
-        if self._resolve_topology:
-            self.rank2devices = dict(
-                zip(
-                    map(lambda worker: self.worker2rank[worker], self.workers),
-                    ray.get([worker.get_devices_info.remote() for worker in self.workers]),
-                )
-            )
-            self.worker2nodes = dict(zip(self.workers, ray.get([worker.get_node_ip.remote() for worker in self.workers])))
-            logger.debug(f"{self.cluster_name} rank2devices {self.rank2devices}")
-        else:
-            # Avoid blocking ray.get() in async actor constructors when topology info is not needed.
-            # Callers that rely on rank2devices/worker2nodes must construct clusters with resolve_topology=True.
-            self.rank2devices = {}
-            self.worker2nodes = {}
+        self.rank2devices = dict(zip(map(lambda worker: self.worker2rank[worker], self.workers),
+                                     ray.get([worker.get_devices_info.remote() for worker in self.workers])))
+        self.worker2nodes = dict(zip(self.workers, ray.get([worker.get_node_ip.remote() for worker in self.workers])))
+        logger.debug(f"{self.cluster_name} rank2devices {self.rank2devices}")
         # for cluster object can transfer by ray rpc.
         del self.worker_cls
 
@@ -145,18 +132,9 @@ class Cluster:
                 "CLUSTER_NAME": self.cluster_name,
                 "WORKER_NAME": worker_name,
             }
-            # Prevent TorchInductor from spawning subprocess pools in Ray worker processes.
-            # This environment can hit OS process/thread limits during startup (EAGAIN), which crashes workers.
-            env_vars.setdefault("TORCHINDUCTOR_COMPILE_THREADS", "1")
-            env_vars.setdefault("TORCH_COMPILE_DISABLE", "1")
-            env_vars.setdefault("RAY_num_server_call_thread", "1")
-            env_vars.setdefault("OMP_NUM_THREADS", "1")
-            env_vars.setdefault("MKL_NUM_THREADS", "1")
-            env_vars.setdefault("OPENBLAS_NUM_THREADS", "1")
-            env_vars.setdefault("NUMEXPR_NUM_THREADS", "1")
-            env_vars.setdefault("TOKENIZERS_PARALLELISM", "false")
+            env_vars.update(rlix_env_vars())
 
-            if rank != 0 and self._resolve_topology:
+            if rank != 0:
                 env_vars["MASTER_ADDR"] = self.master_addr
                 env_vars["MASTER_PORT"] = str(self.master_port)
             if deploy_pg["gpu_rank"] is not None:
@@ -199,7 +177,7 @@ class Cluster:
 
             worker = self.worker_cls.options(**worker_options).remote(worker_config=self.worker_config)
             self.workers.append(worker)
-            if rank == 0 and self._resolve_topology:
+            if rank == 0:
                 self.master_addr, self.master_port = ray.get(worker.get_master_addr_and_port.remote())
 
     def _bind_worker_method(self):

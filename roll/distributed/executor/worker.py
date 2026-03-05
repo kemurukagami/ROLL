@@ -218,7 +218,7 @@ class Worker:
         Process weights after model loading (e.g., weight slicing, dtype conversion).
 
         Uses _maybe_await so sync and async strategy implementations are both handled consistently,
-        matching the pattern used by setup_collective_group and teardown_collective_groups.
+        matching the pattern used by setup_collective_group and destroy_collective_group.
         Any exception from the async path is re-raised loudly by _maybe_await.
         """
         if getattr(self, "strategy", None) is not None:
@@ -253,35 +253,18 @@ class Worker:
         else:
             self.logger.warning("worker has not strategy")
 
-    def teardown_collective_groups(self, model_update_name: str, group_names: List[str]) -> None:
+    def destroy_collective_group(self, group_name: str, model_update_name: str | None = None) -> None:
         """
-        Tear down collective communication groups after model update.
-        
+        Destroy a collective communication group.
+
         Args:
-            model_update_name: Identifier for the model update session (used for logging/cleanup).
-            group_names: List of process group names to destroy.
-        
-        Supports two strategy interfaces:
-        - teardown_collective_groups(model_update_name, group_names): Batch teardown (preferred)
-        - destroy_collective_group(name): Legacy single-group destruction (backward compat)
-        
-        Raises:
-            RuntimeError: If strategy supports neither interface.
+            group_name: Process group name to destroy.
+            model_update_name: Optional identifier for the model update session (used for bookkeeping cleanup).
         """
-        if getattr(self, "strategy", None) is None:
+        if getattr(self, "strategy", None) is not None:
+            self._maybe_await(self.strategy.destroy_collective_group(group_name, model_update_name))
+        else:
             self.logger.warning("worker has not strategy")
-            return
-        teardown = getattr(self.strategy, "teardown_collective_groups", None)
-        if callable(teardown):
-            self._maybe_await(teardown(model_update_name, group_names))
-            return
-        # Backward compatibility: destroy groups one by one if teardown is not implemented.
-        destroy = getattr(self.strategy, "destroy_collective_group", None)
-        if callable(destroy):
-            for name in group_names:
-                self._maybe_await(destroy(name))
-            return
-        raise RuntimeError(f"{type(self.strategy).__name__} does not support teardown_collective_groups")
 
     @staticmethod
     def _maybe_await(result: Any) -> Any:

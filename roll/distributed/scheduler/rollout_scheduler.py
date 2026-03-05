@@ -913,14 +913,17 @@ class RolloutScheduler(RolloutMockMixin):
         logger.info(f"[RolloutScheduler] created RequestScheduler mode={self.mode}")
 
         logger.info(f"[RolloutScheduler] creating env Cluster mode={self.mode} name={self.env_manager_config.name}")
-        self.es_manager: Any = Cluster(
-            name=self.env_manager_config.name,
-            worker_cls=self.env_manager_config.worker_cls,
-            resource_manager=self.resource_manager,
-            worker_config=self.env_manager_config,
-            # resolve_topology=False: env cluster doesn't need rank2devices/worker2nodes info.
-            # Skipping topology resolution avoids blocking ray.get() in this async actor constructor.
-            resolve_topology=False,
+        # Cluster.__init__ calls ray.get() for topology resolution, which blocks the event loop.
+        # Run it in a thread executor to avoid freezing this async actor's constructor.
+        loop = asyncio.get_event_loop()
+        self.es_manager: Any = await loop.run_in_executor(
+            None,
+            lambda: Cluster(
+                name=self.env_manager_config.name,
+                worker_cls=self.env_manager_config.worker_cls,
+                resource_manager=self.resource_manager,
+                worker_config=self.env_manager_config,
+            ),
         )
         logger.info(f"[RolloutScheduler] created env Cluster mode={self.mode} name={self.env_manager_config.name}")
         # Do not block with ray.get() inside this async actor's constructor.

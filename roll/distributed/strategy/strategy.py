@@ -160,21 +160,19 @@ class InferenceStrategy(ABC):
         """
         self._setup_collective_group_impl(model_update_name, comm_plan, backend, mode=mode, timeout_s=timeout_s)
 
-    def teardown_collective_groups(self, model_update_name: str, group_names: List[str]) -> None:
-        # Best-effort cleanup for dynamic model-update groups.
-        if not group_names:
-            return
-        for name in group_names:
-            collective.destroy_collective_group(name)
+    def destroy_collective_group(self, group_name: str, model_update_name: str | None = None) -> None:
+        # Destroy a single collective group and optionally clean up bookkeeping.
+        collective.destroy_collective_group(group_name)
 
-        # Remove bookkeeping if it exists.
-        plan = getattr(self, "model_update_comm_plan", None)
-        if isinstance(plan, dict) and model_update_name in plan:
-            for src_pp_rank in list(plan[model_update_name].keys()):
-                if plan[model_update_name][src_pp_rank].get("group_name") in set(group_names):
-                    plan[model_update_name].pop(src_pp_rank, None)
-            if not plan[model_update_name]:
-                plan.pop(model_update_name, None)
+        # Remove bookkeeping if model_update_name is provided.
+        if model_update_name is not None:
+            plan = getattr(self, "model_update_comm_plan", None)
+            if isinstance(plan, dict) and model_update_name in plan:
+                for src_pp_rank in list(plan[model_update_name].keys()):
+                    if plan[model_update_name][src_pp_rank].get("group_name") == group_name:
+                        plan[model_update_name].pop(src_pp_rank, None)
+                if not plan[model_update_name]:
+                    plan.pop(model_update_name, None)
 
     # offload/load 相关接口
     def load_states(self, *args, **kwargs):

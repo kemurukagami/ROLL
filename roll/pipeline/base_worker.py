@@ -186,7 +186,6 @@ class ActorWorker(Worker):
                         if callable(getattr(self.strategy, "_build_latest_bucket_cache", None)):
                             self.strategy._build_latest_bucket_cache(
                                 checkpoint_version=checkpoint_version,
-                                global_step=per_adapter_step,
                                 adapter_name=adapter,
                             )
             # Mirror train_step summary metrics so dashboards remain comparable in multi-LoRA mode.
@@ -572,12 +571,6 @@ class InferWorker(Worker):
 
     async def setup_collective_group(self, *args, **kwargs):
         await self.strategy.setup_collective_group(*args, **kwargs)
-
-    async def destroy_collective_group(self, group_name: str):
-        destroy = getattr(self.strategy, "destroy_collective_group", None)
-        if not callable(destroy):
-            raise RuntimeError(f"{type(self.strategy).__name__} does not support destroy_collective_group")
-        await destroy(group_name)
 
     async def start_model_update(self, *args, **kwargs):
         raise NotImplementedError

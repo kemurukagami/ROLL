@@ -1091,17 +1091,17 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         # ENG-123 Phase 4: sender-side cached buckets + promotion + selective sync.
         self._cache_lock = threading.Lock()
-        self._cache_map: Dict[Tuple[int, int], List[Any]] = {}
-        self._latest_cached: Optional[Tuple[int, int]] = None
-        self._active_cached: Optional[Tuple[int, int]] = None
+        self._cache_map: Dict[int, List[Any]] = {}
+        self._latest_cached: Optional[int] = None
+        self._active_cached: Optional[int] = None
         self._selective_update_weights_meta = None
         self._selective_sync_cpu_group = None
         self._selective_sync_cpu_group_size: Optional[int] = None
 
         # Per-adapter versioned cache (multi-LoRA selective sync)
-        self._adapter_cache_map: Dict[str, Dict[Tuple[int, int], List[Any]]] = {}
-        self._latest_adapter_cached: Dict[str, Optional[Tuple[int, int]]] = {}
-        self._active_adapter_cached: Dict[str, Optional[Tuple[int, int]]] = {}
+        self._adapter_cache_map: Dict[str, Dict[int, List[Any]]] = {}
+        self._latest_adapter_cached: Dict[str, Optional[int]] = {}
+        self._active_adapter_cached: Dict[str, Optional[int]] = {}
 
     def initialize(self, model_provider):
         self.seq_length = self.worker.pipeline_config.sequence_length
@@ -1509,10 +1509,10 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         if DO_TIME_SHARING:
             checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
-            self._build_latest_bucket_cache(checkpoint_version=checkpoint_version, global_step=int(global_step))
+            self._build_latest_bucket_cache(checkpoint_version=checkpoint_version)
             # fixme(tao) it need an if test, default to false, and only promt after cache explicitly  
             # Ensure selective sync has a valid promoted cache for the next expand/broadcast.
-            self.promote_active_checkpoint(checkpoint_version=checkpoint_version, global_step=int(global_step))
+            self.promote_active_checkpoint(checkpoint_version=checkpoint_version)
         return metrics
 
     def model_update(self, model_update_name: str, adapters_to_update: list[str] | None = None):
@@ -2030,10 +2030,10 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self._selective_sync_cpu_group_size = infer_tp_size
 
     def _build_latest_bucket_cache(
-        self, *, checkpoint_version: int, global_step: int, adapter_name: Optional[str] = None
+        self, *, checkpoint_version: int, adapter_name: Optional[str] = None
     ) -> None:
         buffer_size = int(self.worker.pipeline_config.model_update_buffer_size_mb) * 1024 * 1024
-        cache_key = (int(checkpoint_version), int(global_step))
+        cache_key = int(checkpoint_version)
 
         with self._cache_lock:
             if self._selective_update_weights_meta is None:
@@ -2071,17 +2071,17 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 self._cache_map[cache_key] = cached_buckets
                 self._latest_cached = cache_key
 
-    def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
+    def promote_active_checkpoint(self, checkpoint_version: int) -> None:
         if not DO_TIME_SHARING:
             raise RuntimeError("promote_active_checkpoint is only supported under RLix control plane")
 
-        cache_key = (int(checkpoint_version), int(global_step))
+        cache_key = int(checkpoint_version)
         with self._cache_lock:
             if cache_key not in self._cache_map:
                 raise RuntimeError(f"promote_active_checkpoint missing cache_key={cache_key}")
             self._active_cached = cache_key
 
-            keep: Set[Tuple[int, int]] = set()
+            keep: Set[int] = set()
             if self._latest_cached is not None:
                 keep.add(self._latest_cached)
             keep.add(self._active_cached)
@@ -2091,16 +2091,16 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     del self._cache_map[key]
 
     def promote_active_adapter_checkpoint(
-        self, adapter_name: str, checkpoint_version: int, global_step: int
+        self, adapter_name: str, checkpoint_version: int
     ) -> None:
-        cache_key = (int(checkpoint_version), int(global_step))
+        cache_key = int(checkpoint_version)
         with self._cache_lock:
             if cache_key not in self._adapter_cache_map.get(adapter_name, {}):
                 raise RuntimeError(
                     f"promote_active_adapter_checkpoint missing cache for adapter={adapter_name!r} key={cache_key}"
                 )
             self._active_adapter_cached[adapter_name] = cache_key
-            keep: Set[Tuple[int, int]] = set()
+            keep: Set[int] = set()
             if self._latest_adapter_cached.get(adapter_name) is not None:
                 keep.add(self._latest_adapter_cached[adapter_name])
             keep.add(self._active_adapter_cached[adapter_name])
@@ -2333,7 +2333,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             broadcast_workers = None
             if broadcast_target_dp_ranks and comm_plan is not None and bool(is_leader):
                 # ModelUpdateService set up the group ahead of time; retrieve group_name and receivers.
-                model_update_name = str(model_update_name) if model_update_name is not None else str(sync_id)
+                model_update_name = str(model_update_name)
                 if int(self.worker.rank) not in comm_plan:
                     raise RuntimeError(
                         "selective_sync_active_cache comm_plan missing sender rank. "
@@ -2460,7 +2460,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     f"sync_id={sync_id} group_name={group_name}"
                 )
                 collective.destroy_collective_group(group_name)
-                ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
+                ray.get([w.teardown_collective_groups.remote(model_update_name, [group_name]) for w in broadcast_workers])
                 logger.info(
                     "[rlix][selective_sync] broadcast_teardown_exit "
                     f"sync_id={sync_id} group_name={group_name}"

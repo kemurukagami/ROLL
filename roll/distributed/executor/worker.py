@@ -45,6 +45,22 @@ class RankInfo:
 
 
 class Worker:
+    """
+    Base worker class for distributed training and inference.
+    
+    A Worker wraps a strategy (e.g., FSDP, Megatron, vLLM) and provides a unified interface
+    for model loading, state management, and distributed communication setup.
+    
+    Workers are created by Cluster and run as Ray actors. Each worker has:
+    - A unique rank within its cluster
+    - A strategy that implements framework-specific logic
+    - Access to shared storage for cross-worker coordination
+    
+    Multi-pipeline support:
+    - Workers can belong to different pipelines in the same Ray cluster
+    - Pipeline isolation is achieved via pipeline-scoped rendezvous keys and port claims
+    - PIPELINE_ID environment variable identifies the pipeline (None for single-pipeline mode)
+    """
 
     def __init__(self, worker_config: WorkerConfig):
         if worker_config.offload_nccl:
@@ -56,7 +72,9 @@ class Worker:
         self.rank = int(os.environ.get("RANK", 0))
         self.world_size = int(os.environ.get("WORLD_SIZE", 1))
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        # Pipeline identifier for multi-pipeline isolation. None in single-pipeline mode.
         self.pipeline_id = os.environ.get("PIPELINE_ID") or None
+        # Use GLOBAL_STORAGE_NAMESPACE for cross-pipeline visibility (shared across all pipelines).
         self.shared_storage = SharedStorage.options(
             name=STORAGE_NAME, get_if_exists=True, namespace=GLOBAL_STORAGE_NAMESPACE
         ).remote()
@@ -69,8 +87,11 @@ class Worker:
 
         self.master_addr = os.environ["MASTER_ADDR"]
         self.master_port = int(os.environ["MASTER_PORT"])
+        # Guard against misconfiguration: ROLL_RAY_NAMESPACE implies multi-pipeline mode.
         if self.pipeline_id is None and os.environ.get("ROLL_RAY_NAMESPACE"):
             raise RuntimeError("PIPELINE_ID must be set when ROLL_RAY_NAMESPACE is set (multi-pipeline mode)")
+        # Pipeline-scoped rendezvous key for MASTER_ADDR/PORT discovery by other workers.
+        # Format: "{pipeline_id}:{cluster_name}" for multi-pipeline, "{cluster_name}" for single-pipeline.
         rendezvous_key = f"{self.pipeline_id}:{self.cluster_name}" if self.pipeline_id else self.cluster_name
         self.shared_storage.put.remote(rendezvous_key, {"MASTER_ADDR": self.master_addr, "MASTER_PORT": self.master_port})
         # NOTE: 自定义Worker时根据需要配置rank_info
@@ -100,6 +121,19 @@ class Worker:
 
     @staticmethod
     def get_free_port():
+        """
+        Allocate a unique free port for distributed communication setup.
+        
+        Uses atomic try_put on SharedStorage to claim ports across all workers in the cluster.
+        In multi-pipeline mode, ports are claimed with pipeline_id as the value, enabling
+        per-pipeline port isolation while still detecting conflicts across pipelines.
+        
+        Returns:
+            A unique port number available for use.
+            
+        Raises:
+            RuntimeError: If no unique port can be allocated within MAX_PORT_RETRY_COUNT attempts.
+        """
         shared_storage = SharedStorage.options(
             name=STORAGE_NAME, get_if_exists=True, namespace=GLOBAL_STORAGE_NAMESPACE
         ).remote()
@@ -110,6 +144,8 @@ class Worker:
         master_port = collect_free_port()
         while retry_count < max_retry_count:
             master_addr_port_key = f"MASTER_ADDR_PORT:{master_addr}:{master_port}"
+            # try_put returns True if key was successfully claimed (didn't exist before).
+            # Value is pipeline_id for multi-pipeline, True for single-pipeline mode.
             claimed = ray.get(shared_storage.try_put.remote(master_addr_port_key, pipeline_id if pipeline_id else True))
             if claimed:
                 break
@@ -177,11 +213,16 @@ class Worker:
             self.logger.warning("worker has not strategy")
     
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
-    async def process_weights_after_loading(self):
+    def process_weights_after_loading(self):
+        """
+        Process weights after model loading (e.g., weight slicing, dtype conversion).
+
+        Uses _maybe_await so sync and async strategy implementations are both handled consistently,
+        matching the pattern used by setup_collective_group and teardown_collective_groups.
+        Any exception from the async path is re-raised loudly by _maybe_await.
+        """
         if getattr(self, "strategy", None) is not None:
-            result = self.strategy.process_weights_after_loading()
-            if inspect.isawaitable(result):
-                await result
+            self._maybe_await(self.strategy.process_weights_after_loading())
         
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
@@ -201,12 +242,32 @@ class Worker:
         self.strategy.setup_model_update(*args, **kwargs)
 
     def setup_collective_group(self, *args, **kwargs):
+        """
+        Set up a distributed collective communication group (e.g., NCCL process group).
+        
+        Delegates to strategy.setup_collective_group(), which may be sync or async.
+        Uses _maybe_await to handle both cases transparently.
+        """
         if getattr(self, "strategy", None) is not None:
             self._maybe_await(self.strategy.setup_collective_group(*args, **kwargs))
         else:
             self.logger.warning("worker has not strategy")
 
     def teardown_collective_groups(self, model_update_name: str, group_names: List[str]) -> None:
+        """
+        Tear down collective communication groups after model update.
+        
+        Args:
+            model_update_name: Identifier for the model update session (used for logging/cleanup).
+            group_names: List of process group names to destroy.
+        
+        Supports two strategy interfaces:
+        - teardown_collective_groups(model_update_name, group_names): Batch teardown (preferred)
+        - destroy_collective_group(name): Legacy single-group destruction (backward compat)
+        
+        Raises:
+            RuntimeError: If strategy supports neither interface.
+        """
         if getattr(self, "strategy", None) is None:
             self.logger.warning("worker has not strategy")
             return
@@ -222,35 +283,44 @@ class Worker:
             return
         raise RuntimeError(f"{type(self.strategy).__name__} does not support teardown_collective_groups")
 
-    def destroy_collective_group(self, group_name: str) -> None:
-        if getattr(self, "strategy", None) is None:
-            self.logger.warning("worker has not strategy")
-            return
-        destroy = getattr(self.strategy, "destroy_collective_group", None)
-        if callable(destroy):
-            self._maybe_await(destroy(group_name))
-            return
-        # Fail fast: we cannot safely infer model_update_name for bookkeeping cleanup.
-        # Call teardown_collective_groups(model_update_name=..., group_names=...) when that context exists.
-        raise RuntimeError(
-            f"{type(self.strategy).__name__} does not support destroy_collective_group; "
-            "use teardown_collective_groups(model_update_name=..., group_names=...) instead."
-        )
-
     @staticmethod
     def _maybe_await(result: Any) -> Any:
+        """
+        Execute a result that may be sync or async, returning the resolved value.
+        
+        This helper allows Worker methods to call strategy methods that may be either
+        synchronous or asynchronous without knowing the implementation at call site.
+        
+        Handles three scenarios:
+        1. Non-awaitable result: Return directly (sync path)
+        2. Awaitable with no running event loop: Use run_until_complete
+        3. Awaitable with running event loop: Spawn a thread with asyncio.run
+        
+        Args:
+            result: Either a direct value or an awaitable (coroutine/Future).
+            
+        Returns:
+            The resolved value from the awaitable, or the original result if sync.
+            
+        Raises:
+            Any exception raised by the awaitable.
+        """
         if not inspect.isawaitable(result):
             return result
 
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError:
+            # No event loop exists; create one and run the coroutine.
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
         if not loop.is_running():
+            # Event loop exists but not running; use it directly.
             return loop.run_until_complete(result)
 
+        # Event loop is running (we're inside an async context).
+        # Spawn a daemon thread with a fresh loop to avoid blocking the current loop.
         out: Dict[str, Any] = {}
         err: Dict[str, BaseException] = {}
 
@@ -304,38 +374,71 @@ class Worker:
             self.logger.warning("worker has not strategy")
 
     def build_latest_bucket_cache(
-        self, checkpoint_version: int, global_step: int, adapter_name: str | None = None
+        self, checkpoint_version: int, adapter_name: str | None = None
     ) -> None:
         """
-        Build a sender-side CPU bucket cache for selective sync under RLix.
-
-        This is a thin wrapper around the strategy implementation. Fail fast if unsupported.
+        Build a sender-side CPU bucket cache for selective parameter sync.
+        
+        In RLix's selective sync protocol, the sender (actor_train) builds bucket caches
+        containing the latest parameter state. These caches are then transferred to receiver
+        workers (actor_infer) during model update, avoiding redundant checkpoint loading.
+        
+        Args:
+            checkpoint_version: Unique version identifier for the cached weights snapshot.
+            adapter_name: Optional LoRA adapter name; None means base model.
+        
+        Raises:
+            RuntimeError: If strategy does not implement _build_latest_bucket_cache.
         """
         if getattr(self, "strategy", None) is None:
             raise RuntimeError("worker has no strategy")
         fn = getattr(self.strategy, "_build_latest_bucket_cache", None)
         if not callable(fn):
             raise RuntimeError(f"{type(self.strategy).__name__} does not support build_latest_bucket_cache")
-        fn(checkpoint_version=int(checkpoint_version), global_step=int(global_step), adapter_name=adapter_name)
+        fn(checkpoint_version=int(checkpoint_version), adapter_name=adapter_name)
 
-    def promote_active_checkpoint(self, checkpoint_version: int, global_step: int) -> None:
+    def promote_active_checkpoint(self, checkpoint_version: int) -> None:
+        """
+        Promote a checkpoint version as the active one for subsequent operations.
+        
+        After building bucket caches, this marks which version should be used for
+        the next selective sync. Enables atomic version switching without race conditions.
+        
+        Args:
+            checkpoint_version: Unique version identifier to promote.
+        
+        Raises:
+            RuntimeError: If strategy does not implement promote_active_checkpoint.
+        """
         if getattr(self, "strategy", None) is None:
             raise RuntimeError("worker has no strategy")
         promote = getattr(self.strategy, "promote_active_checkpoint", None)
         if not callable(promote):
             raise RuntimeError(f"{type(self.strategy).__name__} does not support promote_active_checkpoint")
-        promote(checkpoint_version=int(checkpoint_version), global_step=int(global_step))
+        promote(checkpoint_version=int(checkpoint_version))
 
     def promote_active_adapter_checkpoint(
-        self, adapter_name: str, checkpoint_version: int, global_step: int
+        self, adapter_name: str, checkpoint_version: int
     ) -> None:
-        """Promote a per-adapter cache version as active. Thin wrapper around strategy implementation."""
+        """
+        Promote a per-adapter checkpoint version as active (multi-LoRA support).
+        
+        Similar to promote_active_checkpoint but scoped to a specific LoRA adapter,
+        allowing independent version management per adapter.
+        
+        Args:
+            adapter_name: Name of the LoRA adapter.
+            checkpoint_version: Unique version identifier to promote.
+        
+        Raises:
+            RuntimeError: If strategy does not implement promote_active_adapter_checkpoint.
+        """
         if getattr(self, "strategy", None) is None:
             raise RuntimeError("worker has no strategy")
         fn = getattr(self.strategy, "promote_active_adapter_checkpoint", None)
         if not callable(fn):
             raise RuntimeError(f"{type(self.strategy).__name__} does not support promote_active_adapter_checkpoint")
-        fn(str(adapter_name), int(checkpoint_version), int(global_step))
+        fn(str(adapter_name), int(checkpoint_version))
 
     def selective_sync_active_cache(
         self,
@@ -350,6 +453,27 @@ class Worker:
         is_leader: bool = False,
         adapters_to_sync: list[str] | None = None,
     ) -> None:
+        """
+        Perform selective parameter synchronization from sender to receiver workers.
+        
+        This is the core RLix operation that transfers parameter buckets from actor_train
+        (sender) to actor_infer (receiver) workers. Uses pre-built bucket caches and
+        optional communication plans to minimize transfer overhead.
+        
+        Args:
+            sync_id: Unique identifier for this sync operation (for logging/tracing).
+            tgt_dp_ranks: Target data parallel ranks to sync to.
+            tgt_workers: Target worker actor handles.
+            tgt_device_mapping: Device mapping for target workers.
+            tgt_num_gpus_per_worker: Number of GPUs per target worker.
+            model_update_name: Optional name for the model update session.
+            comm_plan: Optional pre-computed communication plan for optimized transfers.
+            is_leader: Whether this worker is the leader for coordination.
+            adapters_to_sync: Optional list of LoRA adapters to sync (multi-LoRA mode).
+        
+        Raises:
+            RuntimeError: If strategy does not implement selective_sync_active_cache.
+        """
         if getattr(self, "strategy", None) is None:
             raise RuntimeError("worker has no strategy")
         fn = getattr(self.strategy, "selective_sync_active_cache", None)

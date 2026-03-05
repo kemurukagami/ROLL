@@ -34,7 +34,7 @@ def main():
     pipeline = pipeline_cls(pipeline_config=ppo_config)
 
     pipeline.run()
-    print('done!!')
+    print("Pipeline finished.")
 
 
 if __name__ == "__main__":

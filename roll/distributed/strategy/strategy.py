@@ -164,7 +164,10 @@ class InferenceStrategy(ABC):
         # Destroy a single collective group and optionally clean up bookkeeping.
         collective.destroy_collective_group(group_name)
 
-        # Remove bookkeeping if model_update_name is provided.
+        # Clean up bookkeeping if model_update_name is provided.
+        # Structure: model_update_comm_plan[model_update_name][src_pp_rank] = {group_name: ..., ...}
+        # Multiple src_pp_rank entries may exist under one model_update_name, each with its own group_name.
+        # We must iterate to remove only entries matching this group_name, then prune model_update_name if empty.
         if model_update_name is not None:
             plan = getattr(self, "model_update_comm_plan", None)
             if isinstance(plan, dict) and model_update_name in plan:

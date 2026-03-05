@@ -581,18 +581,6 @@ class InferWorker(Worker):
     async def add_lora(self, *args, **kwargs):
         await self.strategy.add_lora(*args, **kwargs)
 
-    async def get_lora_id(self, adapter_name: str):
-        # Delegate to strategy adapter-id lookup for multi-LoRA model-update verification.
-        return await self.strategy.get_lora_id(adapter_name)
-
-    async def list_loras(self):
-        # Delegate loaded-adapter-id listing for multi-LoRA readiness checks.
-        return await self.strategy.list_loras()
-
-    async def wait_loras_ready(self, adapter_names: list[str], timeout_s: float):
-        # Delegate per-adapter readiness polling to strategy implementation.
-        await self.strategy.wait_loras_ready(adapter_names, timeout_s=timeout_s)
-
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE)
     async def generate(self, data: DataProto):
         """

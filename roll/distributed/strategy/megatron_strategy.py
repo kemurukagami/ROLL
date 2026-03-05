@@ -2316,6 +2316,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                                 adapter_name=adapter_name,
                             )
                             if co_infer_rank == 0:
+                                # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
                                 ray.get(
                                     co_infer_worker.add_lora.remote(
                                         adapter_name=adapter_name, peft_config=asdict(peft_configs[adapter_name])
@@ -2446,6 +2447,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                             phase_tag="adapter",
                             adapter_name=adapter_name,
                         )
+                        # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
                         ray.get(
                             [
                                 worker.add_lora.remote(

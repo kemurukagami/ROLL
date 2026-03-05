@@ -30,9 +30,29 @@ logger = get_logger()
 
 
 def _normalize_lora_int_ids_loaded(value) -> list[int]:
-    # vLLM list_loras may return flat [id,...] or nested [[id,...],...] across ranks.
+    """Normalize LoRA adapter integer IDs returned by vLLM's list_loras RPC.
+
+    vLLM's ``list_loras`` API has inconsistent return formats across versions and
+    distributed configurations:
+      - Single GPU: returns ``[id1, id2, ...]`` (flat list of ints)
+      - Multi-GPU/Tensor Parallel: may return ``[[id1, id2], [id1, id2], ...]``
+        where each sub-list corresponds to a different rank's view
+      - Empty state: returns ``[]`` or ``[[]]``
+
+    This helper flattens nested structures, deduplicates across ranks, and returns
+    a sorted list of unique integer adapter IDs for consistent downstream handling.
+
+    Args:
+        value: The raw return value from ``await model.list_loras()``. May be
+            a flat list of ints, a nested list of lists, or an empty list.
+
+    Returns:
+        A sorted list of unique integer LoRA adapter IDs. Returns an empty list
+        for invalid or empty inputs.
+    """
     if not isinstance(value, list) or not value:
         return []
+    # Handle nested [[id,...], ...] format from multi-rank responses
     if isinstance(value[0], list):
         flat: list[int] = []
         for sub in value:
@@ -42,6 +62,7 @@ def _normalize_lora_int_ids_loaded(value) -> list[int]:
                 if isinstance(item, int):
                     flat.append(item)
         return sorted(set(flat))
+    # Handle flat [id, ...] format from single-rank responses
     return [item for item in value if isinstance(item, int)]
 
 
@@ -56,49 +77,9 @@ class VllmStrategy(InferenceStrategy):
         self._metrics_snapshot_interval = 1.0  # Snapshot every 1 second
         self._metrics_task = None
 
-    @staticmethod
-    def _should_debug_lora_routing() -> bool:
-        return os.environ.get("ROLL_DEBUG_LORA_ROUTING", "0") == "1" or os.environ.get("ROLL_DEBUG_PUNICA", "0") == "1"
-
-    def _log_lora_routing_context(
-        self,
-        *,
-        where: str,
-        input_ids: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
-        non_tensor_batch: dict | None = None,
-    ) -> None:
-        if not self._should_debug_lora_routing():
-            return
-
-        payload: dict[str, object] = {"where": where}
-        if input_ids is not None:
-            payload["input_ids.shape"] = tuple(input_ids.shape)
-        if attention_mask is not None:
-            payload["attention_mask.shape"] = tuple(attention_mask.shape)
-            try:
-                payload["attention_mask.sum"] = int(attention_mask.sum().item())
-            except Exception:
-                payload["attention_mask.sum"] = "unavailable"
-        if non_tensor_batch is not None:
-            payload["non_tensor_batch.keys"] = sorted(non_tensor_batch.keys())
-            lora_name = non_tensor_batch.get("lora_name", None)
-            if lora_name is not None:
-                payload["lora_name.type"] = str(type(lora_name))
-                payload["lora_name.shape"] = getattr(lora_name, "shape", None)
-                try:
-                    sample = list(lora_name[: min(8, len(lora_name))])
-                except Exception:
-                    sample = None
-                payload["lora_name.sample"] = sample
-        logger.info("LoRA routing debug: %s", payload)
-
     async def initialize(self, model_provider):
         set_seed(seed=self.worker.pipeline_config.seed)
         vllm_config = copy.deepcopy(self.worker_config.strategy_args.strategy_config)
-        has_enable_prefix_caching = "enable_prefix_caching" in vllm_config
-        has_enable_chunked_prefill = "enable_chunked_prefill" in vllm_config
-        has_max_num_batched_tokens = "max_num_batched_tokens" in vllm_config
         # Must explicitly set VLLM_USE_V1 to pass this check: https://github.com/vllm-project/vllm/pull/14972
         os.environ["VLLM_USE_V1"] = str(vllm_config.pop("VLLM_USE_V1", 1))
         self.sleep_level = vllm_config.pop("sleep_level", 1)
@@ -142,33 +123,52 @@ class VllmStrategy(InferenceStrategy):
             }
         )
 
-        # Keep max_loras handling local to vllm_config; no persistent instance field is needed here.
-        self.is_lora = self.worker_config.model_args.adapters is not None
+        # =====================================================================
+        # Multi-LoRA Configuration
+        # =====================================================================
+        # Detection: LoRA mode is active when adapters dict is configured and non-empty.
+        # This replaces the legacy lora_target field check.
+        # Note: We check both `is not None` and `len() > 0` because:
+        #   - adapters=None → LoRA disabled
+        #   - adapters={} (empty dict) → invalid config, would crash on max_lora_rank
+        adapters = self.worker_config.model_args.adapters
+        self.is_lora = adapters is not None and len(adapters) > 0
         if self.is_lora:
-            if not has_enable_prefix_caching:
-                vllm_config["enable_prefix_caching"] = False
-            if not has_enable_chunked_prefill:
-                vllm_config["enable_chunked_prefill"] = False
-            if not has_max_num_batched_tokens:
-                max_model_len = int(vllm_config.get("max_model_len") or 0)
-                vllm_config["max_num_batched_tokens"] = max(8192, max_model_len)
+            # -----------------------------------------------------------------
+            # vLLM V1 Multi-LoRA Support:
+            # -----------------------------------------------------------------
+            # vLLM V1 supports multi-LoRA with prefix caching and chunked prefill:
+            #   - Block hashes include LoRA adapter name via _gen_lora_extra_hash_keys()
+            #   - Each request's lora_request.lora_name is part of the cache key
+            #   - See: vllm/v1/core/kv_cache_utils.py:generate_block_hash_extra_keys()
+            # -----------------------------------------------------------------
+
+            # max_loras: Maximum number of LoRA adapters that can be resident in GPU
+            # memory simultaneously. Set to at least configured adapters + 1 for
+            # dynamic loading headroom.
             max_loras_cfg = int(vllm_config.get("max_loras", 0) or 0)
             lora_kwargs = {
                 "enable_lora": True,
-                "max_loras": max(max_loras_cfg, len(self.worker_config.model_args.adapters) + 1),
-                "max_lora_rank": max(a.lora_rank for a in self.worker_config.model_args.adapters.values()),
+                "max_loras": max(max_loras_cfg, len(adapters) + 1),
+                "max_lora_rank": max(a.lora_rank for a in adapters.values()),
             }
             vllm_config.update(lora_kwargs)
+            # LoRA mode requires real base model weights for adapter weight initialization.
+            # "dummy" load_format only works for weight broadcasting from trainer.
             vllm_config["load_format"] = "auto"
 
+        # Guard: LoRA mode is incompatible with dummy load_format (used for weight broadcasting).
+        # Users must either set load_format='auto' or disable LoRA.
         if self.is_lora and vllm_config.get("load_format") == "dummy":
             raise RuntimeError(
                 "vLLM LoRA mode requires real base model weights; got load_format='dummy'. "
                 "Set vllm strategy_config.load_format='auto' or disable LoRA."
             )
 
+        # Guard: Multi-LoRA routing requires vLLM V1 engine for adapter-id RPC APIs.
+        # The V0 engine does not expose the per-request adapter selection APIs needed
+        # for routing different samples to different LoRA adapters in a single batch.
         if self.is_lora:
-            # Multi-LoRA routing needs adapter-id RPCs that are only exposed on vLLM V1 workers.
             vllm_use_v1 = int(os.environ.get("VLLM_USE_V1", "1"))
             if vllm_use_v1 != 1:
                 raise RuntimeError(
@@ -230,7 +230,26 @@ class VllmStrategy(InferenceStrategy):
         return generation_config.get("num_beams", 1) > 1 or generation_config.get("use_beam_search", False)
 
     async def _generate_standard(self, batch: DataProto, generation_config: Dict) -> torch.Tensor:
-        """Standard generate method for non-beam search cases."""
+        """Standard generate method for non-beam search cases with multi-LoRA routing.
+
+        This method handles both single-LoRA and multi-LoRA scenarios:
+          - Single-LoRA: All samples use the same adapter (auto-filled if not specified)
+          - Multi-LoRA: Each sample specifies its adapter via ``lora_name`` in non_tensor_batch
+
+        The multi-LoRA routing flow:
+          1. Extract per-sample adapter names from ``batch.non_tensor_batch["lora_name"]``
+          2. Resolve each adapter name to its vLLM-assigned integer ID
+          3. Construct a ``LoRARequest`` per sample
+          4. Pass the per-sample requests to vLLM's generate API
+
+        Args:
+            batch: Input batch containing ``batch`` (tensor data) and ``non_tensor_batch``
+                (metadata including optional ``lora_name`` array).
+            generation_config: Generation parameters (temperature, top_p, etc.).
+
+        Returns:
+            Output tensor of shape ``(bs * num_return_sequences, input_len + max_response_len)``.
+        """
         sampling_params = create_sampling_params_for_vllm(gen_kwargs=generation_config)
 
         input_ids = batch.batch["input_ids"]  # (bs, prompt_length)
@@ -243,7 +262,19 @@ class VllmStrategy(InferenceStrategy):
                 for prompt in gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
             ]
 
-        # Auto-fill lora_name for single-adapter producers and fail-fast when multi-adapter lora_name is missing.
+        # =====================================================================
+        # Multi-LoRA Per-Sample Routing
+        # =====================================================================
+        # In multi-LoRA mode, each sample in the batch may use a different adapter.
+        # The adapter assignment is determined by:
+        #   1. Explicit per-sample ``lora_name`` in non_tensor_batch (producer sets this)
+        #   2. Single-adapter fallback: if only one adapter is configured, all samples
+        #      use it automatically (ensures backward compatibility)
+        #
+        # The routing validation ensures:
+        #   - ``lora_name`` array length matches batch size
+        #   - All referenced adapters are registered and loaded in vLLM
+        # =====================================================================
         if self.is_lora:
             ensure_lora_name_in_batch(
                 batch.non_tensor_batch,
@@ -253,43 +284,38 @@ class VllmStrategy(InferenceStrategy):
 
         lora_requests: list[LoRARequest | None] | None = None
         if self.is_lora:
-            try:
-                lora_names = get_lora_name_array(batch.non_tensor_batch)
-            except Exception:
-                self._log_lora_routing_context(
-                    where="vllm_strategy._generate_standard:get_lora_name_array_failed",
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    non_tensor_batch=batch.non_tensor_batch,
-                )
-                raise
+            # Step 1: Extract per-sample adapter names
+            lora_names = get_lora_name_array(batch.non_tensor_batch)
+
+            # Step 2: Validate adapter count matches prompt count
             if len(lora_names) != len(prompts):
-                self._log_lora_routing_context(
-                    where="vllm_strategy._generate_standard:lora_names_len_mismatch",
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    non_tensor_batch=batch.non_tensor_batch,
-                )
                 logger.error("LoRA routing mismatch: len(lora_names)=%s len(prompts)=%s", len(lora_names), len(prompts))
                 raise RuntimeError(
                     f"vLLM routing requires len(lora_name)==len(prompts), got {len(lora_names)} vs {len(prompts)}"
                 )
+
+            # Step 3: Build adapter name -> integer ID mapping
             adapters = [str(d) for d in lora_names.tolist()]
-            # vLLM requires a non-empty lora_path in LoRARequest even when adapters are registered dynamically.
             lora_request_path = self.worker_config.model_args.model_name_or_path
             lora_int_ids_loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
             adapter_to_int_id: dict[str, int] = {}
             for adapter in sorted(set(adapters)):
+                # Validate adapter is configured
                 if adapter not in self.worker_config.model_args.adapters:
                     raise RuntimeError(f"Unknown LoRA adapter requested by lora_name={adapter!r}")
+                # Get vLLM-assigned integer ID
                 lora_int_id = await self.get_lora_id(adapter)
                 if lora_int_id is None:
                     raise RuntimeError(f"Missing LoRA adapter in vLLM engine: {adapter!r}")
+                # Verify adapter is loaded (visible in list_loras)
                 if lora_int_id not in lora_int_ids_loaded:
                     raise RuntimeError(
                         f"LoRA adapter id not loaded in vLLM engine: adapter={adapter!r} lora_int_id={lora_int_id}"
                     )
                 adapter_to_int_id[adapter] = lora_int_id
+
+            # Step 4: Construct per-sample LoRARequest objects
+            # vLLM uses these to route each request to the correct adapter's weights.
             lora_requests = [
                 LoRARequest(
                     lora_name=adapter,
@@ -312,6 +338,7 @@ class VllmStrategy(InferenceStrategy):
                 output = result
             return output
 
+        # Execute all generations in parallel, each with its LoRARequest (or None for non-LoRA mode)
         if lora_requests is None:
             vllm_outputs = await asyncio.gather(*[_generate(prompt, None) for prompt in prompts])
         else:
@@ -395,6 +422,34 @@ class VllmStrategy(InferenceStrategy):
         return output
 
     async def generate_request(self, data: DataProto):
+        """Generate for a single streaming request with LoRA adapter routing.
+
+        Unlike ``_generate_standard`` which handles batch inference with per-sample
+        LoRA routing, this method handles single-request streaming generation where
+        each request uses exactly one LoRA adapter.
+
+        The LoRA routing flow for single requests:
+          1. Resolve the adapter name from ``non_tensor_batch`` (single value, not array)
+          2. Look up the vLLM-assigned integer ID for the adapter
+          3. Verify the adapter is loaded
+          4. Construct and pass a single ``LoRARequest`` to vLLM
+
+        Routing metadata is recorded in ``data.meta_info`` for observability:
+          - ``routed_lora_name``: The resolved adapter name
+          - ``routed_lora_int_id``: The vLLM integer ID for the adapter
+
+        Args:
+            data: Input data proto containing:
+                - ``batch``: Tensor data (input_ids, attention_mask)
+                - ``non_tensor_batch``: Metadata including ``lora_name``
+                - ``meta_info``: Request ID, generation config, etc.
+
+        Returns:
+            DataProto with output tokens, finish reasons, and logprobs in meta_info.
+
+        Raises:
+            RuntimeError: If LoRA routing fails (adapter not found, not loaded, etc.)
+        """
         # Keep meta_info writable for routing diagnostics; some callers may pass None.
         if data.meta_info is None:
             data.meta_info = {}
@@ -421,7 +476,15 @@ class VllmStrategy(InferenceStrategy):
             prompt_token_ids = gather_unpadded_input_ids(input_ids=input_ids, attention_mask=attention_mask)
             assert len(prompt_token_ids) == 1
             prompt = TokensPrompt(prompt_token_ids=prompt_token_ids[0])
-        # Pass batch_size so single-adapter auto-fill still works with empty non_tensor_batch metadata.
+
+        # =====================================================================
+        # Single-Request LoRA Routing
+        # =====================================================================
+        # For streaming requests, each request uses exactly one LoRA adapter.
+        # The adapter name is resolved from non_tensor_batch (single value, not array).
+        # This differs from _generate_standard where we handle per-sample routing
+        # within a batch.
+        # =====================================================================
         if self.is_lora:
             ensure_lora_name_in_batch(
                 data.non_tensor_batch,
@@ -431,64 +494,33 @@ class VllmStrategy(InferenceStrategy):
 
         lora_request = None
         if self.is_lora:
-            lora_request_enabled = os.environ.get("ROLL_VLLM_DISABLE_LORA_REQUEST", "0") != "1"
-            data.meta_info["lora_request_enabled"] = lora_request_enabled
-            if not lora_request_enabled:
-                raise RuntimeError(
-                    "LoRA routing is enabled (is_lora=True) but ROLL_VLLM_DISABLE_LORA_REQUEST=1 disables passing "
-                    "LoRARequest into vLLM. Unset ROLL_VLLM_DISABLE_LORA_REQUEST to ensure rollouts use adapters."
-                )
+            # Step 1: Resolve the adapter name for this single request
+            routing = resolve_microbatch_lora_name(data.non_tensor_batch)
 
-            try:
-                routing = resolve_microbatch_lora_name(data.non_tensor_batch)
-            except Exception:
-                self._log_lora_routing_context(
-                    where="vllm_strategy.generate_request:resolve_microbatch_lora_name_failed",
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    non_tensor_batch=data.non_tensor_batch,
-                )
-                raise
-
+            # Step 2: Get vLLM-assigned integer ID for the adapter
             lora_name = routing.lora_name
             lora_int_id = await self.get_lora_id(lora_name)
             if lora_int_id is None:
-                self._log_lora_routing_context(
-                    where="vllm_strategy.generate_request:lora_id_missing",
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    non_tensor_batch=data.non_tensor_batch,
-                )
                 raise RuntimeError(f"Missing LoRA adapter in vLLM engine: {lora_name!r}")
 
+            # Record routing decision for observability
             data.meta_info["routed_lora_name"] = lora_name
             data.meta_info["routed_lora_int_id"] = int(lora_int_id)
 
+            # Step 3: Verify adapter is loaded (handle race condition after add_lora)
             lora_int_ids_loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
             if lora_int_id not in lora_int_ids_loaded:
-                self._log_lora_routing_context(
-                    where="vllm_strategy.generate_request:lora_id_not_loaded",
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    non_tensor_batch=data.non_tensor_batch,
-                )
-                await self._wait_for_lora_visible(
-                    adapter=lora_name,
-                    lora_int_id=lora_int_id,
-                    where="vllm_strategy.generate_request:lora_id_not_loaded",
+                # Fail fast if adapter not visible - add_lora should have waited
+                raise RuntimeError(
+                    f"LoRA adapter id not loaded: adapter={lora_name!r} lora_int_id={lora_int_id} loaded={lora_int_ids_loaded[:16]!r}"
                 )
 
+            # Step 4: Construct LoRARequest for vLLM
             lora_request = LoRARequest(
                 lora_name=lora_name,
                 lora_int_id=lora_int_id,
                 lora_path=self.worker_config.model_args.model_name_or_path,
             )
-
-            if lora_request is None:
-                raise RuntimeError(
-                    "Expected non-null lora_request for vLLM request (is_lora=True), but got None. "
-                    "This indicates a LoRA routing bug."
-                )
 
         result_generator = self.model.generate(
             prompt=prompt,
@@ -552,14 +584,58 @@ class VllmStrategy(InferenceStrategy):
         # CustomAsyncLLM.process_weights_after_loading is async; return the awaitable so caller can await.
         return self.model.process_weights_after_loading()
 
-    # 参数同步相关接口
+    # =====================================================================
+    # Collective Communication Group Management
+    # =====================================================================
+    # These methods manage process groups for distributed weight synchronization
+    # between trainer (FSDP2) and inference workers. Two call styles are supported:
     #
-    # We support two call styles:
-    # 1) Dynamic comm_plan based group setup (selective model-update style):
-    #    setup_collective_group(model_update_name=..., comm_plan=..., backend=?, mode=?, timeout_s=?)
-    # 2) Legacy/persistent broadcast group:
-    #    setup_collective_group(master_address=..., master_port=..., rank_offset=..., world_size=..., group_name=..., backend=?, timeout_s=?)
-    async def setup_collective_group(self, *args, **kwargs):
+    # 1. Dynamic comm_plan style (modern, selective model-update):
+    #    Used for fine-grained control over which ranks participate in each group.
+    #    setup_collective_group(comm_plan=..., backend=?, timeout_s=?)
+    #
+    # 2. Legacy/persistent broadcast group style:
+    #    Used for traditional all-rank broadcast communication patterns.
+    #    setup_collective_group(master_address=..., master_port=..., rank_offset=...,
+    #                          world_size=..., group_name=..., backend=?, timeout_s=?)
+    # =====================================================================
+
+    async def setup_collective_group(self, *args, **kwargs) -> None:
+        """Create a collective communication group for distributed operations.
+
+        This method supports two calling conventions for different use cases:
+
+        **Style 1: Dynamic comm_plan (recommended for multi-LoRA)**
+            Uses a communication plan that specifies which ranks participate.
+            This enables selective model updates where only relevant workers
+            receive weight broadcasts for specific adapters.
+
+            Required kwargs:
+                comm_plan: Communication plan specifying participant ranks.
+
+            Optional kwargs:
+                backend: Communication backend (defaults to platform default).
+                timeout_s: Timeout for group creation in seconds.
+
+        **Style 2: Legacy broadcast group**
+            Creates a persistent process group for traditional all-rank broadcasts.
+            Used when all workers need to participate in weight synchronization.
+
+            Required kwargs:
+                master_address: Address of the rank 0 process.
+                master_port: Port for communication.
+                rank_offset: Offset to apply to local ranks.
+                world_size: Total number of ranks in the group.
+                group_name: Unique identifier for this process group.
+
+            Optional kwargs:
+                backend: Communication backend (defaults to platform default).
+                timeout_s: Timeout for group creation in seconds.
+
+        Raises:
+            TypeError: If neither style's required arguments are provided.
+        """
+        # Style 1: Dynamic comm_plan based group setup
         if "comm_plan" in kwargs:
             backend = kwargs.get("backend", None)
             timeout_s = kwargs.get("timeout_s", None)
@@ -570,6 +646,7 @@ class VllmStrategy(InferenceStrategy):
             )
             return
 
+        # Style 2: Legacy/persistent broadcast group
         required = {"master_address", "master_port", "rank_offset", "world_size", "group_name"}
         if required.issubset(kwargs.keys()):
             backend = kwargs.get("backend", None)
@@ -589,7 +666,7 @@ class VllmStrategy(InferenceStrategy):
 
         raise TypeError(
             "VllmStrategy.setup_collective_group expects either "
-            "(model_update_name=..., comm_plan=..., backend=?, mode=?, timeout_s=?) "
+            "(comm_plan=..., backend=?, timeout_s=?) "
             "or (master_address=..., master_port=..., rank_offset=..., world_size=..., group_name=..., backend=?, timeout_s=?)."
         )
 
@@ -600,11 +677,56 @@ class VllmStrategy(InferenceStrategy):
         await self.model.update_parameter_in_bucket(serialized_named_tensors, is_lora)
 
     async def destroy_collective_group(self, group_name: str, model_update_name: str | None = None) -> None:
+        """Destroy a previously created collective communication group.
+
+        Args:
+            group_name: The name of the process group to destroy.
+            model_update_name: Unused in vLLM strategy (kept for API compatibility
+                with other strategies that track model_update_comm_plan state).
+        """
         # vLLM has no model_update_comm_plan bookkeeping; model_update_name is unused.
         del model_update_name
         await self.model.destroy_collective_group(group_name)
 
     async def add_lora(self, adapter_name: str = "default", peft_config: dict = None):
+        """Register a LoRA adapter with the vLLM inference engine.
+
+        This method handles the full lifecycle of LoRA adapter registration:
+          1. Validates the adapter name against the configured adapters dict
+          2. Calls vLLM's add_lora RPC with the PEFT configuration
+          3. Verifies the adapter is visible in list_loras()
+          4. Updates internal GPU state tracking
+
+        The method is designed for multi-LoRA scenarios where different samples
+        in a batch may need different adapters. Each adapter must be registered
+        before it can be used in inference via LoRARequest routing.
+
+        This method always re-registers the adapter to ensure updated LoRA weights
+        from the latest training step are applied. The caller (offload_states) is
+        responsible for evicting stale registrations before the next model_update.
+
+        Args:
+            adapter_name: Name of the adapter to register. Must match a key in
+                ``worker_config.model_args.adapters``. Defaults to "default" for
+                backward compatibility with single-LoRA callers.
+            peft_config: PEFT configuration dict containing LoRA parameters.
+                Required. The ``target_modules`` field is overwritten from the
+                configured adapter spec to ensure consistency.
+
+        Raises:
+            RuntimeError: If:
+                - ``peft_config`` is None
+                - ``adapter_name`` is not in the configured adapters
+                - ``adapter_name="default"`` in multi-LoRA mode (FSDP2 limitation)
+                - Adapter registration fails to produce an ID
+                - Adapter is not visible after registration within retry window
+
+        Note:
+            - The ``is_model_in_gpu`` flag is set to True after registration because
+              vLLM's custom_add_lora loads weights into GPU memory before returning.
+            - For multi-LoRA with FSDP2 trainer, use explicit adapter names instead
+              of the "default" placeholder to avoid ambiguity.
+        """
         # Backward-compatible: single-LoRA callers may pass only peft_config and rely on adapter_name default.
         if peft_config is None:
             raise RuntimeError("add_lora: peft_config must not be None")
@@ -614,30 +736,14 @@ class VllmStrategy(InferenceStrategy):
                 f"add_lora: unknown adapter_name={adapter_name!r}. "
                 f"Valid adapters: {sorted(adapters.keys())}"
             )
+        # Guard: FSDP2 model_update path does not support multi-LoRA weight broadcasting.
+        # Using "default" name in multi-LoRA config would cause ambiguity.
         if adapter_name == "default" and len(adapters) > 1:
             raise RuntimeError(
                 "add_lora called with adapter_name='default' in multi-LoRA mode. "
                 "FSDP2 model_update path does not support multi-LoRA. "
                 f"Configured adapters: {list(adapters.keys())}"
             )
-        existing = await self.get_lora_id(adapter_name)
-        logger.info(
-            "[vllm_strategy][add_lora] adapter=%s existing_id=%s",
-            adapter_name, existing,
-        )
-        if existing is not None:
-            loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
-            logger.info(
-                "[vllm_strategy][add_lora] early_return adapter=%s existing_id=%s in_loaded=%s loaded=%s",
-                adapter_name, existing, existing in loaded, loaded[:8],
-            )
-            if existing not in loaded:
-                await self._wait_for_lora_visible(
-                    adapter=adapter_name,
-                    lora_int_id=existing,
-                    where="vllm_strategy.add_lora:existing_not_visible",
-                )
-            return
         # Keep target_modules JSON-serializable and deterministic for worker-side hashing.
         peft_config["target_modules"] = sorted(adapters[adapter_name].lora_target)
         await self.model.add_lora(adapter_name, peft_config)
@@ -654,77 +760,51 @@ class VllmStrategy(InferenceStrategy):
             raise RuntimeError(f"LoRA adapter registration did not produce an id: adapter={adapter_name!r}")
         loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
         if lora_int_id not in loaded:
-            await self._wait_for_lora_visible(
-                adapter=adapter_name,
-                lora_int_id=lora_int_id,
-                where="vllm_strategy.add_lora:not_visible_after_add",
+            raise RuntimeError(
+                f"vllm_strategy.add_lora:not_visible_after_add: "
+                f"adapter={adapter_name!r} lora_int_id={lora_int_id} loaded={loaded[:16]!r}"
             )
-            # _wait_for_lora_visible returns only when adapter is visible or raises on timeout.
-            return
-
-    async def list_loras(self) -> list[int]:
-        # Normalize per-rank RPC returns into one deterministic adapter-id list.
-        return _normalize_lora_int_ids_loaded(await self.model.list_loras())
-
-    async def wait_loras_ready(self, adapter_names: list[str], timeout_s: float = 30.0) -> None:
-        if not adapter_names:
-            return
-
-        deadline = asyncio.get_event_loop().time() + float(timeout_s)
-        last_loaded: list[int] = []
-        last_missing: list[tuple[str, int | None]] = []
-        while True:
-            last_loaded = await self.list_loras()
-            last_missing = []
-            for adapter_name in adapter_names:
-                lora_int_id = await self.get_lora_id(adapter_name)
-                if lora_int_id is None or lora_int_id not in last_loaded:
-                    last_missing.append((adapter_name, lora_int_id))
-            if not last_missing:
-                return
-            if asyncio.get_event_loop().time() >= deadline:
-                raise RuntimeError(
-                    "LoRA adapters not ready before timeout: "
-                    f"missing={last_missing!r} loaded_sample={last_loaded[:16]!r} timeout_s={timeout_s}"
-                )
-            await asyncio.sleep(0.5)
 
     async def get_lora_id(self, adapter_name: str) -> int | None:
+        """Get the integer ID assigned by vLLM for a named LoRA adapter.
+
+        vLLM assigns unique integer IDs to each registered LoRA adapter. These IDs
+        are required for constructing ``LoRARequest`` objects during inference.
+
+        Note:
+            vLLM's ``get_lora_id`` RPC may return various formats depending on the
+            distributed configuration:
+              - Single rank: returns ``int`` directly
+              - Multi-rank via collective_rpc: returns ``[int]`` or ``[[int]]``
+            This method normalizes all formats to a single ``int | None``.
+
+        Args:
+            adapter_name: The name of the LoRA adapter to query.
+
+        Returns:
+            The integer ID if the adapter is registered, or ``None`` if not found.
+
+        Raises:
+            RuntimeError: If different ranks report different IDs for the same
+                adapter name, indicating a registration inconsistency.
+        """
         lora_id = await self.model.get_lora_id(adapter_name)
-        # vLLM collective_rpc may return [id], [id0, id1], or nested [[id], ...] depending on rank fanout.
+        # Handle vLLM collective_rpc return format variations:
+        # - Single rank: int
+        # - Multi-rank: [int, int, ...] (one per rank) or [[int], ...]
         if isinstance(lora_id, list):
             if not lora_id:
                 return None
+            # Handle nested [[id], ...] format
             if len(lora_id) == 1 and isinstance(lora_id[0], list):
                 inner = lora_id[0]
                 return inner[0] if inner else None
+            # Handle [id, id, ...] format - verify consistency across ranks
             first = lora_id[0]
             if all(x == first for x in lora_id):
                 return first
             raise RuntimeError(f"Inconsistent LoRA id across ranks for adapter {adapter_name!r}: {lora_id!r}")
         return lora_id
-
-    async def _wait_for_lora_visible(self, *, adapter: str, lora_int_id: int, where: str) -> list[int]:
-        last_loaded: list[int] = []
-        last_raw_type = "unknown"
-        last_error: str | None = None
-
-        for attempt in range(3):
-            try:
-                raw_loaded = await self.model.list_loras()
-                last_raw_type = type(raw_loaded).__name__
-                last_loaded = _normalize_lora_int_ids_loaded(raw_loaded)
-            except Exception as exc:
-                last_error = str(exc)
-                last_loaded = []
-            if lora_int_id in last_loaded:
-                return last_loaded
-            await asyncio.sleep(0.2 * (attempt + 1))
-
-        raise RuntimeError(
-            f"{where}: LoRA id not visible after retries: adapter={adapter!r} lora_int_id={lora_int_id} "
-            f"loaded_count={len(last_loaded)} raw_loaded_type={last_raw_type} last_error={last_error!r}"
-        )
 
     async def _collect_metrics_snapshot(self):
         """Collect metrics snapshots periodically in a background thread."""

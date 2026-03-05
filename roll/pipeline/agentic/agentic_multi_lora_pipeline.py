@@ -79,7 +79,8 @@ class AgenticMultiLoraPipeline(BasePipeline):
             if sleep_level != 1:
                 raise RuntimeError(
                     "AgenticMultiLoraPipeline requires vLLM sleep_level=1. "
-                    "In vLLM 0.8.4, sleep_level=2 discards weights (no CPU backup), so offload→load can restore garbage."
+                    "Level 1 offloads weights to CPU (restorable); Level 2 discards weights entirely. "
+                    "Multi-LoRA needs restorable offload for train/infer weight sync cycles."
                 )
 
         # For multi-LoRA training, reference is the same backbone with LoRA disabled.
@@ -227,41 +228,12 @@ class AgenticMultiLoraPipeline(BasePipeline):
                 lora_name=name,
             )
 
-    def _verify_lora_model_update(self, *, adapters: set[str] | None, where: str) -> None:
-        """Fail-fast verification that infer workers can see updated LoRA adapters."""
-        if not adapters:
-            return
-        if self.pipeline_config.actor_infer.model_args.adapters is None:
-            raise RuntimeError(
-                f"{where}: actor_infer.model_args.adapters is not configured; cannot verify LoRA model update."
-            )
-
-        timeout_s = float(os.environ.get("ROLL_VERIFY_LORA_TIMEOUT_S", "30"))
-        adapter_names = sorted(adapters)
-
-        ray.get(
-            [
-                w.wait_loras_ready.remote(adapter_names=adapter_names, timeout_s=timeout_s)
-                for w in self.actor_infer.workers
-            ]
-        )
-        for adapter_name in adapter_names:
-            lora_ids = ray.get([w.get_lora_id.remote(adapter_name) for w in self.actor_infer.workers])
-            if not lora_ids or lora_ids[0] is None:
-                raise RuntimeError(f"{where}: infer workers missing adapter id: adapter={adapter_name!r} ids={lora_ids!r}")
-            first = lora_ids[0]
-            if any(lora_id != first for lora_id in lora_ids):
-                raise RuntimeError(
-                    f"{where}: inconsistent adapter id across infer workers: adapter={adapter_name!r} ids={lora_ids!r}"
-                )
-
     def _initial_model_update(self) -> None:
         if self.pipeline_config.async_pipeline:
             self.actor_infer.offload_states(include=OffloadStateType.other_params)
         adapters = set(self.pipeline_config.actor_train.model_args.adapters.keys()) if self.pipeline_config.actor_train.model_args.adapters else None
         _ = self.model_update_lora_subset(global_step=0, adapters_to_update=adapters)
         self.actor_infer.load_states()
-        self._verify_lora_model_update(adapters=adapters, where="initial_model_update")
 
     def adjust_batch(self, data: DataProto, mode: str = "copy") -> DataProto:
         # Reuse AgenticPipeline.adjust_batch to keep behavior identical.
@@ -924,7 +896,6 @@ class AgenticMultiLoraPipeline(BasePipeline):
                             else:
                                 # Non-partial-GPU path: ensure inference weights are loaded before resuming rollouts.
                                 self.actor_infer.load_states()
-                            self._verify_lora_model_update(adapters=dirty_adapters, where=f"tick={global_tick}:model_update")
                             if os.environ.get("ROLL_LOG_PARTIAL_GPU_OPS", "0") == "1":
                                 logger.info("PartialGPU tick=%s model_update: resume all schedulers", global_tick)
                             # We explicitly resume schedulers after model_update as a safety/unblock point.

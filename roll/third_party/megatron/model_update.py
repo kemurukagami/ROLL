@@ -501,6 +501,7 @@ class MegatronWeightUpdater:
                     continue
                 self._process_colocated_weight_update(adapter_name)
                 if co_infer_rank == 0 and self._co_infer_worker is not None:
+                    # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
                     ray.get(
                         self._co_infer_worker.add_lora.remote(
                             adapter_name=adapter_name, peft_config=asdict(peft_config)
@@ -510,6 +511,7 @@ class MegatronWeightUpdater:
                 # They also need the adapter to be registered in their vLLM engines; otherwise routed
                 # requests can fail with "Missing LoRA adapter in vLLM engine".
                 if dist.get_rank() == 0 and self._broadcast_workers:
+                    # BLOCKING: same as above - adapters are fully loaded before ray.get() returns.
                     ray.get(
                         [
                             w.add_lora.remote(adapter_name=adapter_name, peft_config=asdict(peft_config))

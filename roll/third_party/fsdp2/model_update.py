@@ -318,6 +318,7 @@ class FSDP2WeightUpdater:
         if dist.get_rank() != 0 or not self.is_lora:
             return
         peft_config = self.model.peft_config.get("default", None)
+        # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
         ray.get(
             [worker.add_lora.remote(peft_config=asdict(peft_config)) for worker in self.model_update_infer_workers]
         )

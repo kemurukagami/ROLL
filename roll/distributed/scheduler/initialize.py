@@ -46,8 +46,10 @@ def start_ray_cluster():
     logger.info(f"Starting ray cluster: {cmd}")
     ret = subprocess.run(cmd, shell=True, capture_output=True)
     if ret.returncode != 0:
-        # In some Ray builds, CLI bootstrap crashes on a Click/Sentinel deepcopy bug.
-        # Fall back to python `ray.init()` startup path so single-node runs can proceed.
+        # Fallback for Ray CLI bug: some Ray builds crash with "is not a valid Sentinel" error
+        # in Click's deepcopy. When this occurs on rank 0 (head node), return False to signal
+        # the caller to use ray.init(address=None) for in-process local cluster startup instead.
+        # This only works for single-node runs; multi-node distributed runs will still fail.
         stderr_text = ret.stderr.decode("utf-8", errors="ignore")
         if rank == 0 and "is not a valid Sentinel" in stderr_text:
             logger.warning("Ray CLI failed with Sentinel bug; falling back to in-process ray.init startup")
@@ -61,6 +63,9 @@ def start_ray_cluster():
 
 def init():
     if DO_TIME_SHARING:
+        # Time-sharing mode: RLix scheduler manages the Ray cluster lifecycle. We only connect to
+        # the existing cluster via address="auto" and skip node startup, log monitoring, and
+        # atexit shutdown handlers. This allows multiple ROLL pipelines to share a single cluster.
         runtime_env = {
             "env_vars": current_platform.get_custom_env_vars(),
         }

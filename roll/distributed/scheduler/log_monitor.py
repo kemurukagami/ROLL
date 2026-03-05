@@ -26,7 +26,7 @@ from ray._private.log_monitor import (
 from ray._private.worker import print_to_stdstream, logger as monitor_logger, print_worker_logs
 
 from roll.distributed.scheduler.driver_utils import get_driver_rank, wait_for_nodes, get_driver_world_size
-from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE, rlix_env_vars
+from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE
 from roll.utils.logging import get_logger
 
 logger = get_logger()
@@ -219,6 +219,10 @@ class LogMonitorListener:
 
     def stop(self):
         if DO_TIME_SHARING:
+            # Time-sharing mode: cluster is shared across multiple pipelines managed by RLix scheduler.
+            # Only clean up local resources (file handles, thread) - skip cluster teardown to avoid
+            # disrupting other co-tenant pipelines.
+            logger.info("LogMonitorListener.stop: time-sharing mode - cleaning up local resources only")
             StdPublisher.close_file_handlers()
             time.sleep(0.2)
             try:
@@ -244,25 +248,23 @@ class LogMonitorListener:
 
     def start(self):
         if DO_TIME_SHARING:
+            # Time-sharing mode: skip log monitoring setup since the Ray cluster is shared and
+            # managed by RLix scheduler. ExceptionMonitor actors would collide across pipelines,
+            # and atexit shutdown handlers would incorrectly tear down the shared cluster.
+            logger.info("LogMonitorListener.start: time-sharing mode - skipping log monitoring setup")
             return
         atexit.register(self.stop)
 
         if self.rank == 0:
             self.exception_monitor = ExceptionMonitor.options(
-                name=EXCEPTION_MONITOR_ACTOR_NAME,
-                get_if_exists=True,
-                namespace=RAY_NAMESPACE,
-                runtime_env={"env_vars": rlix_env_vars()},
+                name=EXCEPTION_MONITOR_ACTOR_NAME, get_if_exists=True, namespace=RAY_NAMESPACE
             ).remote()
         else:
             while True:
                 if self.exception_monitor is None:
                     try:
                         self.exception_monitor = ExceptionMonitor.options(
-                            name=EXCEPTION_MONITOR_ACTOR_NAME,
-                            get_if_exists=True,
-                            namespace=RAY_NAMESPACE,
-                            runtime_env={"env_vars": rlix_env_vars()},
+                            name=EXCEPTION_MONITOR_ACTOR_NAME, get_if_exists=True, namespace=RAY_NAMESPACE
                         ).remote()
                     except Exception as e:
                         self.exception_monitor = None

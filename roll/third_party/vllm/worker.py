@@ -29,6 +29,11 @@ class TensorLoraManager:
         # Return None when adapter has not been registered on this worker yet.
         return self._lora_names.get(adapter_name, None)
 
+    def register(self, adapter_name: str, lora_int_id: int) -> None:
+        # Called only after vLLM confirms the adapter is loaded successfully.
+        # Invariant: entry in _lora_names ↔ adapter successfully registered in vLLM.
+        self._lora_names[adapter_name] = lora_int_id
+
     def add_weight(self, name: str, weight: torch.Tensor):
         self.lora_params[name] = weight
 
@@ -45,7 +50,8 @@ class TensorLoraManager:
         hash_obj = hashlib.sha256(peft_config_str.encode("utf-8"))
         hex_dig = hash_obj.hexdigest()
         lora_int_id = int(hex_dig, 16) % 0x7FFFFFFF
-        self._lora_names[adapter_name] = lora_int_id
+        # Do NOT set _lora_names here — registration is recorded by register() only after
+        # vLLM confirms the adapter loaded successfully in custom_add_lora.
 
         lora_request = TensorLoRARequest(
             lora_name=adapter_name,
@@ -73,9 +79,9 @@ class WorkerBase:
         lora_request = self.tensor_lora_manager.build_request(adapter_name, peft_config)
         lora_int_id = lora_request.lora_int_id
         staged_count = len(lora_request.lora_tensors) if lora_request.lora_tensors else 0
-        # Diagnostic: check if adapter is still in vLLM's Python registry. After offload_states(level=2),
-        # the registry is cleared, so in_vllm_cache=True here means the adapter was registered without
-        # an intervening sleep (e.g. back-to-back add_lora calls). The cached GPU tensors are valid here.
+        # Diagnostic: check if adapter is still in vLLM's Python registry. After offload_states() at
+        # either sleep level, the registry is cleared, so in_vllm_cache=True here means the adapter was
+        # registered without an intervening sleep (e.g. back-to-back add_lora calls). GPU tensors are valid here.
         lora_manager = getattr(getattr(self, "model_runner", None), "lora_manager", None)
         in_vllm_cache = (
             lora_int_id in lora_manager.list_adapters()
@@ -90,6 +96,8 @@ class WorkerBase:
         # LoRA tensors are outside the cumem pool; calling reload_model() only here
         # leaves KV cache un-initialized, causing OOM when load_states_partial later
         # calls wake_up(["kv_cache"]) on a nearly-full GPU.
+        # load_states() is idempotent: the first add_lora call wakes up weights + KV cache;
+        # subsequent calls (e.g. registering a second adapter) skip wake_up via flag guards.
         self.load_states()
         add_lora = getattr(getattr(self, "model_runner", None), "add_lora", None)
         if not callable(add_lora):
@@ -100,21 +108,20 @@ class WorkerBase:
         try:
             ok = add_lora(lora_request)
         except Exception as exc:
-            # Roll back local mapping so we do not keep a phantom adapter id.
-            self.tensor_lora_manager._lora_names.pop(adapter_name, None)
             logger.error(
                 "[vllm][add_lora] FAILED adapter=%s int_id=%s in_vllm_cache=%s exc=%s",
                 adapter_name, lora_int_id, in_vllm_cache, exc,
             )
             raise
         if ok is False:
-            # Roll back local mapping so verification sees only successfully-added adapters.
-            self.tensor_lora_manager._lora_names.pop(adapter_name, None)
             logger.error(
                 "[vllm][add_lora] returned_False adapter=%s int_id=%s in_vllm_cache=%s",
                 adapter_name, lora_int_id, in_vllm_cache,
             )
             raise RuntimeError(f"vLLM add_lora returned False for adapter={adapter_name!r}")
+        # vLLM confirmed success — record the registration now so _lora_names only ever
+        # contains adapters that are actually loaded in vLLM.
+        self.tensor_lora_manager.register(adapter_name, lora_request.lora_int_id)
         logger.info(
             "[vllm][add_lora] ok adapter=%s int_id=%s in_vllm_cache=%s",
             adapter_name, lora_int_id, in_vllm_cache,
@@ -250,7 +257,8 @@ class WorkerBase:
                 self.tensor_lora_manager.lora_params = OrderedDict()
                 logger.info("[vllm][offload] cleared staged LoRA tensors while already-offloaded: count=%s", staged_count)
             return
-        _desc = "destroy weights+KV" if level == 2 else "swap weights to CPU, discard KV"
+        # LoRA tensors use the default CuMem tag, not the "weights" tag, so sleep(level=1) discards them too.
+        _desc = "destroy weights+KV+LoRA" if level == 2 else "swap weights to CPU, discard KV+LoRA"
         logger.info("[vllm][offload] sleep(level=%s) start: %s", level, _desc)
         if vllm.__version__ < "0.8.5" and level == 2:
             # https://github.com/vllm-project/vllm/issues/16564
@@ -262,20 +270,19 @@ class WorkerBase:
         if hasattr(self, "recv_manager"):
             self.recv_manager.clear()
         # Drop staged LoRA tensors so repeated selective-sync cycles do not accumulate GPU buffers.
-        # Adapter registration ids stay in tensor_lora_manager._lora_names for routing.
         if getattr(self, "tensor_lora_manager", None) is not None and self.tensor_lora_manager.lora_params:
             staged_count = len(self.tensor_lora_manager.lora_params)
             self.tensor_lora_manager.lora_params = OrderedDict()
             logger.info("[vllm][offload] cleared staged LoRA tensors: count=%s", staged_count)
-        # sleep(level=2) frees ALL GPU memory including LoRA tensors, but vLLM's Python-side LoRA cache
-        # (LRUCacheWorkerLoRAManager) still holds the adapter entries pointing at the now-freed GPU memory.
-        # On the next add_lora call, vLLM would take the else-branch (adapter "in cache") and skip
-        # reloading LoRA tensors to GPU → using freed memory during generate → CUDA error / process crash.
-        # Fix: evict all registered adapters from vLLM's Python cache here, so the next add_lora always
-        # takes the fresh-load path. This also ensures newly trained LoRA weights are always applied.
+        # LoRA tensors use the default CuMem tag, not the "weights" tag.
+        # sleep(level=1) therefore discards LoRA GPU memory just like level=2 does.
+        # vLLM's Python-side LoRA cache (LRUCacheWorkerLoRAManager) still holds entries pointing at
+        # now-freed GPU memory after either sleep level. On the next add_lora call, vLLM would take the
+        # else-branch (adapter "in cache") and skip reloading → using freed memory → CUDA error / crash.
+        # Fix: always evict stale vLLM adapter registrations after any sleep level, so the next add_lora
+        # always takes the fresh-load path and newly trained LoRA weights are applied every cycle.
         if (
-            level == 2
-            and getattr(self, "tensor_lora_manager", None) is not None
+            getattr(self, "tensor_lora_manager", None) is not None
             and self.tensor_lora_manager._lora_names
         ):
             lora_manager = getattr(getattr(self, "model_runner", None), "lora_manager", None)
@@ -289,7 +296,7 @@ class WorkerBase:
             logger.info("[vllm][offload] cleared adapter id map and evicted vllm cache: count=%s", evicted)
         gc.collect()
         current_platform.empty_cache()
-        logger.info("[vllm][offload] sleep(level=%s) done: GPU memory %s", level, "fully freed" if level == 2 else "weights on CPU, KV discarded")
+        logger.info("[vllm][offload] sleep(level=%s) done: GPU memory %s", level, "fully freed" if level == 2 else "weights on CPU, KV+LoRA discarded")
 
     def setup_collective_group(self, *args, **kwargs):
         # Dynamic comm_plan based group setup (selective model-update style).

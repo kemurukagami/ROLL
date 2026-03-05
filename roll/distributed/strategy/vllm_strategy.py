@@ -19,6 +19,7 @@ from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.protocol import DataProto, list_of_dict_to_dict_of_list
 from roll.distributed.strategy.strategy import InferenceStrategy
 from roll.third_party.vllm import create_async_llm
+from roll.utils.constants import DO_TIME_SHARING
 from roll.utils.functionals import concatenate_input_and_output, reduce_metrics
 from roll.utils.logging import get_logger
 from roll.utils.lora_routing import ensure_lora_name_in_batch, get_lora_name_array, resolve_microbatch_lora_name
@@ -574,7 +575,7 @@ class VllmStrategy(InferenceStrategy):
     async def offload_states(self, include=None, non_blocking=False):
         await self.model.reset_prefix_cache()
         if include is None or OffloadStateType.model_params in include:
-            if self.is_model_in_gpu:
+            if self.is_model_in_gpu and (self.worker.pipeline_config.is_actor_infer_colocated or DO_TIME_SHARING):
                 await self.model.offload_states(self.sleep_level)
                 self.is_model_in_gpu = False
         gc.collect()
@@ -702,8 +703,9 @@ class VllmStrategy(InferenceStrategy):
         before it can be used in inference via LoRARequest routing.
 
         This method always re-registers the adapter to ensure updated LoRA weights
-        from the latest training step are applied. The caller (offload_states) is
-        responsible for evicting stale registrations before the next model_update.
+        from the latest training step are applied. The caller must evict stale
+        registrations via offload_states() before the next model_update, because
+        LoRA GPU tensors are discarded for both sleep_level=1 and sleep_level=2.
 
         Args:
             adapter_name: Name of the adapter to register. Must match a key in
@@ -746,15 +748,19 @@ class VllmStrategy(InferenceStrategy):
             )
         # Keep target_modules JSON-serializable and deterministic for worker-side hashing.
         peft_config["target_modules"] = sorted(adapters[adapter_name].lora_target)
+        # Blocking RPC: does not return until custom_add_lora on the worker completes.
+        # Inside custom_add_lora the sequence is:
+        #   1. load_states()          → reload_model() + wake_up(kv_cache): GPU fully initialized
+        #   2. vLLM.add_lora()        → LoRA tensors loaded to GPU, adapter registered in vLLM Python cache
+        #   3. register(name, id)     → _lora_names updated only after vLLM confirms success
         await self.model.add_lora(adapter_name, peft_config)
-        # custom_add_lora calls self.load_states() on the worker before registering the LoRA,
-        # so weights + KV cache are fully resident after this RPC returns.
+        # Weights + KV cache + LoRA are all GPU-resident; _lora_names is up to date.
         # Advance the strategy-level flag now so load_states_partial() can skip its no-op RPC.
         self.is_model_in_gpu = True
         lora_int_id = await self.get_lora_id(adapter_name)
         logger.info(
-            "[vllm_strategy][add_lora] post_add adapter=%s lora_int_id=%s",
-            adapter_name, lora_int_id,
+            "[vllm_strategy][add_lora] registered adapter=%s lora_int_id=%s is_model_in_gpu=%s",
+            adapter_name, lora_int_id, self.is_model_in_gpu,
         )
         if lora_int_id is None:
             raise RuntimeError(f"LoRA adapter registration did not produce an id: adapter={adapter_name!r}")

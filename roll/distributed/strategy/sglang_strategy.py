@@ -23,6 +23,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsUpdateGroupReqInput,
     UpdateWeightsFromTensorReqInput,
 )
+
+from roll.utils.constants import DO_TIME_SHARING
 from roll.utils.functionals import concatenate_input_and_output
 from roll.utils.logging import get_logger
 from roll.utils.network_utils import collect_free_port
@@ -378,7 +380,7 @@ class SgLangStrategy(InferenceStrategy):
 
     async def offload_states(self, include=None, non_blocking=False):
         if include is None or OffloadStateType.model_params in include:
-            if self.is_model_in_gpu:
+            if (self.worker.pipeline_config.is_actor_infer_colocated or DO_TIME_SHARING) and self.is_model_in_gpu:
                 await self.model.tokenizer_manager.release_memory_occupation(ReleaseMemoryOccupationReqInput(), None)
                 logger.info("self.model.release_memory_occupation exec ....")
                 # always release all

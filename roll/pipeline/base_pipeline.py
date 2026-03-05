@@ -32,14 +32,10 @@ class BasePipeline:
         set_seed(seed=pipeline_config.seed)
         self.pipeline_config = pipeline_config
         if DO_TIME_SHARING:
-            from roll.distributed.scheduler.resource_manager import (
-                get_or_create_roll_resource_manager_actor,
-                RollResourceManagerProxy,
-            )
-            _rm_actor = get_or_create_roll_resource_manager_actor(
+            from roll.distributed.scheduler.resource_manager import RollResourceManagerProxy
+            self.resource_manager = RollResourceManagerProxy(
                 num_gpus_per_node=self.pipeline_config.num_gpus_per_node
             )
-            self.resource_manager = RollResourceManagerProxy(_rm_actor)
         else:
             self.resource_manager = ResourceManager(
                 num_nodes=self.pipeline_config.num_nodes, num_gpus_per_node=self.pipeline_config.num_gpus_per_node

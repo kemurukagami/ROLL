@@ -188,51 +188,47 @@ _ROLL_RM_ACTOR_NAME = ROLL_RESOURCE_MANAGER_ACTOR_NAME
 _ROLL_RM_NAMESPACE = RLIX_NAMESPACE
 
 
-def get_or_create_roll_resource_manager_actor(num_gpus_per_node):
-    """Return (or lazily create) the cluster-wide singleton ResourceManager Ray actor.
-
-    In RLix mode all concurrent pipelines share ONE ResourceManager actor so
-    that GPU placement groups are allocated only once for the whole cluster.
-    ``num_gpus_per_node`` must be consistent across pipelines (homogeneous cluster).
-    ``num_nodes=None`` means auto-discover all eligible GPU nodes.
-    """
-    try:
-        return ray.get_actor(_ROLL_RM_ACTOR_NAME, namespace=_ROLL_RM_NAMESPACE)
-    except ValueError:
-        pass
-
-    @ray.remote(num_cpus=0, max_restarts=0, max_task_retries=0)
-    class _RollResourceManagerActor(ResourceManager):
-        pass
-
-    try:
-        return (
-            _RollResourceManagerActor.options(
-                name=_ROLL_RM_ACTOR_NAME,
-                namespace=_ROLL_RM_NAMESPACE,
-                get_if_exists=True,
-                max_restarts=0,
-                max_task_retries=0,
-            )
-            .remote(num_gpus_per_node=num_gpus_per_node, num_nodes=None)
-        )
-    except Exception:
-        return ray.get_actor(_ROLL_RM_ACTOR_NAME, namespace=_ROLL_RM_NAMESPACE)
+@ray.remote(num_cpus=0, max_restarts=0, max_task_retries=0)
+class _RollResourceManagerActor(ResourceManager):
+    """Cluster-wide singleton Ray actor wrapping ResourceManager for RLix control-plane mode."""
+    pass
 
 
-class RollResourceManagerProxy:
-    """Synchronous drop-in replacement for ResourceManager backed by a shared Ray actor.
+class RollResourceManagerProxy(ResourceManager):
+    """Synchronous drop-in for ResourceManager backed by a shared Ray actor.
 
-    Used in RLix control-plane mode so that all concurrent pipelines share a
-    single ResourceManager actor (and its placement groups) rather than each
-    pipeline creating its own, which would exhaust cluster GPU resources.
+    Used in RLix control-plane mode so all concurrent pipelines share a single
+    ResourceManager actor (and its placement groups) rather than each pipeline
+    creating its own, which would exhaust cluster GPU resources.
 
-    ``destroy_placement_group()`` is a no-op: the singleton actor owns the PGs
-    and they are cleaned up when the orchestrator tears down the actor.
+    State (placement groups, node/gpu topology) is fetched from the actor once
+    in __init__ and cached locally. This makes allocate_placement_group() safe
+    to call from within async Ray actors — no blocking ray.get() RPCs at call time.
+
+    destroy_placement_group() is a no-op: the singleton actor owns the PGs and
+    they are cleaned up when the orchestrator tears down the actor.
     """
 
-    def __init__(self, actor_handle):
-        self._actor = actor_handle
+    def __init__(self, num_gpus_per_node: int) -> None:
+        # Get or lazily create the cluster-wide singleton ResourceManager actor.
+        # All concurrent pipelines share one actor so placement groups are allocated once.
+        try:
+            actor = ray.get_actor(_ROLL_RM_ACTOR_NAME, namespace=_ROLL_RM_NAMESPACE)
+        except ValueError:
+            try:
+                actor = (
+                    _RollResourceManagerActor.options(
+                        name=_ROLL_RM_ACTOR_NAME,
+                        namespace=_ROLL_RM_NAMESPACE,
+                        get_if_exists=True,
+                        max_restarts=0,
+                        max_task_retries=0,
+                    ).remote(num_gpus_per_node=num_gpus_per_node, num_nodes=None)
+                )
+            except Exception:
+                actor = ray.get_actor(_ROLL_RM_ACTOR_NAME, namespace=_ROLL_RM_NAMESPACE)
+
+        self._actor = actor
         state = ray.get(self._actor.get_state.remote())
         self.num_nodes = state["num_nodes"]
         self.gpu_per_node = state["gpu_per_node"]
@@ -242,58 +238,15 @@ class RollResourceManagerProxy:
         self.node2pg = state["node2pg"]
         self.placement_groups = state["placement_groups"]
 
-    def nodes_placement_group(self, node_rank) -> PlacementGroup:
-        return self.node2pg[node_rank]
+        # Fail fast if this pipeline was configured with a different num_gpus_per_node
+        # than the singleton was created with. Silent mismatch causes wrong placement sizing.
+        assert self.gpu_per_node == num_gpus_per_node, (
+            f"num_gpus_per_node mismatch: singleton actor has {self.gpu_per_node}, "
+            f"caller expected {num_gpus_per_node}. All pipelines must use the same value."
+        )
 
-    def allocate_placement_group(self, world_size, device_mapping=None) -> List[List[Dict]]:
-        # IMPORTANT: This proxy must be safe to call from within async Ray actors.
-        #
-        # The previous implementation used a remote call + ray.get(), which triggers Ray's
-        # "Using blocking ray.get inside async actor" warning and can stall an async actor's
-        # event loop during actor construction (e.g., RolloutScheduler creating env clusters).
-        #
-        # We already fetched the singleton actor's placement group state in __init__(), so we
-        # can allocate from that state locally without any Ray RPCs.
-        allocated_pg = []
-        ray_address = f"{ray.get_runtime_context().gcs_address}"
-        if device_mapping:
-            num_gpus_per_worker = len(device_mapping) // world_size
-            grouped_ranks = [
-                list(device_mapping[i : i + num_gpus_per_worker])
-                for i in range(0, len(device_mapping), num_gpus_per_worker)
-            ]
-            for group in grouped_ranks:
-                pg_list = []
-                for rank in group:
-                    node_rank = rank // self.gpu_per_node
-                    gpu_rank = rank % self.gpu_per_node
-
-                    assert node_rank < self.num_nodes, (
-                        f"device_mapping used gpus are more than "
-                        f"num_nodes×num_gpus_per_node={self.num_nodes}×{self.gpu_per_node}"
-                    )
-
-                    pg = self.nodes_placement_group(node_rank)
-                    pg_list.append(
-                        dict(node_rank=node_rank, gpu_rank=gpu_rank, placement_group=pg, ray_address=ray_address)
-                    )
-                allocated_pg.append(pg_list)
-        else:
-            for rank in range(world_size):
-                node_rank = rank % self.num_nodes
-                allocated_pg.append(
-                    [
-                        dict(
-                            node_rank=node_rank,
-                            gpu_rank=None,
-                            placement_group=self.nodes_placement_group(node_rank),
-                            ray_address=ray_address,
-                        )
-                    ]
-                )
-
-        assert len(allocated_pg) == world_size
-        return allocated_pg
+    # nodes_placement_group and allocate_placement_group are inherited from ResourceManager.
+    # State is cached locally in __init__, so these methods work without blocking RPCs.
 
     def destroy_placement_group(self):
         raise NotImplementedError(

@@ -3,7 +3,7 @@ import hashlib
 import json
 import time
 from collections import OrderedDict
-from typing import Iterable, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import vllm
@@ -21,15 +21,38 @@ logger = get_logger()
 
 
 class TensorLoraManager:
+    """Manages LoRA adapter staging and confirmed registration for vLLM workers.
+
+    Two concerns:
+    (a) Staging: collects incoming tensor weights (add_weight) before they are passed
+        to vLLM for ingestion via build_request.
+    (b) Tracking: maintains a confirmed adapter_name -> lora_int_id map (_lora_names)
+        so routing and readiness checks can look up integer adapter ids by name.
+        An entry in _lora_names means vLLM has confirmed the adapter is loaded on GPU;
+        it is never set speculatively.
+    """
+
     def __init__(self):
         self.lora_params = OrderedDict()
+        self.add_lora_count = 0
         self._lora_names: dict[str, int] = {}  # Track adapter_name -> lora_int_id for routing lookups.
 
     def get_lora_id(self, adapter_name: str) -> int | None:
+        """Return the vLLM integer adapter id for adapter_name, or None if not yet registered.
+
+        Returns None when the adapter has not been confirmed as loaded by vLLM on this worker.
+        Callers should treat None as "not ready" and retry or skip the operation.
+        """
         # Return None when adapter has not been registered on this worker yet.
         return self._lora_names.get(adapter_name, None)
 
     def register(self, adapter_name: str, lora_int_id: int) -> None:
+        """Record a confirmed adapter registration.
+
+        Must be called only after vLLM's add_lora succeeds.
+        Invariant: an entry in _lora_names means the adapter is actually loaded in vLLM on GPU.
+        Violation (calling before vLLM confirms) would cause routing to route to an unloaded adapter.
+        """
         # Called only after vLLM confirms the adapter is loaded successfully.
         # Invariant: entry in _lora_names ↔ adapter successfully registered in vLLM.
         self._lora_names[adapter_name] = lora_int_id
@@ -38,10 +61,22 @@ class TensorLoraManager:
         self.lora_params[name] = weight
 
     def build_request(self, adapter_name: str, peft_config: dict) -> TensorLoRARequest:
+        """Build a TensorLoRARequest from staged weights and return it.
+
+        Computes a stable lora_int_id from the adapter name + PEFT config so every
+        TP-rank worker produces the same integer id for the same adapter, regardless
+        of registration order.  The old design used a call-order counter, which caused
+        different TP ranks to compute different ids when adapters were registered in
+        different orders — leading to NCCL group membership mismatches.
+
+        Does NOT update _lora_names.  Registration is intentionally deferred to
+        register(), which is called by custom_add_lora only after vLLM confirms success.
+        This keeps _lora_names as a strictly confirmed-state map.
+
+        Consumes and resets self.lora_params after building the request.
         """
-        Generate a unique LoRA ID based on adapter name + PEFT config so every
-        rank computes the same id for the same adapter registration.
-        """
+        self.add_lora_count += 1
+        peft_config["add_lora_count"] = self.add_lora_count
         # Use a stable hash key (adapter + config only). Do NOT include call-order counters,
         # otherwise different registration order across workers yields inconsistent adapter ids.
         peft_config_for_hash = dict(peft_config)
@@ -60,12 +95,31 @@ class TensorLoraManager:
             peft_config=peft_config_for_hash,
             lora_tensors=self.lora_params,
         )
+        # Normal-path cleanup: transfer ownership of staged tensors to lora_request, then
+        # reset lora_params immediately.  lora_request is a local in custom_add_lora; once
+        # vLLM's add_lora() copies the tensors into GPU memory and the function returns,
+        # lora_request goes out of scope and Python GC frees the staging buffers.
+        # No separate cleanup step is needed on the happy path.
         del self.lora_params
         self.lora_params = OrderedDict()
         return lora_request
 
 
 class WorkerBase:
+    """Mixin that extends vLLM's WorkerExtensionCls with RLix-specific lifecycle methods.
+
+    All methods use the "custom_" prefix to avoid name conflicts with vLLM's own worker
+    methods.  WorkerV1 (and future V2) subclass this to inherit the full implementation;
+    they only override what differs between engine versions.
+
+    Key responsibilities:
+    - LoRA adapter registration and lifecycle (custom_add_lora, custom_list_loras,
+      custom_get_lora_id).
+    - GPU memory lifecycle: reload_model, load_states, offload_states.
+    - Parameter broadcast and bucket update for model-weight synchronisation.
+    - NCCL collective group management for model updates.
+    """
+
     def custom_init_worker(self, *args, **kwargs):
         self.weight_loaded: bool = True
         self.kv_cache_loaded: bool = True
@@ -74,7 +128,28 @@ class WorkerBase:
         self.tensor_lora_manager = TensorLoraManager()
 
     # Use custom prefix because worker_extension_cls can not have conflicting method names with vllm worker.
-    def custom_add_lora(self, adapter_name: str, peft_config: dict) -> bool:
+    def custom_add_lora(self, adapter_name: str, peft_config: dict, *, lora_local_ranks: Optional[List[int]] = None) -> bool:
+        """Register a LoRA adapter with vLLM on this worker.
+
+        Pre-condition: staged LoRA tensors have already been delivered via add_weight calls.
+        Post-condition: the model is fully awake (weights + KV cache) and the adapter is
+        loaded in vLLM.  tensor_lora_manager._lora_names[adapter_name] is set only on success.
+
+        Why load_states() instead of reload_model():
+        LoRA tensors are allocated outside the cumem "weights" pool.  If we only called
+        reload_model() (which wakes weights only), the KV cache would remain uninitialised.
+        A subsequent load_states_partial call that tries wake_up(["kv_cache"]) on a GPU
+        that is already near-full with model weights + LoRA tensors would OOM.
+        load_states() is idempotent: after the first call both weight_loaded and
+        kv_cache_loaded are True, so additional calls are no-ops.
+
+        Registration is deferred to after vLLM confirms success so _lora_names only ever
+        holds adapters that are actually resident on GPU.
+        """
+        # Partial-overlap support: skip registration on ranks not in the mask.
+        if lora_local_ranks is not None and self.rank not in lora_local_ranks:
+            return True  # match existing True return convention for non-participating ranks
+
         # Build request with adapter name so routing can map name -> id consistently.
         lora_request = self.tensor_lora_manager.build_request(adapter_name, peft_config)
         lora_int_id = lora_request.lora_int_id
@@ -129,6 +204,20 @@ class WorkerBase:
         return True
 
     def custom_list_loras(self) -> list[int]:
+        """Return the sorted list of vLLM integer adapter ids currently loaded on this worker.
+
+        Queries the live vLLM LoRA manager directly rather than tensor_lora_manager._lora_names,
+        because _lora_names is a local Python map that is cleared on sleep().  Querying vLLM at
+        runtime detects evicted slots that the Python map might still show after partial failures.
+
+        Normalises heterogeneous return types across vLLM versions:
+        - dict  → keys are adapter ids
+        - list[int]  → used directly
+        - list[str]  → numeric strings cast to int; name strings resolved via _lora_names
+        - list[object with lora_int_id attr]  → attribute extracted
+
+        Returns an empty list when no LoRA manager is present (LoRA not enabled).
+        """
         # Query runtime vLLM LoRA state instead of tensor_lora_manager._lora_names.
         # This allows strategy-side visibility checks to detect slots that were evicted from GPU state.
         lora_manager = getattr(getattr(self, "model_runner", None), "lora_manager", None)
@@ -161,10 +250,31 @@ class WorkerBase:
         return sorted(set(lora_ids))
 
     def custom_get_lora_id(self, adapter_name: str) -> int | None:
+        """Return the vLLM integer adapter id for adapter_name, or None if not yet registered.
+
+        Provides a stable public API on the worker so strategy code does not need to reach into
+        tensor_lora_manager directly.  Returns None when the adapter has not been confirmed loaded.
+        """
         # Strategy uses this to resolve adapter name into vLLM integer adapter id.
         return self.tensor_lora_manager.get_lora_id(adapter_name)
 
     def reload_model(self):
+        """Allocate the GPU weight memory pool — does NOT update parameter values.
+
+        Calls wake_up(["weights"]) to restore the CuMem "weights" pool back to GPU.
+        After this returns, weight tensors are addressable on GPU but their values are
+        whatever was there before sleep (restored from CPU at level=1, or re-initialized
+        at level=2). No new parameter values are written here.
+
+        To write new trainer weights into the restored pool, call load_weights() next.
+        For a full wake-up (weights + KV cache), use load_states() instead.
+
+        Idempotent: guarded by weight_loaded flag, so repeated calls are no-ops.
+
+        The [debug][wake_up_done] log is a Stage 3 breadcrumb for memory profiling:
+        at this point no receive buffers exist yet (streaming approach), so
+        device_used = baseline + model_weights only.
+        """
         if not self.weight_loaded:
             self.wake_up(["weights"])
             self.weight_loaded = True
@@ -179,6 +289,22 @@ class WorkerBase:
             )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        """Overwrite in-GPU parameter values with the trainer's latest weights.
+
+        This is the second step of model update, after reload_model() allocates the
+        weight memory pool. reload_model() makes weight tensors addressable on GPU;
+        load_weights() makes them correct by copying the trainer's new values in.
+
+        Accepts a generator of (param_name, tensor) pairs so tensors arrive one at a
+        time (streaming), keeping peak GPU memory low during broadcast.
+
+        LoRA alias patch:
+        When LoRA is active, vLLM wraps every target module at init time
+        (e.g. gate_up_proj → gate_up_proj.base_layer). AutoWeightsLoader then looks
+        for the original fused key (gate_up_proj) which no longer exists → KeyError.
+        Fix: temporarily monkey-patch named_parameters() on affected submodules to
+        also yield the unwrapped alias, then restore the original after load_weights.
+        """
         # Before updating parameters, reinitialize the previously released model.
         self.reload_model()
         if vllm.__version__ < "0.8.5":
@@ -218,7 +344,9 @@ class WorkerBase:
             }
             orig = submod.named_parameters
 
-            # Closure captures the correct orig and sub_aliases for each submodule.
+            # _make_aliased is a factory to avoid the classic Python late-binding closure bug.
+            # Without it, a plain lambda/def inside the loop would capture `orig` and `sub_aliases`
+            # by reference, so all patches would use the values from the last loop iteration.
             def _make_aliased(orig_fn, aliased_dict):
                 def _aliased(*args, **kwargs):
                     yield from orig_fn(*args, **kwargs)
@@ -234,6 +362,12 @@ class WorkerBase:
                 submod.named_parameters = orig
 
     def load_states(self):
+        """Fully wake up this worker: model weights + KV cache.
+
+        Idempotent: each sub-step is guarded by its own flag (weight_loaded, kv_cache_loaded).
+        Use this instead of reload_model() when LoRA adapters will be registered immediately
+        after, to avoid a later wake_up(["kv_cache"]) on a near-full GPU (OOM risk).
+        """
         self.reload_model()
         if not self.kv_cache_loaded:
             self.wake_up(["kv_cache"])
@@ -246,12 +380,32 @@ class WorkerBase:
                     buffer.data.copy_(self.buffers[name].data)
             self.buffers = None
 
-    def offload_states(self, level):
+    def offload_states(self, level: int):
+        """Sleep this worker to free GPU memory, evicting LoRA state as part of the teardown.
+
+        level=1: swap model weights to CPU, discard KV cache and LoRA tensors.
+        level=2: destroy everything (weights, KV cache, LoRA tensors).
+
+        LoRA eviction rationale:
+        LoRA tensors use the default CuMem tag (not the "weights" tag), so sleep() at either
+        level discards their GPU memory.  However, vLLM's Python-side LRUCacheWorkerLoRAManager
+        still holds entries pointing at the now-freed GPU memory.  On the next add_lora call,
+        vLLM finds the adapter "in cache" and skips reloading, then accesses the freed memory →
+        CUDA error or silent corruption.
+        Fix: always evict stale vLLM adapter registrations here so the next add_lora always
+        takes the fresh-load path and applies the latest trained LoRA weights.
+
+        Assert invariant: weight_loaded and kv_cache_loaded must be in sync — either both
+        True (fully awake) or both False (already offloaded).  A mixed state indicates a bug.
+        """
         assert (self.weight_loaded and self.kv_cache_loaded) or (not self.weight_loaded and not self.kv_cache_loaded)
         if not self.weight_loaded:
             logger.info("[vllm][offload] already offloaded, skip (level=%s)", level)
-            # Clear staged LoRA tensors even when model weights are already offloaded.
-            # These tensors are sync staging buffers, not persistent model state.
+            # Safety-net cleanup: staged tensors survive only if staging happened but
+            # custom_add_lora was never called (e.g. error mid-cycle, aborted training step).
+            # On the normal path, build_request() already transferred ownership to a local
+            # lora_request that goes out of scope after add_lora() returns, freeing the
+            # tensors then.  This block handles the abnormal path to prevent GPU leaks.
             if getattr(self, "tensor_lora_manager", None) is not None and self.tensor_lora_manager.lora_params:
                 staged_count = len(self.tensor_lora_manager.lora_params)
                 self.tensor_lora_manager.lora_params = OrderedDict()
@@ -299,6 +453,25 @@ class WorkerBase:
         logger.info("[vllm][offload] sleep(level=%s) done: GPU memory %s", level, "fully freed" if level == 2 else "weights on CPU, KV+LoRA discarded")
 
     def setup_collective_group(self, *args, **kwargs):
+        """Initialise an NCCL collective group for model-weight broadcasting.
+
+        Supports two call styles:
+
+        1. comm_plan style (RLix selective model-update):
+           Keyword args: comm_plan, backend, rank_in_cluster, timeout_s (optional).
+           Calls get_dist_info_from_comm_plan to resolve which NCCL group this worker
+           belongs to.  If group_rank is None, this worker is not part of the update
+           group and the call returns immediately (skip — not an error).
+           Ends with a dummy allreduce barrier to verify NCCL connectivity before any
+           broadcast, catching misconfigured groups early.
+
+        2. Legacy positional style (persistent broadcast group):
+           Positional args: master_address, master_port, rank_offset, world_size,
+           group_name, backend.  Optional kwarg: timeout_s.
+           All workers are expected to participate.
+
+        master_port is always cast to int to prevent type mismatch errors in collective init.
+        """
         # Dynamic comm_plan based group setup (selective model-update style).
         if "comm_plan" in kwargs:
             comm_plan = kwargs["comm_plan"]
@@ -334,6 +507,8 @@ class WorkerBase:
                 master_port=master_port,
                 timeout_s=timeout_s,
             )
+            # Dummy allreduce barrier: verifies NCCL connectivity immediately after init.
+            # Detects misconfigured groups (wrong world_size, wrong ranks) before any real broadcast.
             collective.allreduce(torch.zeros(1, device=current_platform.device_type), group_name=group_name)
             logger.info(
                 f"[rlix][vllm][collective] setup_exit group_name={group_name} "
@@ -370,11 +545,40 @@ class WorkerBase:
         )
 
     def destroy_collective_group(self, group_name: str):
+        """Tear down an NCCL collective group and release its resources.
+
+        Call after each model-update cycle completes to free NCCL communicator handles.
+        A new group will be created on the next setup_collective_group call.
+
+        Guard: partial-overlap IPC local ranks never called setup_collective_group, so
+        collective.is_group_exist() returns False for them — skip destroy silently to
+        avoid a KeyError in collective.destroy_collective_group (collective.py:65).
+        """
+        if not collective.is_group_exist(group_name):
+            logger.info(
+                f"[rlix][vllm][collective] destroy_skip_not_joined group_name={group_name} rank={self.rank}"
+            )
+            return
         logger.info(f"[rlix][vllm][collective] destroy_enter group_name={group_name}")
         collective.destroy_collective_group(group_name)
         logger.info(f"[rlix][vllm][collective] destroy_exit group_name={group_name}")
 
-    def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
+    def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False, *, broadcast_local_ranks=None):
+        """Receive broadcasted tensors from rank 0. Base weights are written to GPU immediately;
+        LoRA tensors are staged in tensor_lora_manager for later add_lora registration.
+
+        is_lora=False (base model weights):
+          Overwrites the model's in-GPU weight tensors directly, one at a time via a streaming
+          generator. reload_model() is called first to ensure the weight memory pool exists,
+          then each tensor is received and written in-place before the next buffer is allocated.
+          Peak memory = model_weights + one_tensor_buffer.
+
+        is_lora=True (LoRA adapter weights):
+          Does NOT write to the model. Received tensors are staged in tensor_lora_manager
+          and only applied to the vLLM engine later when custom_add_lora is called.
+          LoRA tensors are small so all receives are issued async in a batch to let NCCL
+          pipeline the transfers.
+        """
         # [debug] Stage 1: log GPU memory before any receive buffer is allocated.
         # If another process still has model weights loaded, device_used will be much higher
         # than the expected idle baseline (~3.5 GiB for 6 idle processes on this test config).
@@ -387,6 +591,10 @@ class WorkerBase:
             f"[debug] device_used={_device_used_gb:.3f}GB allocated={_alloc_gb:.3f}GB "
             f"device_total={_total_bytes / 1024**3:.3f}GB"
         )
+
+        # Partial-overlap support: ranks not in the mask never joined the NCCL group; skip early.
+        if broadcast_local_ranks is not None and self.rank not in broadcast_local_ranks:
+            return
 
         if is_lora:
             # LoRA tensors are small: keep async batch pattern so NCCL can pipeline transfers.
@@ -409,13 +617,21 @@ class WorkerBase:
         self.reload_model()
 
         def _streaming_weights_gen():
+            # One buffer at a time: allocate → blocking broadcast (wait for data) → yield →
+            # del _buf before the loop advances to the next tensor.  This keeps peak memory at
+            # model_weights + one_buffer rather than model_weights + all_buffers.
             for _name, _dtype, _shape in zip(names, dtypes, shapes):
                 _target_dtype = _dtype if isinstance(_dtype, torch.dtype) else getattr(torch, _dtype)
                 _buf = torch.empty(_shape, dtype=_target_dtype, device=self.device)
                 # Blocking broadcast: receive this tensor before allocating the next buffer.
                 collective.broadcast(tensor=_buf, src_rank=0, group_name=group_name, async_op=False)
                 yield _name, _buf
-                del _buf  # free buffer before allocating the next one
+                # Each parameter has a different shape (embedding, attention, MLP, bias, ...),
+                # so the buffer cannot be reused — a new torch.empty is required each iteration.
+                # del here ensures the old GPU block is returned to the CUDA caching allocator
+                # before the next torch.empty runs.  Without it, both tensors would be alive
+                # simultaneously at the loop boundary → peak = 2 buffers instead of 1.
+                del _buf
 
         # load_weights calls reload_model() internally; no-op since weight_loaded=True after
         # the reload_model() call above.
@@ -430,27 +646,38 @@ class WorkerBase:
         )
         logger.info(f"[rlix][vllm][broadcast] exit group_name={group_name} mode=weights")
 
-    def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
+    def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False, *, ipc_local_ranks=None):
+        """Deserialise a packed parameter bucket and apply it to the model or stage for LoRA.
+
+        Counterpart to broadcast_parameter: same base/LoRA split, but tensors arrive
+        pre-packed in a serialized bucket (CUDA-IPC or CPU-bytes) instead of via NCCL broadcast.
+
+        is_lora=False (base model weights):
+          Calls load_weights() to overwrite in-GPU parameter values with the unpacked tensors.
+          No explicit reload_model() here — load_weights() handles that internally.
+
+        is_lora=True (LoRA adapter weights):
+          Stages each unpacked tensor in tensor_lora_manager.add_weight(), same as
+          broadcast_parameter's LoRA path. Applied to vLLM later via custom_add_lora.
+
+        The bucket is always serialised as {"bucket": <torch.Tensor>, "tensors_meta": ...}
+        via CUDA IPC. Operators must run containers with --ipc=host or --cap-add SYS_PTRACE;
+        if CUDA IPC is blocked, deserialization will raise naturally (fail-fast).
+
+        named_params is materialised with list() because named_tensors_from_bucket returns a
+        generator and generators can only be consumed once.
+        """
+        # Partial-overlap support: broadcast-only ranks receive weights via NCCL instead;
+        # returning early here prevents double-application of the same weights.
+        if ipc_local_ranks is not None and self.rank not in ipc_local_ranks:
+            return
         monkey_patch_torch_reductions()
         bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_named_tensors[self.rank])
-        # Support both formats:
-        # - {"bucket": <torch.Tensor>, "tensors_meta": ...}  (legacy / CUDA-IPC path)
-        # - {"bucket_bytes": <bytes>, "tensors_meta": ...}  (RLix CPU-cache safe path)
-        if "bucket" not in bucket_with_meta:
-            bucket_bytes = bucket_with_meta.get("bucket_bytes")
-            if bucket_bytes is None:
-                raise RuntimeError("update_parameter_in_bucket missing 'bucket' or 'bucket_bytes'")
-            bucket_with_meta["bucket"] = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8).to(
-                device=self.device
-            ).contiguous()
-            # Avoid passing unexpected kwargs into named_tensors_from_bucket.
-            bucket_with_meta.pop("bucket_bytes", None)
-        else:
-            bucket = bucket_with_meta["bucket"]
-            if not getattr(bucket, "is_cuda", False):
-                bucket_with_meta["bucket"] = bucket.to(device=self.device).contiguous()
-            bucket_with_meta.pop("bucket_bytes", None)
-        named_params = list(named_tensors_from_bucket(**bucket_with_meta))
+        bucket = bucket_with_meta["bucket"]
+        # FSDP2 CPUOffload may deliver a CPU tensor; move to device before slicing.
+        if not getattr(bucket, "is_cuda", False):
+            bucket = bucket.to(device=self.device).contiguous()
+        named_params = list(named_tensors_from_bucket(bucket=bucket, tensors_meta=bucket_with_meta["tensors_meta"]))
         if is_lora:
             for name, weight in named_params:
                 self.tensor_lora_manager.add_weight(name, weight)
@@ -471,6 +698,17 @@ class WorkerBase:
 
 
 class WorkerV1(WorkerBase):
+    """vLLM V1 engine worker variant.
+
+    The only V1-specific behaviour is calling patch_vllm_lora_manager() at init time.
+    That patch fixes vLLM's LRUCacheWorkerLoRAManager so evicted adapter entries are
+    properly removed from the Python-side cache, preventing stale-pointer CUDA errors on
+    the next add_lora call after a sleep cycle.
+
+    All other logic (LoRA registration, weight broadcasting, collective group management,
+    offload/reload lifecycle) is inherited from WorkerBase.
+    """
+
     def custom_init_worker(self, *args, **kwargs):
         super().custom_init_worker(*args, **kwargs)
         patch_vllm_lora_manager()

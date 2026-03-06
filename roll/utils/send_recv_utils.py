@@ -5,14 +5,6 @@ from torch.multiprocessing import reductions
 
 from roll.platforms import current_platform
 from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
-from roll.utils.logging import get_logger
-
-logger = get_logger()
-
-# Lazy-probed flag: None = not yet tested, True = works, False = blocked.
-# Probed on first serialize_named_weights() call (not at import time)
-# to avoid CUDA init before Ray assigns GPUs.
-_cuda_ipc_available: bool | None = None
 
 MAX_SHARD_SIZE = 5_000_000_000  # 5GB
 
@@ -252,28 +244,6 @@ def named_tensors_from_bucket(bucket: "torch.Tensor", tensors_meta: list[dict]) 
     return reconstructed
 
 
-def _probe_cuda_ipc(bucket: torch.Tensor, tensors_meta: list[dict]) -> bytes:
-    """Try CUDA IPC serialization. On success, cache result and return serialized bytes.
-    On pidfd_getfd failure, mark disabled and raise."""
-    global _cuda_ipc_available
-    try:
-        result = MultiprocessingSerializer.serialize({"bucket": bucket, "tensors_meta": tensors_meta})
-        _cuda_ipc_available = True
-        return result
-    except OSError as exc:
-        if "pidfd_getfd" not in str(exc) and "Operation not permitted" not in str(exc):
-            raise
-        _cuda_ipc_available = False
-        logger.warning(
-            "[CUDA_IPC] Container blocks CUDA IPC fd-transfer. "
-            "Using CPU byte path for all subsequent model updates (slower). "
-            "Fix: run container with --cap-add SYS_PTRACE or --ipc=host. "
-            "Error: %s",
-            exc,
-        )
-        raise
-
-
 def serialize_named_weights(named_weights: list[tuple[str, torch.Tensor]], infer_strategy: str):
     if infer_strategy == "sglang":
         from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
@@ -298,28 +268,10 @@ def serialize_named_weights(named_weights: list[tuple[str, torch.Tensor]], infer
 
     bucket, tensors_meta = _bucket_named_tensors(named_weights)
 
-    # FSDP2 will fail if using CPUOffload Policy without this check
+    # FSDP2 CPUOffload delivers a CPU tensor; move to GPU before CUDA IPC serialization.
     if not getattr(bucket, "is_cuda", False):
         bucket = bucket.to(current_platform.device_type).contiguous()
 
+    # Always use CUDA IPC. If blocked (missing --ipc=host / --cap-add SYS_PTRACE), raises naturally.
     monkey_patch_torch_reductions()
-
-    # Fast path: CUDA IPC confirmed working from previous call.
-    if _cuda_ipc_available is True:
-        return MultiprocessingSerializer.serialize({"bucket": bucket, "tensors_meta": tensors_meta})
-
-    # Slow path: CUDA IPC confirmed blocked — go straight to CPU bytes.
-    if _cuda_ipc_available is False:
-        bucket_cpu = bucket.cpu().contiguous()
-        return MultiprocessingSerializer.serialize(
-            {"bucket_bytes": memoryview(bucket_cpu.numpy()).tobytes(), "tensors_meta": tensors_meta}
-        )
-
-    # First call: probe CUDA IPC. On failure, fall back to CPU bytes.
-    try:
-        return _probe_cuda_ipc(bucket, tensors_meta)
-    except OSError:
-        bucket_cpu = bucket.cpu().contiguous()
-        return MultiprocessingSerializer.serialize(
-            {"bucket_bytes": memoryview(bucket_cpu.numpy()).tobytes(), "tensors_meta": tensors_meta}
-        )
+    return MultiprocessingSerializer.serialize({"bucket": bucket, "tensors_meta": tensors_meta})

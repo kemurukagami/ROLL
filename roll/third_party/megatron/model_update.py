@@ -564,7 +564,6 @@ class MegatronWeightUpdater:
         if self.worker_config.model_args.adapters is not None:
             peft_configs = self.models_unwrapped[0].peft_config
             selected = set(adapters_to_update) if adapters_to_update is not None else None
-            co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
             for adapter_name, peft_config in peft_configs.items():
                 if selected is not None and adapter_name not in selected:
                     continue

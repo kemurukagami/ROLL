@@ -18,8 +18,12 @@ class CustomAsyncLLM(AsyncLLM):
     async def broadcast_parameter(self, *args, **kwargs):
         await self.engine_core.collective_rpc_async(method="broadcast_parameter", args=args, kwargs=kwargs)
 
-    async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
-        await self.engine_core.collective_rpc_async(method="update_parameter_in_bucket", args=(serialized_named_tensors, is_lora))
+    async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False, *, ipc_local_ranks=None):
+        await self.engine_core.collective_rpc_async(
+            method="update_parameter_in_bucket",
+            args=(serialized_named_tensors, is_lora),
+            kwargs={"ipc_local_ranks": ipc_local_ranks},
+        )
 
     async def destroy_collective_group(self, group_name: str):
         await self.engine_core.collective_rpc_async(method="destroy_collective_group", args=(group_name,))

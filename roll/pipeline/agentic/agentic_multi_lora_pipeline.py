@@ -492,7 +492,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
 
         success = False
         try:
-            max_steps_per_adapter = int(self.pipeline_config.max_steps)
+            max_steps_per_lora = int(self.pipeline_config.max_steps)
             adapters = list(self.pipeline_config.actor_train.model_args.adapters.keys())
             lora_step: dict[str, int] = {name: 0 for name in adapters}
             global_tick = 0
@@ -516,7 +516,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
             tags = list(self.rollout_schedulers.keys())
             for tag in tags:
                 adapter = tag_to_adapter[tag]
-                if lora_step.get(adapter, 0) >= max_steps_per_adapter:
+                if lora_step.get(adapter, 0) >= max_steps_per_lora:
                     continue
                 data = DataProto(meta_info={"global_step": global_tick})
                 in_flight[tag] = self.rollout_schedulers[tag].get_batch.remote(
@@ -533,8 +533,8 @@ class AgenticMultiLoraPipeline(BasePipeline):
             last_train_step_done_ts_by_adapter: dict[str, float] = {}
             last_train_step_done_ts_global: float | None = None
 
-            while any(lora_step[name] < max_steps_per_adapter for name in adapters):
-                active_tags = [tag for tag in tags if lora_step.get(tag_to_adapter[tag], 0) < max_steps_per_adapter]
+            while any(lora_step[name] < max_steps_per_lora for name in adapters):
+                active_tags = [tag for tag in tags if lora_step.get(tag_to_adapter[tag], 0) < max_steps_per_lora]
                 active_tags_in_flight = [tag for tag in active_tags if tag in in_flight]
                 active_refs = [in_flight[tag] for tag in active_tags_in_flight]
                 assert len(active_refs) > 0
@@ -625,7 +625,6 @@ class AgenticMultiLoraPipeline(BasePipeline):
                 # relies on RequestScheduler to abort/remap + update routing safely for any in-flight requests.
 
                 tick_metrics: dict = {}
-                per_adapter_metrics: dict[str, dict] = {}
                 shrink_duration_s: Optional[float] = None
                 with Timer(name="pipeline_tick_total", logger=None) as tick_timer:
                     with tps_timer:
@@ -695,97 +694,88 @@ class AgenticMultiLoraPipeline(BasePipeline):
                         if "metrics" in actor_infer_metrics.meta_info:
                             actor_infer_reduced = reduce_metrics(actor_infer_metrics.meta_info.pop("metrics", {}))
 
-                        # Prepare each tag-batch independently, then train in one batched call.
-                        prepared: list[DataProto] = []
-                        prepared_by_adapter: dict[str, list[DataProto]] = {}
-                        dirty_adapters: set[str] = set()
-                        for tag, batch in pending_by_tag.items():
-                            adapter_for_tag = tag_to_adapter[tag]
-                            adapter_metrics = per_adapter_metrics.setdefault(adapter_for_tag, {})
-                            if actor_infer_reduced:
-                                adapter_metrics.update(actor_infer_reduced)
-                            tick_wait_ready_batch_s = float(
-                                batch.meta_info.get("metrics", {}).get("time/ray_wait_ready_batch_s", 0.0) or 0.0
+                        # Exactly one batch is ready per tick (ray.wait returns 1,
+                        # cleared before next iteration).
+                        if len(pending_by_tag) != 1:
+                            raise RuntimeError(
+                                f"Expected exactly 1 pending batch per tick, got {len(pending_by_tag)}: "
+                                f"{sorted(pending_by_tag.keys())}"
                             )
-                            tick_metrics["time/ray_wait_ready_batch_s"] = tick_wait_ready_batch_s
-                            adapter_metrics["time/ray_wait_ready_batch_s"] = tick_wait_ready_batch_s
+                        (ready_tag_for_tick, ready_batch_for_tick), = pending_by_tag.items()
 
-                            wait_s = float(batch.meta_info.get("metrics", {}).get("time/get_batch_wait_s", 0.0) or 0.0)
-                            batch.meta_info.setdefault("global_step", global_tick)
-                            batch.meta_info["_broadcast_non_tensor_batch"] = True
-                            # Keep strategy token-count accounting contract identical to agentic_pipeline.
-                            batch.meta_info["loss_mask_keys"] = ["response_mask"]
-                            with Timer(name="rollout", logger=None) as rollout_timer:
-                                adapter_metrics.update(reduce_metrics(batch.meta_info.pop("metrics", {})))
-                                adapter_metrics.update(compute_rollout_traj_metrics(batch))
-                                dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_tick, batch)
-                            adapter_metrics["time/step_rollout"] = rollout_timer.last + wait_s
+                        dirty_adapters: set[str] = set()
+                        lora_metrics: dict[str, dict] = {}
 
-                            prepared_batch = self._prepare_batch(batch, adapter_metrics)
-                            prepared.append(prepared_batch)
+                        adapter_for_tag = tag_to_adapter[ready_tag_for_tick]
+                        adapter_metrics = lora_metrics.setdefault(adapter_for_tag, {})
+                        if actor_infer_reduced:
+                            adapter_metrics.update(actor_infer_reduced)
+                        tick_wait_ready_batch_s = float(
+                            ready_batch_for_tick.meta_info.get("metrics", {}).get("time/ray_wait_ready_batch_s", 0.0) or 0.0
+                        )
+                        tick_metrics["time/ray_wait_ready_batch_s"] = tick_wait_ready_batch_s
+                        adapter_metrics["time/ray_wait_ready_batch_s"] = tick_wait_ready_batch_s
 
-                            # Track which adapter(s) stepped this tick.
-                            lora_names = prepared_batch.non_tensor_batch["lora_name"]
-                            unique = list(dict.fromkeys(lora_names.tolist()))
-                            if len(unique) != 1:
-                                raise RuntimeError(f"Expected homogeneous lora_name per prepared batch, got {unique}")
-                            adapter_name = str(unique[0])
-                            if adapter_name != adapter_for_tag:
-                                merged = per_adapter_metrics.setdefault(adapter_name, {})
-                                merged.update(adapter_metrics)
-                                adapter_metrics = merged
-                            dirty_adapters.add(adapter_name)
-                            prepared_by_adapter.setdefault(adapter_name, []).append(prepared_batch)
+                        wait_s = float(ready_batch_for_tick.meta_info.get("metrics", {}).get("time/get_batch_wait_s", 0.0) or 0.0)
+                        ready_batch_for_tick.meta_info.setdefault("global_step", global_tick)
+                        ready_batch_for_tick.meta_info["_broadcast_non_tensor_batch"] = True
+                        # Keep strategy token-count accounting contract identical to agentic_pipeline.
+                        ready_batch_for_tick.meta_info["loss_mask_keys"] = ["response_mask"]
+                        with Timer(name="rollout", logger=None) as rollout_timer:
+                            adapter_metrics.update(reduce_metrics(ready_batch_for_tick.meta_info.pop("metrics", {})))
+                            adapter_metrics.update(compute_rollout_traj_metrics(ready_batch_for_tick))
+                            dump_rollout_trajectories(self.pipeline_config.rollout_dump_dir, global_tick, ready_batch_for_tick)
+                        adapter_metrics["time/step_rollout"] = rollout_timer.last + wait_s
 
-                        # Train (per-adapter optimizer mode). In barrier mode this concatenates all tags' batches.
+                        prepared_batch = self._prepare_batch(ready_batch_for_tick, adapter_metrics)
+
+                        # Extract the single adapter name from the prepared batch.
+                        lora_names = prepared_batch.non_tensor_batch["lora_name"]
+                        unique = list(dict.fromkeys(lora_names.tolist()))
+                        if len(unique) != 1:
+                            raise RuntimeError(f"Expected homogeneous lora_name per prepared batch, got {unique}")
+                        adapter_name = str(unique[0])
+                        if adapter_name != adapter_for_tag:
+                            merged = lora_metrics.setdefault(adapter_name, {})
+                            merged.update(adapter_metrics)
+                            adapter_metrics = merged
+                        dirty_adapters.add(adapter_name)
+
+                        # Per-adapter data metrics inline (single batch, no deferred concat needed).
+                        with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
+                            adapter_metrics.update(compute_train_data_metrics(batch=prepared_batch))
+                        adapter_metrics["time/step_compute_data_metrics"] = data_metrics_timer.last
+
+                        # Dynamic batching: shard prepared_batch before train_step_lora
+                        # (same pattern as agentic_pipeline.py train_step path).
+                        if self.pipeline_config.actor_train.use_dynamic_batching_in_train:
+                            prepared_batch, dynamic_batching_metrics = dynamic_batching_shard(
+                                prepared_batch,
+                                self.actor_train.dp_size,
+                                self.pipeline_config.actor_train.max_tokens_per_microbatch_in_train,
+                                self.pipeline_config.actor_train.sequence_length_round_in_train,
+                                self.pipeline_config.actor_train.strategy_args.strategy_config.get(
+                                    "pipeline_model_parallel_size", 1
+                                ),
+                                self.pipeline_config.actor_train.strategy_args.strategy_config.get(
+                                    "virtual_pipeline_model_parallel_size", None
+                                ),
+                                "actor_train/train_step_lora",
+                            )
+                            adapter_metrics.update(dynamic_batching_metrics)
+
+                        # Train single adapter.
                         with Timer(name="train_timer", logger=None) as train_timer:
-                            train_input = prepared[0] if len(prepared) == 1 else DataProto.concat(prepared)
-                            if os.environ.get("ROLL_DEBUG_TRAIN_STEP_INPUTS", "0") == "1":
-                                lora_arr = train_input.non_tensor_batch.get("lora_name", None)
-                                if lora_arr is None:
-                                    raise RuntimeError("ROLL_DEBUG_TRAIN_STEP_INPUTS requires non_tensor_batch['lora_name'] to exist.")
-                                lora_list = [str(x) for x in lora_arr.tolist()]
-                                lora_counts: dict[str, int] = {}
-                                for name in lora_list:
-                                    lora_counts[name] = lora_counts.get(name, 0) + 1
-
-                                response_mask_sum = float(train_input.batch["response_mask"][:, 1:].sum().detach().item())
-                                advantages_abs_sum = float(train_input.batch["advantages"].abs().sum().detach().item())
-                                raw_advantages_abs_sum = float(
-                                    train_input.batch.get("raw_advantages", train_input.batch["advantages"]).abs().sum().detach().item()
-                                )
-                                token_rewards_abs_sum = float(
-                                    train_input.batch.get("token_level_rewards", torch.zeros_like(train_input.batch["advantages"]))
-                                    .abs()
-                                    .sum()
-                                    .detach()
-                                    .item()
-                                )
-                                seq_scores = train_input.batch["scores"].sum(dim=-1).detach()
-                                seq_score_min = float(seq_scores.min().item())
-                                seq_score_max = float(seq_scores.max().item())
-                                logger.info(
-                                    "train_step_lora inputs: global_tick=%s lora_counts=%s response_mask_sum=%s "
-                                    "advantages_abs_sum=%s raw_advantages_abs_sum=%s token_rewards_abs_sum=%s seq_score_min=%s seq_score_max=%s",
-                                    global_tick,
-                                    lora_counts,
-                                    response_mask_sum,
-                                    advantages_abs_sum,
-                                    raw_advantages_abs_sum,
-                                    token_rewards_abs_sum,
-                                    seq_score_min,
-                                    seq_score_max,
-                                )
                             if self.pipeline_config.adv_estimator == "gae":
-                                critic_train_refs: list[ray.ObjectRef] = self.critic.train_step(train_input, blocking=False)
-                            train_refs: list[ray.ObjectRef] = self.actor_train.train_step_lora(train_input, blocking=False)
+                                critic_train_refs: list[ray.ObjectRef] = self.critic.train_step(prepared_batch, blocking=False)
+                            train_refs: list[ray.ObjectRef] = self.actor_train.train_step_lora(prepared_batch, blocking=False)
                             train_metrics = DataProto.materialize_concat(data_refs=train_refs)
                             reduced_train_metrics = reduce_metrics(train_metrics.meta_info.pop("metrics", {}))
                             tick_metrics.update(reduced_train_metrics)
                             if self.pipeline_config.adv_estimator == "gae":
                                 critic_train_metrics = DataProto.materialize_concat(data_refs=critic_train_refs)
                                 tick_metrics.update(reduce_metrics(critic_train_metrics.meta_info.pop("metrics", {})))
-                            tps_timer.push_units_processed(n=torch.sum(train_input.batch["attention_mask"]).detach().item())
+                            tps_timer.push_units_processed(n=torch.sum(prepared_batch.batch["attention_mask"]).detach().item())
                         train_step_s = float(train_timer.last)
                         train_step_done_ts = time.monotonic() - pipeline_start_mono
                         tick_metrics["time/train_step_done_ts"] = train_step_done_ts
@@ -797,7 +787,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
                         last_train_step_done_ts_global = train_step_done_ts
                         tick_metrics["system/tps"] = tps_timer.mean_throughput
                         for name in dirty_adapters:
-                            adapter_metrics = per_adapter_metrics.setdefault(name, {})
+                            adapter_metrics = lora_metrics.setdefault(name, {})
                             adapter_metrics["time/step_train"] = train_step_s
                             adapter_metrics["time/step_train_step_lora"] = train_step_s
                             adapter_metrics["time/train_step_done_ts"] = train_step_done_ts
@@ -823,7 +813,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
                         for name, step in lora_step.items():
                             tick_metrics[f"system/lora_step/{name}"] = step
                         for name in dirty_adapters:
-                            adapter_metrics = per_adapter_metrics.setdefault(name, {})
+                            adapter_metrics = lora_metrics.setdefault(name, {})
                             adapter_metrics["system/global_tick"] = global_tick
                             adapter_metrics["system/lora_step"] = lora_step.get(name, global_tick)
 
@@ -841,7 +831,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
                             model_update_metrics = self.model_update_lora_subset(global_tick, adapters_to_update=dirty_adapters)
                             tick_metrics.update(model_update_metrics)
                             for name in dirty_adapters:
-                                per_adapter_metrics.setdefault(name, {}).update(model_update_metrics)
+                                lora_metrics.setdefault(name, {}).update(model_update_metrics)
 
                             # Partial GPU: expand routing state after model_update reloads to all GPUs.
                             if self.partial_gpu_mode and global_tick > 0:
@@ -876,7 +866,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
                                     for idx, expand_metrics in enumerate(expand_metrics_list):
                                         tick_metrics.update({f"expand/{idx}/{k}": v for k, v in expand_metrics.items()})
                                         for name in dirty_adapters:
-                                            per_adapter_metrics.setdefault(name, {}).update(
+                                            lora_metrics.setdefault(name, {}).update(
                                                 {f"expand/{idx}/{k}": v for k, v in expand_metrics.items()}
                                             )
                                     if os.environ.get("ROLL_LOG_PARTIAL_GPU_OPS", "0") == "1":
@@ -911,24 +901,14 @@ class AgenticMultiLoraPipeline(BasePipeline):
                         model_update_s = float(model_update_timer.last)
                         tick_metrics["time/step_model_update"] = model_update_s
                         for name in dirty_adapters:
-                            per_adapter_metrics.setdefault(name, {})["time/step_model_update"] = model_update_s
-
-                        # Basic data metrics
-                        for name, batches in prepared_by_adapter.items():
-                            if not batches:
-                                continue
-                            with Timer(name="compute_data_metrics", logger=None) as data_metrics_timer:
-                                per_adapter_metrics.setdefault(name, {}).update(
-                                    compute_train_data_metrics(batch=DataProto.concat(batches))
-                                )
-                            per_adapter_metrics.setdefault(name, {})["time/step_compute_data_metrics"] = data_metrics_timer.last
+                            lora_metrics.setdefault(name, {})["time/step_model_update"] = model_update_s
 
                 tick_total_s = float(tick_timer.last)
                 for name in dirty_adapters:
-                    per_adapter_metrics.setdefault(name, {})["time/tick_total"] = tick_total_s
-                    per_adapter_metrics.setdefault(name, {})["time/step_log"] = 0.0
+                    lora_metrics.setdefault(name, {})["time/tick_total"] = tick_total_s
+                    lora_metrics.setdefault(name, {})["time/step_log"] = 0.0
                     if shrink_duration_s is not None:
-                        per_adapter_metrics.setdefault(name, {})["time/step_shrink"] = shrink_duration_s
+                        lora_metrics.setdefault(name, {})["time/step_shrink"] = shrink_duration_s
 
                 if self.pipeline_config.logging_steps > 0 and global_tick % self.pipeline_config.logging_steps == 0:
                     logger.info(f"tick={global_tick} lora_step={lora_step}")
@@ -937,7 +917,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
                 if self.pipeline_config.track_with == "ml_tracker":
                     # Log to one ml_tracker run per LoRA adapter (via Ray actor).
                     for name in sorted(dirty_adapters):
-                        per_lora_metrics = dict(per_adapter_metrics.get(name, {}))
+                        per_lora_metrics = dict(lora_metrics.get(name, {}))
                         per_lora_metrics["system/lora_name"] = name
                         self.tracker.log(values=per_lora_metrics, step=lora_step.get(name, global_tick), lora_name=name)
                 else:
@@ -946,7 +926,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
                 pending_by_tag.clear()
                 for tag in tags:
                     adapter = tag_to_adapter[tag]
-                    if lora_step.get(adapter, 0) >= max_steps_per_adapter:
+                    if lora_step.get(adapter, 0) >= max_steps_per_lora:
                         in_flight.pop(tag, None)
                         continue
                     if tag in in_flight:

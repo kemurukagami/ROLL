@@ -431,29 +431,25 @@ class Worker:
         tgt_workers,
         tgt_device_mapping,
         tgt_num_gpus_per_worker: int,
-        model_update_name: str | None = None,
         comm_plan=None,
-        is_leader: bool = False,
         adapters_to_sync: list[str] | None = None,
     ) -> None:
         """
         Perform selective parameter synchronization from sender to receiver workers.
-        
+
         This is the core RLix operation that transfers parameter buckets from actor_train
         (sender) to actor_infer (receiver) workers. Uses pre-built bucket caches and
         optional communication plans to minimize transfer overhead.
-        
+
         Args:
             sync_id: Unique identifier for this sync operation (for logging/tracing).
             tgt_dp_ranks: Target data parallel ranks to sync to.
             tgt_workers: Target worker actor handles.
             tgt_device_mapping: Device mapping for target workers.
             tgt_num_gpus_per_worker: Number of GPUs per target worker.
-            model_update_name: Optional name for the model update session.
             comm_plan: Optional pre-computed communication plan for optimized transfers.
-            is_leader: Whether this worker is the leader for coordination.
             adapters_to_sync: Optional list of LoRA adapters to sync (multi-LoRA mode).
-        
+
         Raises:
             RuntimeError: If strategy does not implement selective_sync_active_cache.
         """
@@ -468,14 +464,11 @@ class Worker:
             f"tgt_num_gpus_per_worker={tgt_num_gpus_per_worker}"
         )
         fn(
-            sync_id=str(sync_id),
             tgt_dp_ranks=tgt_dp_ranks,
             tgt_workers=tgt_workers,
             tgt_device_mapping=tgt_device_mapping,
             tgt_num_gpus_per_worker=int(tgt_num_gpus_per_worker),
-            model_update_name=model_update_name,
             comm_plan=comm_plan,
-            is_leader=bool(is_leader),
             adapters_to_sync=adapters_to_sync,
         )
         self.logger.info(f"[rlix][selective_sync] worker_call_exit sync_id={sync_id}")

@@ -671,11 +671,11 @@ class VllmStrategy(InferenceStrategy):
             "or (master_address=..., master_port=..., rank_offset=..., world_size=..., group_name=..., backend=?, timeout_s=?)."
         )
 
-    async def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False):
-        await self.model.broadcast_parameter(names, dtypes, shapes, group_name, is_lora)
+    async def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False, *, broadcast_local_ranks=None):
+        await self.model.broadcast_parameter(names, dtypes, shapes, group_name, is_lora, broadcast_local_ranks=broadcast_local_ranks)
 
-    async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False):
-        await self.model.update_parameter_in_bucket(serialized_named_tensors, is_lora)
+    async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False, *, ipc_local_ranks=None):
+        await self.model.update_parameter_in_bucket(serialized_named_tensors, is_lora, ipc_local_ranks=ipc_local_ranks)
 
     async def destroy_collective_group(self, group_name: str, model_update_name: str | None = None) -> None:
         """Destroy a previously created collective communication group.
@@ -689,7 +689,7 @@ class VllmStrategy(InferenceStrategy):
         del model_update_name
         await self.model.destroy_collective_group(group_name)
 
-    async def add_lora(self, adapter_name: str = "default", peft_config: dict = None):
+    async def add_lora(self, adapter_name: str = "default", peft_config: dict = None, *, lora_local_ranks=None):
         """Register a LoRA adapter with the vLLM inference engine.
 
         This method handles the full lifecycle of LoRA adapter registration:
@@ -753,22 +753,31 @@ class VllmStrategy(InferenceStrategy):
         #   1. load_states()          → reload_model() + wake_up(kv_cache): GPU fully initialized
         #   2. vLLM.add_lora()        → LoRA tensors loaded to GPU, adapter registered in vLLM Python cache
         #   3. register(name, id)     → _lora_names updated only after vLLM confirms success
-        await self.model.add_lora(adapter_name, peft_config)
+        await self.model.add_lora(adapter_name, peft_config, lora_local_ranks=lora_local_ranks)
         # Weights + KV cache + LoRA are all GPU-resident; _lora_names is up to date.
         # Advance the strategy-level flag now so load_states_partial() can skip its no-op RPC.
         self.is_model_in_gpu = True
-        lora_int_id = await self.get_lora_id(adapter_name)
-        logger.info(
-            "[vllm_strategy][add_lora] registered adapter=%s lora_int_id=%s is_model_in_gpu=%s",
-            adapter_name, lora_int_id, self.is_model_in_gpu,
-        )
-        if lora_int_id is None:
-            raise RuntimeError(f"LoRA adapter registration did not produce an id: adapter={adapter_name!r}")
-        loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
-        if lora_int_id not in loaded:
-            raise RuntimeError(
-                f"vllm_strategy.add_lora:not_visible_after_add: "
-                f"adapter={adapter_name!r} lora_int_id={lora_int_id} loaded={loaded[:16]!r}"
+        # When lora_local_ranks masks some TP ranks, those ranks skip custom_add_lora so
+        # list_loras() on masked ranks returns empty — skip strategy-level verification here;
+        # worker-side success is sufficient. For non-masked calls, do the full check.
+        if lora_local_ranks is None:
+            lora_int_id = await self.get_lora_id(adapter_name)
+            logger.info(
+                "[vllm_strategy][add_lora] registered adapter=%s lora_int_id=%s is_model_in_gpu=%s",
+                adapter_name, lora_int_id, self.is_model_in_gpu,
+            )
+            if lora_int_id is None:
+                raise RuntimeError(f"LoRA adapter registration did not produce an id: adapter={adapter_name!r}")
+            loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
+            if lora_int_id not in loaded:
+                raise RuntimeError(
+                    f"vllm_strategy.add_lora:not_visible_after_add: "
+                    f"adapter={adapter_name!r} lora_int_id={lora_int_id} loaded={loaded[:16]!r}"
+                )
+        else:
+            logger.info(
+                "[vllm_strategy][add_lora] registered adapter=%s (lora_local_ranks=%s, skipping per-rank verify)",
+                adapter_name, lora_local_ranks,
             )
 
     async def get_lora_id(self, adapter_name: str) -> int | None:

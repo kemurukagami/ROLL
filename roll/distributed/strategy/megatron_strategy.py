@@ -2,10 +2,9 @@ import math
 import os
 import random
 import threading
-import time
 from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
@@ -79,7 +78,7 @@ from roll.utils.logging import get_logger
 from roll.utils.lora_routing import resolve_microbatch_lora_name
 from roll.utils.network_utils import collect_free_port, get_node_ip
 from roll.utils.offload_states import OffloadStateType
-from roll.utils.send_recv_utils import _bucket_named_tensors, named_tensors_from_bucket
+from roll.utils.send_recv_utils import _bucket_named_tensors, monkey_patch_torch_reductions, named_tensors_from_bucket
 from roll.utils.sequence_packing import make_micro_batch_iter_for_sequence_packing, restore_results_order
 
 
@@ -89,16 +88,29 @@ if TYPE_CHECKING:
 logger = get_logger()
 
 
-def _safe_dist_barrier(group=None):
+def _safe_dist_barrier(subgroup=None):
+    """Synchronize ranks at a barrier, handling two common failure modes.
+
+    Safe to call even when ``dist`` is not initialized (single-process or
+    workers that skipped dist init) — the barrier becomes a no-op in that case.
+
+    For NCCL backend, passes ``device_ids`` explicitly to avoid a hang that
+    occurs when no default CUDA device is set (NCCL requires an explicit device
+    for the barrier collective; see PyTorch issue fixed after v2.9.1).
+
+    Args:
+        subgroup: Optional process-group subset (e.g. TP group, PP group).
+            When None, synchronizes all ranks in the global default group.
+    """
     if not dist.is_available() or not dist.is_initialized():
         return
     kwargs = {}
     if dist.get_backend() == "nccl" and current_platform.is_available():
         kwargs["device_ids"] = [current_platform.current_device()]
-    if group is None:
+    if subgroup is None:
         dist.barrier(**kwargs)
     else:
-        dist.barrier(group=group, **kwargs)
+        dist.barrier(group=subgroup, **kwargs)
 
 
 class MegatronInferStrategy(InferenceStrategy):
@@ -114,10 +126,12 @@ class MegatronInferStrategy(InferenceStrategy):
         # maybe put max_grad_norm into training_args as transformers do, rather
         # than in pipeline_config (PPOConfig)
         config_dict.update({"max_grad_norm": self.worker.pipeline_config.max_grad_norm})
+        # Filter out strategy_config keys (e.g., is_lora_optimizer_isolated) that are not
+        # valid TrainingArguments fields — otherwise TrainingArguments(**config_dict) raises TypeError.
         supported_keys = set(TrainingArguments.__dataclass_fields__.keys())
         dropped_keys = [k for k in config_dict if k not in supported_keys]
         if dropped_keys:
-            logger.warn(f"Ignore non-TrainingArguments keys: {dropped_keys}")
+            logger.warning(f"Ignore non-TrainingArguments keys: {dropped_keys}")
             config_dict = {k: v for k, v in config_dict.items() if k in supported_keys}
         logger.info(f"training_args: {config_dict}")
         self.megatron_train_args = TrainingArguments(**config_dict)
@@ -142,6 +156,7 @@ class MegatronInferStrategy(InferenceStrategy):
         self.forward_backward_func = get_forward_backward_func()
 
         self.seq_length = self.worker.pipeline_config.sequence_length
+        # True when PEFT LoRA adapters are configured; gates adapter-routing code paths.
         self.is_lora = self.worker_config.model_args.adapters is not None
 
         self.worker.rank_info.dp_rank = mpu.get_data_parallel_rank(with_context_parallel=False)
@@ -260,23 +275,8 @@ class MegatronInferStrategy(InferenceStrategy):
         return results
 
     def _get_feature_on_this_cp_rank(self, feature: torch.Tensor, feature_name: str = "input_ids") -> torch.Tensor:
-        # Debugging aid: detect unexpected device transition during CP slicing.
-        out = self.models_unwrapped[0].get_batch_on_this_cp_rank({feature_name: feature}, dim3_keys=[])[feature_name]
-        if (
-            feature is not None
-            and out is not None
-            and isinstance(feature, torch.Tensor)
-            and isinstance(out, torch.Tensor)
-            and feature.device != out.device
-        ):
-            logger.info(
-                "[device_trace][cp_rank_slice] rank=%s feature=%s in_device=%s out_device=%s",
-                self.worker.rank_info.rank,
-                feature_name,
-                feature.device,
-                out.device,
-            )
-        return out
+        """Slice a feature tensor for this Context Parallel rank."""
+        return self.models_unwrapped[0].get_batch_on_this_cp_rank({feature_name: feature}, dim3_keys=[])[feature_name]
 
     def _get_unpad_seqlen(self, attention_mask: torch.Tensor, pad_to_multiple_of: int = 256) -> int:
         max_seqlen = attention_mask.sum(dim=1).max().item()
@@ -447,71 +447,37 @@ class MegatronInferStrategy(InferenceStrategy):
             yield local_chunk
 
     def inner_forward_step(self, loss_func, data_iterator: Iterator[DataProto], model):
+        """Single micro-batch forward step called by Megatron's forward_backward_func.
+
+        Multi-LoRA: ``set_adapter`` is called per microbatch because different
+        microbatches may target different LoRA adapters.
+
+        """
         data = next(data_iterator)
-        logger.info(f"inner_forward_step enter rank={self.worker.rank_info.rank}")
+        # Multi-LoRA: activate the correct adapter for this microbatch before forward.
         if self.is_lora:
             routing = resolve_microbatch_lora_name(data.non_tensor_batch)
             for m in self.models_unwrapped:
                 m.set_adapter(routing.lora_name)
-        is_pp_first = mpu.is_pipeline_first_stage()
-        is_pp_last = mpu.is_pipeline_last_stage()
-
-        input_ids = data.batch["input_ids"] if is_pp_first else None
-        attention_mask = data.batch["attention_mask"] if is_pp_first else None
-        labels = data.batch["labels"] if (is_pp_last and "labels" in data.batch) else None  # labels is only used for sft
+        # get_data_input broadcasts batch.batch to all PP/TP/CP ranks, so tensors are always available.
+        input_ids = data.batch["input_ids"]
+        attention_mask = data.batch["attention_mask"]
+        labels = data.batch["labels"] if "labels" in data.batch else None  # labels is only used for sft
         packed_seq_params = None
-        # Root-cause tracing: per-call logs for LoRA train forwards. One-time logs are insufficient because
-        # earlier compute_log_probs forwards can consume the once-only guard before train_step_lora executes.
-        is_lora_train_forward = bool(data.meta_info and ("grad_accumulation_loss_scale" in data.meta_info))
-        # Root-cause tracing: log once per strategy instance before CP split/transforms.
-        if is_pp_first and input_ids is not None and not getattr(self, "_logged_lora_inner_pre_cp_once", False):
-            logger.info(
-                "[device_trace][inner_forward_step/pre_cp] rank=%s input_ids=%s attention_mask=%s labels=%s",
-                self.worker.rank_info.rank,
-                input_ids.device,
-                attention_mask.device if attention_mask is not None else None,
-                labels.device if labels is not None else None,
-            )
-            self._logged_lora_inner_pre_cp_once = True
-        if is_pp_first and input_ids is not None and is_lora_train_forward:
-            logger.info(
-                "[device_trace][inner_forward_step/pre_cp_lora_train] rank=%s input_ids=%s attention_mask=%s labels=%s",
-                self.worker.rank_info.rank,
-                input_ids.device,
-                attention_mask.device if attention_mask is not None else None,
-                labels.device if labels is not None else None,
-            )
 
-        if self.use_sequence_packing and is_pp_first:
+        if self.use_sequence_packing:
             input_ids, packed_seq_params, cu_seqlens, cu_seqlens_padded = self._pack_sequences(
                 input_ids, attention_mask,
             )
             if labels is not None:
                 labels, _, _, _ = self._pack_sequences(labels, attention_mask, pad_val=IGNORE_INDEX)
             attention_mask = None
-        elif is_pp_first:
+        else:
             input_ids = self._get_feature_on_this_cp_rank(input_ids, "input_ids")
             attention_mask = self._get_feature_on_this_cp_rank(attention_mask, "attention_mask")
             if labels is not None:
                 labels = self._get_feature_on_this_cp_rank(labels, "labels")
-            # Root-cause tracing: log once per strategy instance after CP split/transforms.
-            if not getattr(self, "_logged_lora_inner_post_cp_once", False):
-                logger.info(
-                    "[device_trace][inner_forward_step/post_cp] rank=%s input_ids=%s attention_mask=%s labels=%s",
-                    self.worker.rank_info.rank,
-                    input_ids.device if input_ids is not None else None,
-                    attention_mask.device if attention_mask is not None else None,
-                    labels.device if labels is not None else None,
-                )
-                self._logged_lora_inner_post_cp_once = True
-            if is_lora_train_forward:
-                logger.info(
-                    "[device_trace][inner_forward_step/post_cp_lora_train] rank=%s input_ids=%s attention_mask=%s labels=%s",
-                    self.worker.rank_info.rank,
-                    input_ids.device if input_ids is not None else None,
-                    attention_mask.device if attention_mask is not None else None,
-                    labels.device if labels is not None else None,
-                )
+        # Megatron TransformerEngine expects bool attention_mask; some pipelines produce int tensors.
         if attention_mask is not None and attention_mask.dtype != torch.bool and not torch.is_floating_point(attention_mask):
             attention_mask = attention_mask.bool()
         position_ids = None
@@ -523,7 +489,7 @@ class MegatronInferStrategy(InferenceStrategy):
         # attention_mask and position_ids would be chunked for cp with dim 2 as
         # seq dim in it if they are provided
         forward_args = data.meta_info.get("forward_args", {})
-        if is_pp_first and "position_ids" in data.batch.keys() and data.batch["position_ids"].dim() == 3:  # qwen2vl mrope
+        if "position_ids" in data.batch.keys() and data.batch["position_ids"].dim() == 3:  # qwen2vl mrope
             # not support MoE VLM, not used temperarily
             attention_mask = None
             position_ids = data.batch["position_ids"]
@@ -540,49 +506,21 @@ class MegatronInferStrategy(InferenceStrategy):
                     multi_modal_data[key].append(sample_mm_inputs[key])
             for key in multi_modal_data.keys():
                 assert key not in forward_args
-                # DataProto.to('cuda') in upper frame not work for non_tensor_batch
-                target_device = input_ids.device if input_ids is not None else labels.device
-                forward_args[key] = torch.concat(multi_modal_data[key], dim=0).to(target_device)
+                # DataProto.to('cuda') in upper frame not work for non_tensor_batch.
+                forward_args[key] = torch.concat(multi_modal_data[key], dim=0).to(input_ids.device)
             forward_args.update({"force_vit_image": True})
 
         # megatron_llama_core need loss_mask to compute aux loss
         if "loss_mask" not in forward_args:
             if labels is not None:
                 forward_args["loss_mask"] = (labels != IGNORE_INDEX).float()
-            elif input_ids is not None:
-                forward_args["loss_mask"] = torch.ones_like(input_ids)
             else:
-                forward_args["loss_mask"] = None
-
-        # Debugging aid: log exact devices at model-call boundary for LoRA train forwards.
-        if is_lora_train_forward and is_pp_first:
-            loss_mask = forward_args.get("loss_mask", None)
-            loss_mask_device = loss_mask.device if isinstance(loss_mask, torch.Tensor) else None
-            # Try best-effort lookup for embedding weight device to compare against input_ids.
-            embedding_weight_device = None
-            try:
-                for n, p in self.models_unwrapped[0].named_parameters():
-                    if "word_embeddings.weight" in n:
-                        embedding_weight_device = p.device
-                        break
-            except Exception:
-                embedding_weight_device = None
-            logger.info(
-                "[device_trace][inner_forward_step/model_call_lora_train] rank=%s input_ids=%s attention_mask=%s position_ids=%s labels=%s loss_mask=%s emb_weight=%s",
-                self.worker.rank_info.rank,
-                input_ids.device if input_ids is not None else None,
-                attention_mask.device if attention_mask is not None else None,
-                position_ids.device if isinstance(position_ids, torch.Tensor) else None,
-                labels.device if labels is not None else None,
-                loss_mask_device,
-                embedding_weight_device,
-            )
+                forward_args["loss_mask"] = torch.ones_like(input_ids)
 
         output_tensor = model(
             input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels,
             packed_seq_params=packed_seq_params, **forward_args
         )
-        logger.info(f"inner_forward_step model_done rank={self.worker.rank_info.rank}")
 
         if self.use_sequence_packing:
             cp_size = mpu.get_context_parallel_world_size()
@@ -1079,6 +1017,17 @@ class MegatronInferStrategy(InferenceStrategy):
 
         return loss, metrics
 
+
+@dataclass
+class SplitBatchResult:
+    """Result of splitting a batch into microbatches for training."""
+
+    microbatches: List[DataProto]
+    num_microbatches: int
+    # 1 for dynamic batching / sequence packing; per_device_train_batch_size otherwise.
+    micro_batch_size: int
+
+
 class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
     strategy_name = "megatron_train"
 
@@ -1089,16 +1038,28 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.processor = None
         self._validate_access_integrity = True
 
-        # ENG-123 Phase 4: sender-side cached buckets + promotion + selective sync.
+        # ---------- Versioned Bucket Cache for Selective Sync (Time-Sharing) ----------
+        # Design: after each train_step, weights are gathered across PP ranks into CPU
+        # buckets and stored in a versioned cache. Only one rank (pp0/dp0/tp0/cp0, the
+        # "cache owner") stores the buckets; other ranks participate in the PP collective
+        # but discard results. When selective_sync_active_cache is called, the cache
+        # owner replays the "active" version's buckets to inference workers via CUDA IPC
+        # (colocated) or NCCL broadcast (remote), avoiding a full model_update cycle.
+        #
+        # _latest_cached: version just built (may not yet be promoted)
+        # _active_cached: version promoted for the next selective sync
+        # GC policy: keep latest + active; evict everything else.
         self._cache_lock = threading.Lock()
         self._cache_map: Dict[int, List[Any]] = {}
         self._latest_cached: Optional[int] = None
         self._active_cached: Optional[int] = None
         self._selective_update_weights_meta = None
-        self._selective_sync_cpu_group = None
-        self._selective_sync_cpu_group_size: Optional[int] = None
+        # Single global cache owner: pp0/dp0/tp0/cp0 only; set during initialize().
+        self._is_cache_owner: bool = False
 
-        # Per-adapter versioned cache (multi-LoRA selective sync)
+        # Per-adapter versioned cache (multi-LoRA selective sync): same design as base
+        # cache but keyed by adapter name, so each adapter's LoRA weights can be synced
+        # independently at different versions.
         self._adapter_cache_map: Dict[str, Dict[int, List[Any]]] = {}
         self._latest_adapter_cached: Dict[str, Optional[int]] = {}
         self._active_adapter_cached: Dict[str, Optional[int]] = {}
@@ -1118,6 +1079,122 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         )
         self.forward_backward_func = get_forward_backward_func()
         self.model.config.finalize_model_grads_func = finalize_model_grads
+
+        # Capture unwrapped models before DDP replaces self.model.models.
+        self.models_unwrapped = self.model.get_models()
+
+        # LoRA detection: check both explicit adapter configs and the legacy lora_target field.
+        self.is_lora = (self.worker_config.model_args.adapters is not None) or \
+                       (getattr(self.worker_config.model_args, "lora_target", None) is not None)
+        # Multi-adapter discriminator: True only for RLix multi-adapter LoRA configs.
+        # Legacy single-LoRA (lora_target only, no adapters dict) uses train_step + shared optimizer.
+        self.has_multi_adapter = self.worker_config.model_args.adapters is not None
+
+        # --- Config validation: reject incompatible configs before DDP wrapping ---
+
+        # Read boolean flag; defaults to False when absent.
+        self.is_lora_optimizer_isolated: bool = bool(
+            self.worker_config.strategy_args.strategy_config.get("is_lora_optimizer_isolated", False)
+            if self.worker_config.strategy_args and self.worker_config.strategy_args.strategy_config
+            else False
+        )
+        # Multi-adapter requires isolated optimizers — one per adapter.
+        if self.has_multi_adapter and not self.is_lora_optimizer_isolated:
+            raise ValueError(
+                "model_args.adapters is configured but is_lora_optimizer_isolated is not set. "
+                "Set strategy_config.is_lora_optimizer_isolated=true."
+            )
+
+        if self.is_lora_optimizer_isolated:
+            if self.megatron_train_args.use_distributed_optimizer:
+                raise ValueError(
+                    "Isolated multi-adapter LoRA requires use_distributed_optimizer=False. "
+                    "Distributed optimizer shards state across ranks, which conflicts "
+                    "with per-adapter optimizer isolation."
+                )
+            if self.megatron_train_args.overlap_grad_reduce:
+                raise ValueError(
+                    "Isolated multi-adapter LoRA requires overlap_grad_reduce=False. "
+                    "With overlap_grad_reduce=True, idle adapters' DDP backward hooks "
+                    "never fire during another adapter's sequential pass, causing a "
+                    "hang in finish_grad_sync()."
+                )
+            if getattr(self.worker_config.model_args, "model_type", None) == "trl":
+                raise ValueError(
+                    "Isolated multi-adapter LoRA does not support TRL value-head models "
+                    "(model_type='trl'). Disable value head."
+                )
+
+        # --- Model-structure validation: needs instantiated model, not DDP ---
+        # When is_lora_optimizer_isolated=True, each adapter has its own optimizer.
+        # This requires every trainable parameter to belong to exactly one adapter.
+        # Shared trainable parameters (e.g., a value head not scoped to any adapter)
+        # would receive gradient updates from multiple optimizers, corrupting state.
+        #
+        # Example of VALID param names (adapter-scoped):
+        #   "layers.0.self_attn.q_proj.lora_A.adapter_A.weight"
+        #   "layers.0.self_attn.q_proj.lora_B.adapter_B.weight"
+        #
+        # Example of INVALID shared trainable (would cause error):
+        #   "v_head.weight"  # not scoped to any adapter → shared across optimizers
+        if self.is_lora_optimizer_isolated:
+            adapter_names = list(self.worker_config.model_args.adapters.keys())
+            if not adapter_names:
+                raise ValueError(
+                    "Multi-adapter LoRA requires at least one adapter in model_args.adapters"
+                )
+
+            # Activate all adapters so their LoRA params are marked trainable for inspection.
+            for model in self.models_unwrapped:
+                base_model = getattr(model, "base_model", None)
+                if base_model is not None and hasattr(base_model, "set_adapter"):
+                    base_model.set_adapter(adapter_names)
+
+            # Aggregate params from all chunks with a chunk-index prefix so names are unique.
+            # Virtual-pipeline chunks each hold different layers; the same local name (e.g.
+            # "layers.0.weight") can appear in multiple chunks, so the prefix is required.
+            name_to_param: Dict[str, torch.nn.Parameter] = {}
+            for chunk_idx, chunk_model in enumerate(self.models_unwrapped):
+                for param_name, param in chunk_model.named_parameters():
+                    name_to_param[f"chunk{chunk_idx}.{param_name}"] = param
+
+            original_requires_grad: Dict[str, bool] = {
+                n: bool(p.requires_grad) for n, p in name_to_param.items()
+            }
+
+            # Build adapter markers for name-matching. Example: {adapter_A: ".adapter_A.", ...}
+            markers = {adapter_name: f".{adapter_name}." for adapter_name in adapter_names}
+
+            # Find shared trainables: params that are trainable but not scoped to any adapter.
+            # A param is adapter-scoped if its name contains one of the markers (e.g., ".adapter_A.")
+            shared_trainables: List[str] = []
+            for name, param in name_to_param.items():
+                if not original_requires_grad[name]:
+                    # Skip frozen params — they don't participate in optimizer updates.
+                    continue
+                if not any(marker in name for marker in markers.values()):
+                    # Trainable but not adapter-scoped → shared across all adapters.
+                    shared_trainables.append(name)
+
+            if shared_trainables:
+                preview = ", ".join(repr(n) for n in shared_trainables[:10])
+                likely_value_head = any(
+                    ("v_head" in n or "value_head" in n) for n in shared_trainables
+                )
+                hint = (
+                    " This looks like a value head / TRL wrapper. Set model_type: ~ to disable."
+                    if likely_value_head
+                    else ""
+                )
+                raise ValueError(
+                    "Multi-adapter LoRA requires all trainable parameters to be "
+                    f"adapter-scoped (name must include one of: {sorted(markers.values())}). "
+                    f"Found shared trainables (first 10): {preview}. "
+                    "Freeze these parameters to use per-adapter optimizer mode."
+                    + hint
+                )
+
+        # --- DDP wrapping: all config and model-structure checks passed ---
         ddp_config = DistributedDataParallelConfig(
             grad_reduce_in_fp32=self.megatron_train_args.accumulate_allreduce_grads_in_fp32,
             overlap_grad_reduce=self.megatron_train_args.overlap_grad_reduce,
@@ -1134,30 +1211,15 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 # model chunks is overlapped with compute anyway.
                 disable_bucketing=(model_index > 0),
             )
-            for model_index, m in enumerate(self.model.get_models())
+            for model_index, m in enumerate(self.models_unwrapped)
         ]
-        self.models_unwrapped = self.model.get_models()
         self.model.models = self.models_wrapped
-        self.is_lora = (self.worker_config.model_args.adapters is not None) or \
-                       (getattr(self.worker_config.model_args, "lora_target", None) is not None)
 
         params_dtype = (
             torch.float16
             if self.megatron_train_args.fp16
             else torch.bfloat16 if self.megatron_train_args.bf16 else torch.float32
         )
-
-        # ---- lora_optimizer_mode: 'shared' (default) or 'per_adapter' ----
-        self.lora_optimizer_mode: str = (
-            self.worker_config.strategy_args.strategy_config.get("lora_optimizer_mode", "shared")
-            if self.worker_config.strategy_args and self.worker_config.strategy_args.strategy_config
-            else "shared"
-        )
-        if self.lora_optimizer_mode not in ("shared", "per_adapter"):
-            raise ValueError(
-                f"Unknown lora_optimizer_mode={self.lora_optimizer_mode!r} "
-                "(expected 'shared' | 'per_adapter')"
-            )
 
         optimizer_config = OptimizerConfig(
             optimizer=self.megatron_train_args.optimizer,
@@ -1170,110 +1232,30 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             fp16=self.megatron_train_args.fp16,
             bf16=self.megatron_train_args.bf16,
             params_dtype=params_dtype,
-            # per_adapter prototype requires non-distributed optimizer.
-            use_distributed_optimizer=(
-                False
-                if self.lora_optimizer_mode == "per_adapter"
-                else self.megatron_train_args.use_distributed_optimizer
-            ),
+            use_distributed_optimizer=self.megatron_train_args.use_distributed_optimizer,
             clip_grad=self.megatron_train_args.max_grad_norm,
         )
 
         self.adapter_optimizers: Dict[str, MegatronOptimizer] | None = None
         self.adapter_schedulers: Dict[str, Any] | None = None
 
-        if self.lora_optimizer_mode == "shared":
+        if not self.has_multi_adapter:
+            # Non-LoRA or legacy single-LoRA: single optimizer (upstream v0.2.0 path).
             self.optimizer: MegatronOptimizer = get_megatron_optimizer(optimizer_config, self.models_wrapped)
             logger.info(f"megatron optimizer: {self.optimizer}")
             bind_megatron_offload_states_func(optimizer=self.optimizer)
         else:
-            # ---- per_adapter mode: one optimizer + scheduler per adapter ----
-            if self.megatron_train_args.use_distributed_optimizer:
-                raise ValueError(
-                    "lora_optimizer_mode='per_adapter' requires use_distributed_optimizer=False"
-                )
-            if self.megatron_train_args.overlap_grad_reduce:
-                raise ValueError(
-                    "lora_optimizer_mode='per_adapter' requires overlap_grad_reduce=False. "
-                    "With overlap_grad_reduce=True, idle adapters' DDP backward hooks never fire "
-                    "during another adapter's sequential pass, causing a hang in finish_grad_sync()."
-                )
-            if not self.is_lora:
-                raise ValueError(
-                    "lora_optimizer_mode='per_adapter' requires LoRA adapters to be configured"
-                )
-            if getattr(self.worker_config.model_args, "model_type", None) == "trl":
-                raise ValueError(
-                    "lora_optimizer_mode='per_adapter' does not support TRL value-head models "
-                    "(model_type='trl'). Disable value head or use lora_optimizer_mode='shared'."
-                )
-
-            adapter_names = list(self.worker_config.model_args.adapters.keys())
-            if not adapter_names:
-                raise ValueError(
-                    "lora_optimizer_mode='per_adapter' requires at least one adapter"
-                )
-
-            # PEFT activates trainability only for the currently active adapter.
-            # For per-adapter optimizer construction we need a stable snapshot where
-            # *all* adapters' LoRA params are considered trainable.
-            for model in self.models_unwrapped:
-                base_model = getattr(model, "base_model", None)
-                if base_model is not None and hasattr(base_model, "set_adapter"):
-                    base_model.set_adapter(adapter_names)
-
-            # Verify all trainable params are adapter-scoped (no shared trainables like a value head).
-            name_to_param: Dict[str, torch.nn.Parameter] = dict(
-                self.models_unwrapped[0].named_parameters()
-            )
-            original_requires_grad: Dict[str, bool] = {
-                n: bool(p.requires_grad) for n, p in name_to_param.items()
-            }
-            markers = {a: f".{a}." for a in adapter_names}
-
-            shared_trainables: List[str] = []
-            for name, param in name_to_param.items():
-                if not original_requires_grad[name]:
-                    continue
-                if not any(marker in name for marker in markers.values()):
-                    shared_trainables.append(name)
-            if shared_trainables:
-                preview = ", ".join(repr(n) for n in shared_trainables[:10])
-                likely_value_head = any(
-                    ("v_head" in n or "value_head" in n) for n in shared_trainables
-                )
-                hint = (
-                    " This looks like a value head / TRL wrapper. Set model_type: ~ to disable."
-                    if likely_value_head
-                    else ""
-                )
-                raise ValueError(
-                    "lora_optimizer_mode='per_adapter' requires all trainable parameters to be "
-                    f"adapter-scoped (name must include one of: {sorted(markers.values())}). "
-                    f"Found shared trainables (first 10): {preview}. "
-                    "Either freeze these parameters or use lora_optimizer_mode='shared'."
-                    + hint
-                )
-
-            # Check that BN/LN running-stats buffers are adapter-scoped (plan item 16).
-            # These buffers have requires_grad=False so they are NOT caught by the param check above.
-            _NORM_BUFFER_TAGS = ("running_mean", "running_var", "num_batches_tracked")
-            shared_norm_buffers: List[str] = [
-                name
-                for name, _ in self.models_unwrapped[0].named_buffers()
-                if any(tag in name for tag in _NORM_BUFFER_TAGS)
-                and not any(marker in name for marker in markers.values())
-            ]
-            if shared_norm_buffers:
-                preview = ", ".join(repr(n) for n in shared_norm_buffers[:10])
-                raise ValueError(
-                    "lora_optimizer_mode='per_adapter' requires BN/LN running-stats buffers to be "
-                    f"adapter-scoped (name must include one of: {sorted(markers.values())}). "
-                    f"Found shared norm buffers (first 10): {preview}. "
-                    "Wrap BN/LN layers in nn.ModuleDict keyed by adapter name."
-                )
+            # ---- Isolated mode: one optimizer + scheduler per adapter ----
+            # adapter_names, name_to_param, original_requires_grad, markers already
+            # computed during model-structure validation above.
 
             def _apply_trainability_mask_for_adapter(active_adapter: str) -> None:
+                """Freeze all params except this adapter's LoRA weights.
+
+                Used before ``get_megatron_optimizer`` so the optimizer only captures
+                parameters that belong to ``active_adapter``. The trainability mask
+                is restored after all per-adapter optimizers are constructed.
+                """
                 marker = markers[active_adapter]
                 for n, p in name_to_param.items():
                     p.requires_grad_(bool(original_requires_grad[n] and (marker in n)))
@@ -1283,10 +1265,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             param_id_to_name = {id(p): n for n, p in name_to_param.items()}
             seen_param_ids: Set[int] = set()
             for adapter_name in adapter_names:
-                self.models_unwrapped[0].set_adapter(adapter_name)
+                # Activate the current adapter on every chunk so PEFT routes forward
+                # correctly; chunk 0 alone is not sufficient for virtual-pipeline models.
+                for chunk_model in self.models_unwrapped:
+                    chunk_model.set_adapter(adapter_name)
                 _apply_trainability_mask_for_adapter(adapter_name)
                 adapter_opt = get_megatron_optimizer(optimizer_config, self.models_wrapped)
-                bind_megatron_offload_states_func(optimizer=adapter_opt)
+                # bind_megatron_offload_states_func is deferred to the ChainedOptimizer
+                # call below (line ~1306), which recursively binds all sub-optimizers.
 
                 # Assert optimizer param ownership is isolated to this adapter.
                 marker = markers[adapter_name]
@@ -1323,19 +1309,30 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             for n, p in name_to_param.items():
                 p.requires_grad_(original_requires_grad[n])
 
-            # Chained optimizer for generic offload/load hooks.
+            # ChainedOptimizer wraps all per-adapter optimizers so that generic
+            # offload/reload/state_dict calls (which expect a single self.optimizer)
+            # fan out to every adapter optimizer transparently.
+            # Tradeoff: all-or-nothing handling means all adapters are reloaded/offloaded together,
+            # even when train_step_lora() only trains one adapter at a time.
+            # fixme(tao) HACK can we do lora granular swap of optimizer?
+            # Each sub-optimizer already has reload_states/offload_states bound by
+            # bind_megatron_offload_states_func, so adapter_optimizers[adapter_name].reload_states()
+            # would work mechanically — but train_step_lora still calls self.load_states()/
+            # self.offload_states() which go through ChainedOptimizer and swap all adapters.
             from megatron.core.optimizer import ChainedOptimizer
             self.optimizer = ChainedOptimizer(list(self.adapter_optimizers.values()))
             bind_megatron_offload_states_func(optimizer=self.optimizer)
 
             # Initialize per-adapter RNG states for sequential training (plan item 15).
             # Each adapter starts from the current global RNG state; they diverge as training progresses.
+            # Includes Megatron TP CUDA RNG tracker for deterministic TP-parallel dropout per adapter.
             self.adapter_rng_states: Dict[str, Dict[str, Any]] = {
                 name: {
                     "cpu": torch.get_rng_state(),
                     "cuda": torch.cuda.get_rng_state(),
                     "python": random.getstate(),
                     "numpy": np.random.get_state(),
+                    "rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states(),
                 }
                 for name in adapter_names
             }
@@ -1349,6 +1346,14 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.worker.rank_info.cp_size = mpu.get_context_parallel_world_size()
         self.worker.rank_info.cp_rank = mpu.get_context_parallel_rank()
 
+        # Single global cache owner: the unique rank with all parallel dimensions at 0.
+        self._is_cache_owner = (
+            mpu.get_pipeline_model_parallel_rank() == 0
+            and mpu.get_data_parallel_rank() == 0
+            and mpu.get_tensor_model_parallel_rank() == 0
+            and mpu.get_context_parallel_rank() == 0
+        )
+
         logger.info(f"max steps pipeline {self.worker_config.training_args.max_steps}")
         self.worker_config.training_args.max_steps = (
             self.worker_config.training_args.max_steps // self.worker.rank_info.dp_size
@@ -1358,7 +1363,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         # Per-adapter schedulers must use DP-adjusted max_steps. They were initially
         # created before dp_size was known, so rebuild here with the final step budget.
-        if self.lora_optimizer_mode == "per_adapter" and self.adapter_optimizers:
+        if self.has_multi_adapter and self.adapter_optimizers:
             self.adapter_schedulers = {
                 adapter_name: get_megatron_lr_scheduler(
                     self.megatron_train_args,
@@ -1403,55 +1408,32 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
     def train_step(self, batch: DataProto, loss_func: Callable):
         self.model.train()
-        logger.info(f"train_step start rank={self.worker.rank_info.rank} pp={self.worker.rank_info.pp_size}")
 
         global_step = batch.meta_info.get("global_step", 0)
-        is_offload_optimizer_states_in_train_step = batch.meta_info.get("is_offload_optimizer_states_in_train_step", True)
-        batch.meta_info['batch_num_tokens'] = self._get_batch_num_tokens(batch, dp_group=mpu.get_data_parallel_group())
-        batch.meta_info['global_valid_samples'] = self._get_global_valid_samples(batch, dp_group=mpu.get_data_parallel_group())
-
-        if self.worker_config.use_dynamic_batching_in_train:
-            micro_batches_list = list(make_micro_batch_iter_for_dynamic_batching(batch))
-            num_microbatches = batch.meta_info["num_micro_batchs"]
-            mini_batch_size = 1
-        elif self.use_sequence_packing:
-            vp_size = self.worker_config.strategy_args.strategy_config['virtual_pipeline_model_parallel_size']\
-                if 'virtual_pipeline_model_parallel_size' in self.worker_config.strategy_args.strategy_config else 1
-            micro_batches_list = list(make_micro_batch_iter_for_sequence_packing(batch, tp_size=self.worker.rank_info.tp_size,
-                                                                cp_size=self.worker.rank_info.cp_size,
-                                                                vp_size=vp_size, is_train=True,
-                                                                dp_group=mpu.get_data_parallel_group(with_context_parallel=True),
-                                                                micro_batch_size=self.worker_config.training_args.per_device_train_batch_size,
-                                                                                 config=self.worker_config.sequence_packing_args))
-            num_microbatches = micro_batches_list[0].meta_info["num_micro_batchs"]
-            mini_batch_size = 1
-        else:
-            mini_batch_size = self.worker_config.training_args.per_device_train_batch_size
-            num_microbatches = batch.batch.batch_size[0] // self.worker_config.training_args.per_device_train_batch_size
-            assert (
-                num_microbatches == self.megatron_train_args.gradient_accumulation_steps
-            ), f"num_microbatches={num_microbatches} gradient_accumulation_steps={self.megatron_train_args.gradient_accumulation_steps}"
-            micro_batches_list = batch.chunk(chunks=num_microbatches)
-
-        for micro_batch in micro_batches_list:
-            micro_batch.meta_info['loss_scale'] = num_microbatches * mpu.get_data_parallel_world_size()
-            micro_batch.meta_info['micro_batch_size'] = micro_batch.batch.batch_size[0]
-        logger.info(
-            f"train_step before fwd_bwd rank={self.worker.rank_info.rank} num_microbatches={num_microbatches}"
+        is_offload_optimizer_states_in_train_step = batch.meta_info.get(
+            "is_offload_optimizer_states_in_train_step", True
         )
 
-        data_iterator = [iter(micro_batches_list) for _ in range(len(self.model))]
+        # Shared: populate batch-level metadata.
+        self._ensure_train_batch_meta(batch)
 
-        metrics_tensors: List[Dict[str, "torch.Tensor"]] = self.forward_backward_func(
-            forward_step_func=partial(self.inner_forward_step, loss_func),
-            data_iterator=data_iterator,
-            model=self.model.get_models(),
-            num_microbatches=num_microbatches,
+        # Shared: split batch into microbatches.
+        split = self._split_batch_to_microbatches(batch)
+
+        # Shared: stamp loss_scale, micro_batch_size, batch_num_tokens, global_valid_samples.
+        self._annotate_microbatches_for_train(
+            split.microbatches, split.num_microbatches, batch.meta_info
+        )
+
+        # Shared: forward/backward passes.
+        # train_step always uses self.seq_length, even for sequence packing (current RLIX behavior).
+        metrics = self._run_forward_backward(
+            microbatches=split.microbatches,
+            loss_func=loss_func,
+            num_microbatches=split.num_microbatches,
+            micro_batch_size=split.micro_batch_size,
             seq_length=self.seq_length,
-            micro_batch_size=mini_batch_size,
-            forward_only=False,
         )
-        logger.info(f"train_step after fwd_bwd rank={self.worker.rank_info.rank}")
 
         # 只有step的时候需要load optimizer states
         self.load_states(include=[OffloadStateType.optimizer_states])
@@ -1465,23 +1447,179 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         else:
             raise NotImplementedError("megatron optimizer step failed!")
 
-        for model in self.model:
-            model.zero_grad_buffer()
-            # Offload/reload does not update cached_param_buffer_shard_list/cached_grad_buffer_shard_list,
-            # resulting using old params in `start_param_sync`, which leads to wrong results. So we clear the cache.
-            for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
-                if hasattr(bucket_group, "cached_param_buffer_shard_list"):
-                    bucket_group.cached_param_buffer_shard_list = [None] * len(bucket_group.buckets)
-                if hasattr(bucket_group, "cached_grad_buffer_shard_list"):
-                    bucket_group.cached_grad_buffer_shard_list = [None] * len(bucket_group.buckets)
-        self.optimizer.zero_grad()
-
-        metrics = {}
-        for mini_metrics in metrics_tensors:
-            append_to_dict(metrics, mini_metrics)
+        # Shared: zero grad buffers and optimizer state, then clear stale bucket caches.
+        self._zero_grad()
+        self._clear_bucket_caches()
 
         metrics.update({self.worker_config.name + "/" + "grad_norm": grad_norm})
+        self._collect_auxiliary_loss_metrics(metrics)
 
+        # Time-sharing: build a versioned bucket cache of the current weights.
+        # Promotion is NOT done here — the RLix pipeline calls
+        # promote_active_checkpoint explicitly after train_step to control which
+        # version is broadcast via selective_sync_active_cache.
+        if DO_TIME_SHARING:
+            checkpoint_version = int(batch.meta_info["checkpoint_version"])
+            self._build_latest_bucket_cache(checkpoint_version=checkpoint_version)
+        return metrics
+
+
+    # ------------------------------------------------------------------
+    # Shared helpers extracted from train_step (Changes 2-6)
+    # ------------------------------------------------------------------
+    def _zero_grad(self) -> None:
+        """Zero Megatron DDP grad buffers and optimizer grad state."""
+        for model in self.model:
+            model.zero_grad_buffer()
+        self.optimizer.zero_grad()
+
+    def _ensure_train_batch_meta(self, batch: DataProto) -> None:
+        """Populate batch_num_tokens and global_valid_samples on batch.meta_info.
+
+        Uses direct assignment matching train_step baseline.
+        DataProto.chunk()/make_iterator() share the same meta_info dict reference
+        across microbatches, so setdefault would preserve stale values from a
+        previous mini-batch iteration.
+        """
+        if batch.meta_info is None:
+            batch.meta_info = {}
+        batch.meta_info['batch_num_tokens'] = self._get_batch_num_tokens(
+            batch, dp_group=mpu.get_data_parallel_group()
+        )
+        batch.meta_info['global_valid_samples'] = self._get_global_valid_samples(
+            batch, dp_group=mpu.get_data_parallel_group()
+        )
+
+    def _split_batch_to_microbatches(
+        self,
+        batch: DataProto,
+    ) -> SplitBatchResult:
+        """Split a DataProto batch into microbatches for training.
+
+        Three splitting strategies, selected by worker config:
+        - Dynamic batching: variable-length microbatches via make_micro_batch_iter_for_dynamic_batching.
+        - Sequence packing: load-balanced packed partitions via make_micro_batch_iter_for_sequence_packing.
+        - Standard: equal-size chunks by per_device_train_batch_size, with
+          num_microbatches == gradient_accumulation_steps assertion.
+        """
+        if self.worker_config.use_dynamic_batching_in_train:
+            # Fail fast if upstream caller did not run dynamic_batching_shard() to prepare
+            # required batch metadata. See dynamic_batching.py:118.
+            if not batch.meta_info or "micro_batch_indices" not in batch.meta_info:
+                raise RuntimeError(
+                    "use_dynamic_batching_in_train requires batch metadata from "
+                    "dynamic_batching_shard(). Ensure the pipeline calls "
+                    "dynamic_batching_shard() before train_step/train_step_lora."
+                )
+            microbatches = list(make_micro_batch_iter_for_dynamic_batching(batch))
+            num_microbatches = batch.meta_info["num_micro_batchs"]
+            return SplitBatchResult(
+                microbatches=microbatches,
+                num_microbatches=num_microbatches,
+                micro_batch_size=1,
+            )
+
+        if self.use_sequence_packing:
+            vp_size = self.worker_config.strategy_args.strategy_config.get(
+                "virtual_pipeline_model_parallel_size", 1
+            )
+            microbatches = list(
+                make_micro_batch_iter_for_sequence_packing(
+                    batch,
+                    tp_size=self.worker.rank_info.tp_size,
+                    cp_size=self.worker.rank_info.cp_size,
+                    vp_size=vp_size,
+                    is_train=True,
+                    dp_group=mpu.get_data_parallel_group(with_context_parallel=True),
+                    micro_batch_size=self.worker_config.training_args.per_device_train_batch_size,
+                    config=self.worker_config.sequence_packing_args,
+                )
+            )
+            num_microbatches = microbatches[0].meta_info["num_micro_batchs"]
+            return SplitBatchResult(
+                microbatches=microbatches,
+                num_microbatches=num_microbatches,
+                micro_batch_size=1,
+            )
+
+        # Standard path: equal chunks by per_device_train_batch_size.
+        per_device_batch_size = self.worker_config.training_args.per_device_train_batch_size
+        total_batch_size = batch.batch.batch_size[0]
+        num_microbatches = total_batch_size // per_device_batch_size
+        assert num_microbatches == self.megatron_train_args.gradient_accumulation_steps, (
+            f"num_microbatches={num_microbatches} "
+            f"gradient_accumulation_steps={self.megatron_train_args.gradient_accumulation_steps}"
+        )
+        microbatches = batch.chunk(chunks=num_microbatches)
+        return SplitBatchResult(
+            microbatches=microbatches,
+            num_microbatches=num_microbatches,
+            micro_batch_size=per_device_batch_size,
+        )
+
+    def _annotate_microbatches_for_train(
+        self,
+        microbatches: List[DataProto],
+        num_microbatches: int,
+        batch_meta: Dict[str, Any],
+    ) -> None:
+        """Stamp loss_scale, micro_batch_size, and batch-level metadata on each microbatch.
+
+        loss_scale = num_microbatches * dp_world_size. This is the standard train_step
+        convention — inner_forward_step multiplies loss by this value to normalize
+        gradient accumulation across microbatches and data parallel ranks.
+        """
+        for micro_batch in microbatches:
+            if micro_batch.meta_info is None:
+                micro_batch.meta_info = {}
+            # Direct assignment for loss_scale and micro_batch_size, matching train_step
+            # baseline. These are always set fresh by the training step.
+            micro_batch.meta_info['loss_scale'] = num_microbatches * mpu.get_data_parallel_world_size()
+            micro_batch.meta_info['micro_batch_size'] = micro_batch.batch.batch_size[0]
+            # setdefault for batch-level metadata that may already be populated.
+            micro_batch.meta_info.setdefault("batch_num_tokens", batch_meta.get("batch_num_tokens"))
+            micro_batch.meta_info.setdefault("global_valid_samples", batch_meta.get("global_valid_samples"))
+
+    def _run_forward_backward(
+        self,
+        microbatches: List[DataProto],
+        loss_func: Callable,
+        num_microbatches: int,
+        micro_batch_size: int,
+        seq_length: int,
+    ) -> Dict[str, Any]:
+        """Run forward/backward passes on explicit microbatch list. Does NOT step optimizer.
+
+        Builds the data_iterator from the provided microbatch list and calls
+        forward_backward_func. Does not re-split — the microbatch list is used as-is,
+        preserving packed partition boundaries for sequence packing.
+
+        Loss scaling is handled by _annotate_microbatches_for_train which stamps
+        loss_scale = num_microbatches * dp_world_size on each microbatch. The
+        inner_forward_step loss_wrapper applies this scale.
+        """
+        data_iterator = [iter(microbatches) for _ in range(len(self.model))]
+        metrics_tensors: List[Dict[str, "torch.Tensor"]] = self.forward_backward_func(
+            forward_step_func=partial(self.inner_forward_step, loss_func),
+            data_iterator=data_iterator,
+            model=self.model.get_models(),
+            num_microbatches=num_microbatches,
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            forward_only=False,
+        )
+
+        metrics: Dict[str, Any] = {}
+        for mini_metrics in metrics_tensors:
+            append_to_dict(metrics, mini_metrics)
+        return metrics
+
+    def _collect_auxiliary_loss_metrics(self, metrics: Dict[str, Any]) -> None:
+        """Collect MoE and MTP auxiliary loss metrics after a training step.
+
+        Called by both train_step and train_step_lora to ensure auxiliary losses
+        are always reported regardless of training path.
+        """
         if self.model.config.num_moe_experts is not None and self.model.config.num_moe_experts > 1:
             reduce_aux_losses_tracker_across_ranks()
             tracker = get_moe_layer_wise_logging_tracker()
@@ -1494,412 +1632,139 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             metrics.update(moe_losses)
 
         if self.model.config.mtp_num_layers is not None and self.model.config.mtp_num_layers > 0:
-            mtp_total_loss_dict = {}
+            mtp_total_loss_dict: Dict[str, Any] = {}
             MTPLossLoggingHelper.reduce_loss_in_tracker()
             tracker = MTPLossLoggingHelper.tracker
             if "values" in tracker:
                 loss_scale = 1 / self.megatron_train_args.gradient_accumulation_steps
                 mtp_losses = tracker["values"] * loss_scale
                 mtp_num_layers = mtp_losses.shape[0]
-                for i in range(mtp_num_layers):
-                    name = self.worker_config.name + "/" + f"mtp_{i+1} loss"
-                    mtp_total_loss_dict[name] = mtp_losses[i].item()
+                for layer_idx in range(mtp_num_layers):
+                    name = self.worker_config.name + "/" + f"mtp_{layer_idx+1} loss"
+                    mtp_total_loss_dict[name] = mtp_losses[layer_idx].item()
                 MTPLossLoggingHelper.clean_loss_in_tracker()
                 metrics.update(mtp_total_loss_dict)
 
-        if DO_TIME_SHARING:
-            checkpoint_version = int(batch.meta_info.get("checkpoint_version", global_step))
-            self._build_latest_bucket_cache(checkpoint_version=checkpoint_version)
-            # fixme(tao) it need an if test, default to false, and only promt after cache explicitly  
-            # Ensure selective sync has a valid promoted cache for the next expand/broadcast.
-            self.promote_active_checkpoint(checkpoint_version=checkpoint_version)
-        return metrics
+    def _clear_bucket_caches(self) -> None:
+        """Clear cached param/grad buffer shard lists after optimizer step.
 
-    def model_update(self, model_update_name: str, adapters_to_update: list[str] | None = None):
-        # Forward optional adapter subset to weight updater for multi-LoRA selective sync.
-        return self.weight_updaters[model_update_name].model_update(adapters_to_update=adapters_to_update)
-
-    # ------------------------------------------------------------------
-    # Per-adapter multi-LoRA helpers (Phase 1 port)
-    # ------------------------------------------------------------------
-
-    def zero_grad(self) -> None:
-        """Zero Megatron DDP grad buffers and optimizer grad state."""
-        for model in self.model:
-            model.zero_grad_buffer()
-        self.optimizer.zero_grad()
-
-    def forward_backward_only(self, batch: DataProto, loss_func: Callable) -> dict:
+        Offload/reload does not update these caches, so stale params in
+        start_param_sync would lead to wrong results.
         """
-        Run forward/backward to accumulate gradients but do NOT optimizer.step().
+        for model in self.model:
+            for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
+                if hasattr(bucket_group, "cached_param_buffer_shard_list"):
+                    bucket_group.cached_param_buffer_shard_list = [None] * len(bucket_group.buckets)
+                if hasattr(bucket_group, "cached_grad_buffer_shard_list"):
+                    bucket_group.cached_grad_buffer_shard_list = [None] * len(bucket_group.buckets)
 
-        Supports ``batch.meta_info["num_microbatches_override"]`` to bypass the
-        default ``gradient_accumulation_steps`` check (needed for per-adapter
-        one-microbatch-at-a-time accumulation).
+    def train_step_lora(self, batch: DataProto, loss_func: Callable) -> dict:
+        """Single-adapter-per-call LoRA training step.
 
-        ``batch.meta_info["grad_accumulation_loss_scale"]`` (optional float) is
-        applied as a pre-multiplier on the loss before backward so that several
-        forward_backward_only calls can be composed into a single effective step.
+        Callers guarantee exactly one adapter per call. The adapter's per-adapter
+        optimizer and scheduler are stepped independently.
         """
         self.model.train()
 
-        if self.worker_config.use_dynamic_batching_in_train:
-            raise RuntimeError("forward_backward_only does not support dynamic batching in train.")
-        if batch.meta_info is None:
-            batch.meta_info = {}
-        batch.meta_info.setdefault(
-            "batch_num_tokens", self._get_batch_num_tokens(batch, dp_group=mpu.get_data_parallel_group())
-        )
-        batch.meta_info.setdefault(
-            "global_valid_samples", self._get_global_valid_samples(batch, dp_group=mpu.get_data_parallel_group())
-        )
-
-        mini_batch_size = self.worker_config.training_args.per_device_train_batch_size
-        override = batch.meta_info.get("num_microbatches_override", None) if batch.meta_info else None
-        if override is None:
-            num_microbatches = batch.batch.batch_size[0] // mini_batch_size
-            assert (
-                num_microbatches == self.megatron_train_args.gradient_accumulation_steps
-            ), (
-                f"num_microbatches={num_microbatches} gradient_accumulation_steps="
-                f"{self.megatron_train_args.gradient_accumulation_steps}"
+        if not self.is_lora_optimizer_isolated:
+            raise RuntimeError(
+                "train_step_lora requires model_args.adapters. "
+                "Legacy (lora_target only) should use train_step."
             )
-            micro_batches_list = batch.chunk(chunks=num_microbatches)
-        else:
-            num_microbatches = int(override)
-            if num_microbatches <= 0:
-                raise ValueError(f"num_microbatches_override must be > 0, got {override!r}")
-            if num_microbatches == 1:
-                micro_batches_list = [batch]
-            else:
-                micro_batches_list = batch.chunk(chunks=num_microbatches)
 
-        if self.use_sequence_packing:
-            mini_batch_size = 1
-            self.max_packed_len = self._get_max_packed_len(micro_batches_list)
-
-        # Optionally populate batch_num_tokens so loss_func can use it.
-        for mb in micro_batches_list:
-            if mb.meta_info is None:
-                mb.meta_info = {}
-            mb.meta_info.setdefault(
-                "loss_scale", num_microbatches * mpu.get_data_parallel_world_size()
+        if self.adapter_optimizers is None or self.adapter_schedulers is None:
+            raise RuntimeError(
+                "train_step_lora requires adapter_optimizers/adapter_schedulers "
+                "to be initialized"
             )
-            mb.meta_info.setdefault("micro_batch_size", mb.batch.batch_size[0])
-            mb.meta_info.setdefault("batch_num_tokens", batch.meta_info["batch_num_tokens"])
-            mb.meta_info.setdefault("global_valid_samples", batch.meta_info["global_valid_samples"])
 
-        loss_scale = (
-            batch.meta_info.get("grad_accumulation_loss_scale", None)
-            if batch.meta_info
-            else None
+        # Shared: populate batch-level metadata.
+        self._ensure_train_batch_meta(batch)
+
+        # Shared: split batch into microbatches (same contract as train_step).
+        split = self._split_batch_to_microbatches(batch)
+        microbatches = split.microbatches
+
+        # Shared: stamp loss_scale, micro_batch_size, batch_num_tokens, global_valid_samples.
+        # loss_scale = num_microbatches * dp_world_size, matching train_step semantics.
+        self._annotate_microbatches_for_train(
+            microbatches, split.num_microbatches, batch.meta_info
         )
-        if loss_scale is not None:
-            loss_scale = float(loss_scale)
-            if loss_scale <= 0:
-                raise ValueError(f"grad_accumulation_loss_scale must be > 0, got {loss_scale}")
 
-            def scaled_loss_func(data: DataProto, output_tensor: torch.Tensor):
-                out = loss_func(data, output_tensor)
-                if not isinstance(out, tuple):
-                    raise TypeError(f"loss_func must return a tuple, got {type(out)}")
-                if len(out) == 2:
-                    raw_loss, metrics = out
-                    return raw_loss * loss_scale, metrics
-                if len(out) == 3:
-                    raw_loss, num_tokens, metrics = out
-                    return raw_loss * loss_scale, num_tokens, metrics
-                raise TypeError(
-                    f"loss_func returned a {len(out)}-tuple; expected 2 or 3 elements"
+        # LoRA-specific: resolve adapter name from non_tensor_batch.
+        # resolve_microbatch_lora_name validates homogeneity within each microbatch.
+        # All callers set lora_name via non_tensor_batch (pipeline routing).
+        adapter_name = resolve_microbatch_lora_name(microbatches[0].non_tensor_batch).lora_name
+        # Validate all microbatches target the same adapter (single-adapter-per-call contract).
+        for mb_idx, mb in enumerate(microbatches[1:], start=1):
+            mb_adapter = resolve_microbatch_lora_name(mb.non_tensor_batch).lora_name
+            if mb_adapter != adapter_name:
+                raise ValueError(
+                    f"train_step_lora expects single adapter per call, but microbatch[{mb_idx}] "
+                    f"has adapter={mb_adapter!r}, expected {adapter_name!r}"
                 )
 
-            effective_loss_func = scaled_loss_func
-        else:
-            effective_loss_func = loss_func
-
-        data_iterator = [iter(micro_batches_list) for _ in range(len(self.model))]
-        metrics_tensors: List[Dict[str, "torch.Tensor"]] = self.forward_backward_func(
-            forward_step_func=partial(self.inner_forward_step, effective_loss_func),
-            data_iterator=data_iterator,
-            model=self.model.get_models(),
-            num_microbatches=num_microbatches,
-            seq_length=self.seq_length if not self.use_sequence_packing else self.max_packed_len,
-            micro_batch_size=mini_batch_size,
-            forward_only=False,
+        is_offload_optimizer_states_in_train_step = bool(
+            batch.meta_info.get("is_offload_optimizer_states_in_train_step", True)
         )
 
-        metrics: dict = {}
-        for mini_metrics in metrics_tensors:
-            append_to_dict(metrics, mini_metrics)
-        return metrics
+        opt = self.adapter_optimizers.get(adapter_name)
+        sch = self.adapter_schedulers.get(adapter_name)
+        if opt is None or sch is None:
+            raise RuntimeError(f"Missing optimizer/scheduler for adapter {adapter_name!r}")
 
-    def optimizer_step_only(
-        self, *, adapter_name: str | None = None, batch_meta: dict | None = None
-    ) -> dict:
-        """
-        Perform optimizer.step() + scheduler.step() + zero_grad assuming gradients are already
-        accumulated via forward_backward_only().
-
-        When ``adapter_name`` is provided (per_adapter mode), only that adapter's
-        optimizer is stepped. Otherwise the shared optimizer is used.
-        """
-        if self.lora_optimizer_mode == "per_adapter" and adapter_name is None:
-            raise RuntimeError(
-                "optimizer_step_only requires adapter_name when lora_optimizer_mode='per_adapter'"
-            )
-        if self.lora_optimizer_mode == "shared" and adapter_name is not None:
-            raise RuntimeError(
-                "optimizer_step_only: adapter_name must be None for lora_optimizer_mode='shared'"
-            )
-
-        is_offload = True
-        if batch_meta is not None:
-            is_offload = bool(batch_meta.get("is_offload_optimizer_states_in_train_step", True))
-
-        if adapter_name is not None:
-            opt = self.adapter_optimizers[adapter_name]
-            sch = self.adapter_schedulers[adapter_name]
-        else:
-            opt = self.optimizer
-            sch = self.scheduler
-
+        # LoRA-specific: restore adapter RNG state (including TP CUDA RNG tracker for dropout).
         self.load_states(include=[OffloadStateType.optimizer_states])
-        grad_norm_unclip = opt.get_grad_norm()
-        update_successful, grad_norm, _num_zeros_in_grad = opt.step()
-        if is_offload:
-            self.offload_states(include=[OffloadStateType.optimizer_states], non_blocking=True)
+        rng = self.adapter_rng_states[adapter_name]
+        torch.set_rng_state(rng["cpu"])
+        torch.cuda.set_rng_state(rng["cuda"])
+        random.setstate(rng["python"])
+        np.random.set_state(rng["numpy"])
+        tensor_parallel.get_cuda_rng_tracker().set_states(rng["rng_tracker_states"])
 
+        # Shared: forward/backward passes (same call signature as train_step).
+        metrics = self._run_forward_backward(
+            microbatches=microbatches,
+            loss_func=loss_func,
+            num_microbatches=split.num_microbatches,
+            micro_batch_size=split.micro_batch_size,
+            seq_length=self.seq_length,
+        )
+
+        # LoRA-specific: save adapter RNG state (including TP CUDA RNG tracker for dropout).
+        self.adapter_rng_states[adapter_name] = {
+            "cpu": torch.get_rng_state(),
+            "cuda": torch.cuda.get_rng_state(),
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states(),
+        }
+
+        # LoRA-specific: per-adapter optimizer step.
+        update_successful, grad_norm, _ = opt.step()
         if update_successful:
             sch.step()
         else:
             raise NotImplementedError("megatron optimizer step failed!")
 
-        for model in self.model:
-            model.zero_grad_buffer()
-        self.optimizer.zero_grad()
+        # Shared: zero grad buffers and optimizer state, then clear stale bucket caches.
+        self._zero_grad()
+        self._clear_bucket_caches()
 
-        prefix = self.worker_config.name
-        name_prefix = f"{prefix}/{adapter_name}" if adapter_name else prefix
-        return {
-            f"{name_prefix}/grad_norm": grad_norm,
-            f"{name_prefix}/grad_norm_unclip": grad_norm_unclip,
-        }
-
-    def train_step_lora(self, batch_or_microbatches: Any, loss_func: Callable) -> dict:
-        """
-        LoRA training step with two possible modes.
-
-        - ``lora_optimizer_mode='shared'``: accumulate gradients across all
-          microbatches then do one optimizer step (existing shared semantics).
-        - ``lora_optimizer_mode='per_adapter'``: per-adapter optimizer + scheduler
-          state; one optimizer step per adapter that appears in this call.
-          A single call with N adapters is equivalent to N separate single-adapter
-          calls — the key correctness claim of adapter isolation.
-
-        Adapter routing requires ``non_tensor_batch["lora_name"]`` as the
-        canonical key; the legacy ``domain`` fallback is removed.
-        """
-        if not self.is_lora:
-            raise RuntimeError(
-                "train_step_lora called but LoRA is not enabled for this strategy."
+        # Time-sharing: build per-adapter bucket cache while GPU weights are still resident.
+        # Must run before offload_states moves weights to CPU.
+        # Promotion is NOT done here — the pipeline calls promote methods explicitly.
+        if DO_TIME_SHARING:
+            checkpoint_version = int(batch.meta_info["checkpoint_version"])
+            self._build_latest_bucket_cache(
+                checkpoint_version=checkpoint_version,
+                adapter_name=adapter_name,
             )
 
-        def _merge_metrics(dst: Dict[str, Any], src: Dict[str, Any]) -> None:
-            # Keep train_step_lora metric shapes consistent with train_step: values are flat lists.
-            for key, val in src.items():
-                if key not in dst:
-                    dst[key] = []
-                if isinstance(val, list):
-                    dst[key].extend(val)
-                else:
-                    dst[key].append(val)
-
-        # ----------------------------------------------------------------
-        # Shared mode: forward existing train_step logic via forward/backward
-        # ----------------------------------------------------------------
-        if self.lora_optimizer_mode == "shared":
-            if isinstance(batch_or_microbatches, list):
-                if len(batch_or_microbatches) == 0:
-                    raise ValueError("train_step_lora(shared) received empty microbatch list")
-                self.zero_grad()
-                loss_scale = 1.0 / len(batch_or_microbatches)
-                metrics: Dict[str, Any] = {}
-                for mb in batch_or_microbatches:
-                    if mb.meta_info is None:
-                        mb.meta_info = {}
-                    mb.meta_info.setdefault("num_microbatches_override", 1)
-                    mb.meta_info.setdefault("grad_accumulation_loss_scale", loss_scale)
-                    _merge_metrics(metrics, self.forward_backward_only(mb, loss_func))
-                _merge_metrics(
-                    metrics, self.optimizer_step_only(batch_meta=batch_or_microbatches[0].meta_info)
-                )
-                return metrics
-            self.zero_grad()
-            metrics = self.forward_backward_only(batch_or_microbatches, loss_func)
-            _merge_metrics(metrics, self.optimizer_step_only(batch_meta=batch_or_microbatches.meta_info))
-            return metrics
-
-        # ----------------------------------------------------------------
-        # Per-adapter mode
-        # ----------------------------------------------------------------
-        if self.adapter_optimizers is None or self.adapter_schedulers is None:
-            raise RuntimeError(
-                "train_step_lora(per_adapter) requires adapter_optimizers/adapter_schedulers "
-                "to be initialized"
-            )
-
-        if isinstance(batch_or_microbatches, list):
-            microbatches = batch_or_microbatches
-        else:
-            if self.worker_config.use_dynamic_batching_in_train:
-                raise RuntimeError(
-                    "train_step_lora(per_adapter) does not support dynamic batching in train."
-                )
-            micro_batch_size = self.worker_config.training_args.per_device_train_batch_size
-            if batch_or_microbatches.batch.batch_size[0] % micro_batch_size != 0:
-                raise RuntimeError(
-                    f"batch_size {batch_or_microbatches.batch.batch_size[0]} must be divisible "
-                    f"by micro_batch_size {micro_batch_size}"
-                )
-            num_microbatches = batch_or_microbatches.batch.batch_size[0] // micro_batch_size
-            microbatches = batch_or_microbatches.chunk(chunks=num_microbatches)
-        # Root-cause tracing: log once before per-adapter grouping/chunking.
-        if not getattr(self, "_logged_lora_train_step_once", False):
-            if not microbatches:
-                logger.info("[device_trace][strategy/train_step_lora] microbatches=0")
-            else:
-                first_mb = microbatches[0]
-                if first_mb.batch is not None and "input_ids" in first_mb.batch:
-                    logger.info(
-                        "[device_trace][strategy/train_step_lora] mb_count=%s first_input_ids_device=%s",
-                        len(microbatches),
-                        first_mb.batch["input_ids"].device,
-                    )
-            self._logged_lora_train_step_once = True
-
-        first_meta = (
-            microbatches[0].meta_info if microbatches and microbatches[0].meta_info else {}
-        )
-        is_offload_optimizer_states_in_train_step = bool(
-            first_meta.get("is_offload_optimizer_states_in_train_step", True)
-        )
-
-        # Group microbatches by adapter (preserve encounter order for adapter ordering).
-        adapters_in_order: List[str] = []
-        adapter_to_mbs: Dict[str, List] = {}
-        for mb in microbatches:
-            if mb.non_tensor_batch:
-                routing = resolve_microbatch_lora_name(mb.non_tensor_batch)
-                adapter_name = routing.lora_name
-            else:
-                adapter_name = mb.meta_info.get("lora_name") if mb.meta_info is not None else None
-                if not isinstance(adapter_name, str) or not adapter_name:
-                    raise RuntimeError(
-                        "Missing LoRA routing key for microbatch. "
-                        "Expected non_tensor_batch['lora_name'] or meta_info['lora_name']."
-                    )
-            if adapter_name not in adapter_to_mbs:
-                adapters_in_order.append(adapter_name)
-                adapter_to_mbs[adapter_name] = []
-            adapter_to_mbs[adapter_name].append(mb)
-
-        metrics: Dict[str, Any] = {}
-
-        # Sequential per-adapter loop (plan item 15): for each adapter, restore its RNG state,
-        # run forward/backward for its microbatches, save its RNG state, then step its optimizer.
-        # This guarantees RNG isolation between adapters (dropout masks are deterministic per-adapter).
-        # Requires overlap_grad_reduce=False (checked at init): finalize_model_grads() does a
-        # synchronous all-reduce that safely handles zero grads for idle adapters — no DDP hang.
-        self.load_states(include=[OffloadStateType.optimizer_states])
-        for adapter_name in adapters_in_order:
-            opt = self.adapter_optimizers.get(adapter_name)
-            sch = self.adapter_schedulers.get(adapter_name)
-            if opt is None or sch is None:
-                raise RuntimeError(f"Missing optimizer/scheduler for adapter {adapter_name!r}")
-
-            # Restore this adapter's RNG state before forward passes.
-            rng = self.adapter_rng_states[adapter_name]
-            torch.set_rng_state(rng["cpu"])
-            torch.cuda.set_rng_state(rng["cuda"])
-            random.setstate(rng["python"])
-            np.random.set_state(rng["numpy"])
-
-            # Forward/backward for this adapter's microbatches only.
-            self.zero_grad()
-            adapter_mbs = adapter_to_mbs[adapter_name]
-            count = len(adapter_mbs)
-            # Debugging aid: verify per-adapter microbatch tensor devices before forward/backward.
-            if count > 0 and adapter_mbs[0].batch is not None:
-                first_mb = adapter_mbs[0]
-                pos_ids = first_mb.batch.get("position_ids", None)
-                logger.info(
-                    "[device_trace][train_step_lora/per_adapter_first_mb] rank=%s adapter=%s count=%s input_ids=%s attention_mask=%s position_ids=%s",
-                    self.worker.rank_info.rank,
-                    adapter_name,
-                    count,
-                    first_mb.batch["input_ids"].device if "input_ids" in first_mb.batch else None,
-                    first_mb.batch["attention_mask"].device if "attention_mask" in first_mb.batch else None,
-                    pos_ids.device if isinstance(pos_ids, torch.Tensor) else None,
-                )
-            logger.info(
-                f"train_step_lora(per_adapter) adapter={adapter_name} microbatches={count} "
-                f"pp={self.worker.rank_info.pp_size} rank={self.worker.rank_info.rank}"
-            )
-            if self.worker.rank_info.pp_size > 1 and count > 1:
-                merged = DataProto.concat(adapter_mbs)
-                if merged.meta_info is None:
-                    merged.meta_info = {}
-                merged.meta_info["num_microbatches_override"] = count
-                merged.meta_info["grad_accumulation_loss_scale"] = 1.0 / float(count)
-                _merge_metrics(metrics, self.forward_backward_only(merged, loss_func))
-            else:
-                for mb in adapter_mbs:
-                    if mb.meta_info is None:
-                        mb.meta_info = {}
-                    mb.meta_info["num_microbatches_override"] = 1
-                    mb.meta_info["grad_accumulation_loss_scale"] = 1.0 / float(count)
-                    _merge_metrics(metrics, self.forward_backward_only(mb, loss_func))
-            logger.info(
-                f"train_step_lora(per_adapter) adapter={adapter_name} forward_backward_done "
-                f"rank={self.worker.rank_info.rank}"
-            )
-
-            # Save this adapter's RNG state after its forward passes.
-            self.adapter_rng_states[adapter_name] = {
-                "cpu": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state(),
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-            }
-
-            grad_norm_unclip = opt.get_grad_norm()
-            update_successful, grad_norm, _ = opt.step()
-            if update_successful:
-                sch.step()
-            else:
-                raise NotImplementedError("megatron optimizer step failed!")
-            logger.info(
-                f"train_step_lora(per_adapter) adapter={adapter_name} optimizer_step_done "
-                f"rank={self.worker.rank_info.rank}"
-            )
-
-            # Mirror train_step (lines 1337-1341): clear bucket caches after each adapter step.
-            # Offload/reload does not update cached_param_buffer_shard_list/cached_grad_buffer_shard_list;
-            # stale caches cause wrong params in start_param_sync (relevant when use_distributed_optimizer=True).
-            for m in self.model:
-                for bucket_group in m.bucket_groups + m.expert_parallel_bucket_groups:
-                    if hasattr(bucket_group, "cached_param_buffer_shard_list"):
-                        bucket_group.cached_param_buffer_shard_list = [None] * len(bucket_group.buckets)
-                    if hasattr(bucket_group, "cached_grad_buffer_shard_list"):
-                        bucket_group.cached_grad_buffer_shard_list = [None] * len(bucket_group.buckets)
-
-            _merge_metrics(
-                metrics,
-                {
-                    f"{self.worker_config.name}/{adapter_name}/grad_norm": grad_norm,
-                    f"{self.worker_config.name}/{adapter_name}/grad_norm_unclip": grad_norm_unclip,
-                },
-            )
+        metrics.update({
+            f"{self.worker_config.name}/{adapter_name}/grad_norm": grad_norm,
+        })
+        self._collect_auxiliary_loss_metrics(metrics)
 
         if is_offload_optimizer_states_in_train_step:
             self.offload_states(include=[OffloadStateType.optimizer_states], non_blocking=True)
@@ -1911,8 +1776,20 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         return metrics
 
+    def model_update(self, model_update_name: str, adapters_to_update: list[str] | None = None):
+        # Forward optional adapter subset to weight updater for multi-LoRA selective sync.
+        return self.weight_updaters[model_update_name].model_update(adapters_to_update=adapters_to_update)
+
+
     def get_lora_tensors(self, adapter_name: str) -> Dict[str, torch.Tensor]:
-        """Return a CPU copy of all LoRA parameter tensors for *adapter_name*."""
+        """Return a CPU copy of all LoRA parameter tensors for *adapter_name*.
+
+        Reads parameters from models_unwrapped[0] (TP/DP ranks share identical
+        LoRA weights, so rank 0 is sufficient).
+
+        Note: used only by integration tests for weight inspection and snapshot
+        comparison. Not called in any production pipeline.
+        """
         if not self.is_lora:
             raise RuntimeError(
                 "get_lora_tensors called but LoRA is not enabled for this strategy."
@@ -1934,7 +1811,15 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
     def set_lora_tensors(
         self, *, adapter_name: str, tensors: Dict[str, torch.Tensor]
     ) -> int:
-        """Overwrite the LoRA parameters for *adapter_name* with *tensors* (in-place)."""
+        """Overwrite the LoRA parameters for *adapter_name* with *tensors* (in-place).
+
+        Also refreshes the optimizer's FP32 main-param copies via
+        ``optimizer.reload_model_params()`` so the next step starts from the
+        updated weights, not stale copies.
+
+        Note: used only by integration tests to reset adapter weights to a known
+        state before a reference run. Not called in any production pipeline.
+        """
         if not self.is_lora:
             raise RuntimeError(
                 "set_lora_tensors called but LoRA is not enabled for this strategy."
@@ -1968,14 +1853,24 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 "check naming and tensor keys."
             )
 
-        # Megatron mixed-precision optimizers keep FP32 "main params" copies of BF16/FP16
-        # model weights. Since we just mutated model params in-place, refresh the main params
-        # so the next optimizer.step() starts from the updated weights.
+        # Sync BF16 model params → FP32 main params.
+        # Megatron's mixed-precision optimizers keep a separate FP32 "main params" copy of
+        # BF16/FP16 model weights and use it as the authoritative source in optimizer.step().
+        # We just mutated the BF16 side directly (bypassing the optimizer), so push those
+        # changes into FP32 now — otherwise the next step() would overwrite our writes.
         self.optimizer.reload_model_params()
         return copied
 
     def copy_lora_params(self, *, src_adapter: str, dst_adapter: str) -> int:
-        """Copy LoRA parameters in-place from *src_adapter* to *dst_adapter*."""
+        """Copy LoRA parameters in-place from *src_adapter* to *dst_adapter*.
+
+        Matches source parameter names to destination names by substituting the
+        adapter marker (``.<src_adapter>.`` → ``.<dst_adapter>.``) and raises
+        ``KeyError`` if the expected destination parameter does not exist.
+
+        Note: used only by integration tests to synchronize all adapters to the
+        same initial weights. Not called in any production pipeline.
+        """
         if not self.is_lora:
             raise RuntimeError(
                 "copy_lora_params called but LoRA is not enabled for this strategy."
@@ -2001,37 +1896,24 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 "No LoRA parameters copied; check adapter naming and parameter patterns."
             )
 
-        # Keep optimizer FP32 main params in sync with the mutated model params.
+        # Sync BF16 model params → FP32 main params (same reason as set_lora_tensors).
         self.optimizer.reload_model_params()
         return copied
-
-    def _ensure_selective_sync_cpu_group(self, *, infer_tp_size: int) -> None:
-        if self._selective_sync_cpu_group is not None and self._selective_sync_cpu_group_size == int(infer_tp_size):
-            return
-
-        infer_tp_size = int(infer_tp_size)
-        if infer_tp_size <= 0:
-            raise ValueError(f"infer_tp_size must be positive int, got {infer_tp_size}")
-
-        world_size = dist.get_world_size()
-        if world_size % infer_tp_size != 0:
-            raise RuntimeError(f"train world_size={world_size} must be divisible by infer_tp_size={infer_tp_size}")
-
-        self._selective_sync_cpu_group = None
-        for start_rank in range(0, world_size, infer_tp_size):
-            end_rank = start_rank + infer_tp_size
-            group_ranks = list(range(start_rank, end_rank))
-            new_group = dist.new_group(ranks=group_ranks, backend="gloo")
-            if dist.get_rank() in group_ranks:
-                self._selective_sync_cpu_group = new_group
-
-        if self._selective_sync_cpu_group is None:
-            raise RuntimeError("Failed to resolve selective_sync cpu group for this rank")
-        self._selective_sync_cpu_group_size = infer_tp_size
 
     def _build_latest_bucket_cache(
         self, *, checkpoint_version: int, adapter_name: Optional[str] = None
     ) -> None:
+        """Gather current model weights across PP ranks and store as CPU buckets.
+
+        All PP ranks must participate in ``gather_all_hf_weights`` (it uses PP
+        collectives internally). Only the cache owner (pp0/dp0/tp0/cp0) stores
+        the resulting buckets; non-owners drain the generator to keep the
+        collective moving but discard results.
+
+        When ``adapter_name`` is given, only that adapter's LoRA weights are
+        cached (stored in ``_adapter_cache_map``); otherwise base weights are
+        cached in ``_cache_map``.
+        """
         buffer_size = int(self.worker.pipeline_config.model_update_buffer_size_mb) * 1024 * 1024
         cache_key = int(checkpoint_version)
 
@@ -2039,6 +1921,8 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             if self._selective_update_weights_meta is None:
                 self._selective_update_weights_meta = gather_weights_meta_cross_pp(self.models_unwrapped)
 
+            # All PP ranks must participate in gather_all_hf_weights (PP collective).
+            # Only the cache owner stores results; non-owners drain and discard each batch.
             cached_buckets: List[Any] = []
             for hf_named_weights in gather_all_hf_weights(
                 self.models_unwrapped,
@@ -2046,23 +1930,21 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 weights_meta=self._selective_update_weights_meta,
                 adapter_name=adapter_name,
             ):
-                # Important: cache must be CPU-resident and must not pickle torch Tensors.
-                #
-                # If we pickle torch Tensors (even CPU tensors), torch's multiprocessing reductions can create
-                # resource-sharer connections with authkeys that are not consistent with vLLM v1 engine worker
-                # processes, resulting in "digest sent was rejected" when applying IPC updates.
-                #
-                # So we serialize the flattened bucket as raw bytes + metadata only.
-                cpu_named_weights = [(str(name), weight.detach().to("cpu").contiguous()) for name, weight in hf_named_weights]
+                if not self._is_cache_owner:
+                    # Non-owner must consume the generator element to keep the PP collective moving,
+                    # but does not store anything.
+                    continue
+                # Cache as raw CPU tensors. GPU staging + serialization happens at transport
+                # time because IPC handles are ephemeral (tied to specific GPU allocations).
+                cpu_named_weights = [
+                    (str(name), weight.detach().to("cpu").contiguous())
+                    for name, weight in hf_named_weights
+                ]
                 bucket, tensors_meta = _bucket_named_tensors(cpu_named_weights)  # CPU int8
-                cached_buckets.append(
-                    MultiprocessingSerializer.serialize(
-                        {
-                            "bucket_bytes": memoryview(bucket.numpy()).tobytes(),
-                            "tensors_meta": tensors_meta,
-                        }
-                    )
-                )
+                cached_buckets.append((tensors_meta, bucket))
+
+            if not self._is_cache_owner:
+                return
 
             if adapter_name is not None:
                 self._adapter_cache_map.setdefault(adapter_name, {})[cache_key] = cached_buckets
@@ -2072,8 +1954,18 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 self._latest_cached = cache_key
 
     def promote_active_checkpoint(self, checkpoint_version: int) -> None:
+        """Mark a cached version as the "active" snapshot for selective sync.
+
+        The distinction between "latest" and "active" allows a new cache to be
+        built concurrently while selective_sync_active_cache reads the previous
+        active version. After promotion, all versions except latest and active
+        are garbage-collected.
+        """
         if not DO_TIME_SHARING:
             raise RuntimeError("promote_active_checkpoint is only supported under RLix control plane")
+        # Non-owners hold no cache, so there is nothing to promote.
+        if not self._is_cache_owner:
+            return
 
         cache_key = int(checkpoint_version)
         with self._cache_lock:
@@ -2093,6 +1985,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
     def promote_active_adapter_checkpoint(
         self, adapter_name: str, checkpoint_version: int
     ) -> None:
+        """Same as ``promote_active_checkpoint`` but for a single adapter's LoRA cache."""
+        if not DO_TIME_SHARING:
+            raise RuntimeError("promote_active_adapter_checkpoint is only supported under RLix control plane")
+        # Non-owners hold no cache, so there is nothing to promote.
+        if not self._is_cache_owner:
+            return
         cache_key = int(checkpoint_version)
         with self._cache_lock:
             if cache_key not in self._adapter_cache_map.get(adapter_name, {}):
@@ -2111,16 +2009,30 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
     def selective_sync_active_cache(
         self,
         *,
-        sync_id: str,
         tgt_dp_ranks: List[int],
         tgt_workers,
         tgt_device_mapping: List[int],
         tgt_num_gpus_per_worker: int,
-        model_update_name: Optional[str] = None,
         comm_plan: Optional[dict] = None,
-        is_leader: bool = False,
         adapters_to_sync: Optional[List[str]] = None,
     ) -> None:
+        """Replay the active bucket cache to inference workers (time-sharing).
+
+        Transport flow (executed only by the single cache-owner rank):
+        1. **Cache lookup**: read the promoted "active" version from ``_cache_map``
+           (base weights) and optionally ``_adapter_cache_map`` (per-adapter LoRA).
+        2. **Decode comm_plan**: the ``ModelUpdateService`` builds a per-rank plan
+           specifying IPC targets (colocated workers) and NCCL broadcast targets.
+        3. **Transport**: for each cached bucket, stage to GPU once, then:
+           - IPC path: serialize the GPU tensor via CUDA IPC and push to colocated workers.
+           - Broadcast path: NCCL broadcast to remote workers.
+        4. **LoRA registration**: after adapter weights are transported, call
+           ``add_lora`` on each target worker to register the adapter with its PEFT config.
+        5. **Group teardown**: destroy the temporary NCCL broadcast group.
+
+        Non-owner ranks return immediately; ``ray.get(sync_refs)`` in
+        ``ModelUpdateService`` provides the cross-worker sync barrier.
+        """
         if not DO_TIME_SHARING:
             raise RuntimeError("selective_sync_active_cache is only supported under RLix control plane")
 
@@ -2134,32 +2046,24 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         if len(tgt_device_mapping) % int(tgt_num_gpus_per_worker) != 0:
             raise RuntimeError("tgt_device_mapping length must be divisible by tgt_num_gpus_per_worker")
 
-        sync_t0 = time.perf_counter()
-        logger.info(
-            "[rlix][selective_sync] enter "
-            f"sync_id={sync_id} world_rank={dist.get_rank()} "
-            f"tgt_dp_ranks={tgt_dp_ranks} tgt_num_gpus_per_worker={tgt_num_gpus_per_worker} "
-            f"tgt_device_mapping={list(tgt_device_mapping)} "
-            f"train_device_mapping={list(self.worker_config.device_mapping or [])}"
-        )
+        world_rank = int(self.worker.rank)
 
-        def _dp_rank_gpus(dp_rank: int) -> List[int]:
-            start = int(dp_rank) * int(tgt_num_gpus_per_worker)
-            end = start + int(tgt_num_gpus_per_worker)
-            return [int(x) for x in tgt_device_mapping[start:end]]
+        # Non-owners have no cache and do no transport.
+        # ray.get(sync_refs) in ModelUpdateService provides the sync barrier for all train workers.
+        if not self._is_cache_owner:
+            return
 
-        world_rank = dist.get_rank()
-        adapter_names_to_register: List[str] = []
-        base_cached_buckets: List[Any] = []
-        adapter_cached_buckets: Dict[str, List[Any]] = {}
-
+        # Owner acquires lock for the entire replay (cache lookup + all transport + group teardown).
+        # This prevents concurrent promote_active_checkpoint or _build_latest_bucket_cache from
+        # racing with in-flight transport.
         with self._cache_lock:
-            # Multi-LoRA under sleep_level=2 requires replaying base + adapter weights to infer workers.
-            # Base model is pinned at an active cache version (typically init checkpoint -1/-1).
-            # Keep base and adapter bucket streams separate so infer replay can run in phases:
-            # base weights first, then per-adapter stage+register.
+            # --- Cache lookup ---
+            adapter_names_to_register: List[str] = []
+            base_cached_buckets: List[Any] = []
+            adapter_cached_buckets: Dict[str, List[Any]] = {}
+
             if adapters_to_sync is not None:
-                # Sync specified adapters using their active versions
+                # Sync specified adapters using their active versions.
                 missing = [a for a in adapters_to_sync if self._active_adapter_cached.get(a) is None]
                 if missing:
                     raise RuntimeError(f"selective_sync_active_cache: no active version for adapters {missing}")
@@ -2176,7 +2080,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     key = self._active_adapter_cached[a]
                     adapter_cached_buckets[a] = list(self._adapter_cache_map[a][key])
             elif self.is_lora:
-                # adapters_to_sync=None + LoRA mode: sync ALL active adapters (expand path)
+                # adapters_to_sync=None + LoRA mode: sync ALL active adapters (expand path).
                 active_entries = {a: k for a, k in self._active_adapter_cached.items() if k is not None}
                 if not active_entries:
                     raise RuntimeError(
@@ -2194,7 +2098,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 for a, key in active_entries.items():
                     adapter_cached_buckets[a] = list(self._adapter_cache_map[a][key])
             else:
-                # Full fine-tune path (unchanged)
+                # Full fine-tune path.
                 if self._active_cached is None:
                     raise RuntimeError(
                         "selective_sync_active_cache requires an active promoted cache (active_cached is unset)"
@@ -2202,177 +2106,85 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 if self._active_cached not in self._cache_map:
                     raise RuntimeError(f"active_cached={self._active_cached} missing from cache_map")
                 base_cached_buckets = list(self._cache_map[self._active_cached])
-            logger.info(
-                "[rlix][selective_sync] cache "
-                f"sync_id={sync_id} world_rank={world_rank} active_cached={self._active_cached} "
-                f"adapters_to_sync={adapters_to_sync} base_num_buckets={len(base_cached_buckets)} "
-                f"adapter_num_buckets={sum(len(v) for v in adapter_cached_buckets.values())}"
-            )
 
-            train_devices = set(int(x) for x in (self.worker_config.device_mapping or []))
-            infer_devices = set(int(x) for x in tgt_device_mapping)
-            is_colocated = bool(train_devices.intersection(infer_devices))
-
-            ipc_target_dp_ranks: Set[int] = set()
-            broadcast_target_dp_ranks: Set[int] = set()
-            for dp_rank in tgt_dp_ranks:
-                gpus = _dp_rank_gpus(dp_rank)
-                if any(g in train_devices for g in gpus) and is_colocated:
-                    ipc_target_dp_ranks.add(int(dp_rank))
-                else:
-                    broadcast_target_dp_ranks.add(int(dp_rank))
-
-            logger.info(
-                "[rlix][selective_sync] targets "
-                f"sync_id={sync_id} world_rank={world_rank} is_colocated={int(is_colocated)} "
-                f"ipc_target_dp_ranks={sorted(ipc_target_dp_ranks)} "
-                f"broadcast_target_dp_ranks={sorted(broadcast_target_dp_ranks)}"
-            )
-
-            # IPC path (colocated overlapped workers): reuse upstream Megatron mapping/group behavior.
-            if ipc_target_dp_ranks:
-                train_mapping = [int(x) for x in (self.worker_config.device_mapping or [])]
-                if not train_mapping:
-                    raise RuntimeError("train device_mapping is empty; cannot perform IPC selective sync")
-
-                device_start_diff = min(train_mapping) - min(int(x) for x in tgt_device_mapping)
-                device_end_diff = max(train_mapping) - max(int(x) for x in tgt_device_mapping)
-                if device_start_diff % int(tgt_num_gpus_per_worker) != 0 or device_end_diff % int(tgt_num_gpus_per_worker) != 0:
-                    raise RuntimeError(
-                        "device_mapping diff must be divisible by tgt_num_gpus_per_worker "
-                        f"({device_start_diff=}, {device_end_diff=}, {tgt_num_gpus_per_worker=})"
-                    )
-
-                self._ensure_selective_sync_cpu_group(infer_tp_size=int(tgt_num_gpus_per_worker))
-                co_infer_rank = dist.get_rank(self._selective_sync_cpu_group)
-                infer_parallel_size = dist.get_world_size(self._selective_sync_cpu_group)
-                infer_worker_idx = (int(world_rank) + int(device_start_diff)) // int(tgt_num_gpus_per_worker)
-                logger.info(
-                    "[rlix][selective_sync] ipc "
-                    f"sync_id={sync_id} world_rank={world_rank} co_infer_rank={co_infer_rank} "
-                    f"infer_parallel_size={infer_parallel_size} infer_worker_idx={infer_worker_idx} "
-                    f"device_start_diff={device_start_diff} device_end_diff={device_end_diff}"
+            # --- Decode comm_plan for the single owner ---
+            # comm_plan is always non-None for the owner (ModelUpdateService guarantees this).
+            if comm_plan is None:
+                raise RuntimeError(
+                    "selective_sync_active_cache: comm_plan must be non-None for the cache owner. "
+                    "ModelUpdateService must always build a comm_plan keyed by the owner's src_rank."
                 )
-
-                if 0 <= infer_worker_idx < len(tgt_workers) and infer_worker_idx in ipc_target_dp_ranks:
-                    co_infer_worker = tgt_workers[infer_worker_idx]
-                    # Keep gather_object calls rank-consistent by applying the same phase/bucket sequence on all ranks.
-                    def _ipc_apply_bucket_sequence(
-                        bucket_sequence: List[Any], *, is_lora_stage: bool, phase_tag: str, adapter_name: Optional[str] = None
-                    ) -> None:
-                        for bucket_idx, serialized_tensors in enumerate(bucket_sequence):
-                            infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
-                            logger.info(
-                                "[rlix][selective_sync] ipc_gather_enter "
-                                f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
-                                f"adapter={adapter_name} bucket_idx={bucket_idx} "
-                                f"serialized_len={len(serialized_tensors) if serialized_tensors is not None else 'None'}"
-                            )
-                            dist.gather_object(
-                                serialized_tensors,
-                                infer_parallel_tensors,
-                                group_dst=0,
-                                group=self._selective_sync_cpu_group,
-                            )
-                            if co_infer_rank == 0:
-                                logger.info(
-                                    "[rlix][selective_sync] ipc_apply_enter "
-                                    f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
-                                    f"adapter={adapter_name} bucket_idx={bucket_idx}"
-                                )
-                                ray.get(
-                                    co_infer_worker.update_parameter_in_bucket.remote(
-                                        infer_parallel_tensors,
-                                        is_lora=is_lora_stage,
-                                    )
-                                )
-                                logger.info(
-                                    "[rlix][selective_sync] ipc_apply_exit "
-                                    f"sync_id={sync_id} world_rank={world_rank} phase={phase_tag} "
-                                    f"adapter={adapter_name} bucket_idx={bucket_idx}"
-                                )
-
-                    # Apply base tensors first so load_weights restores model state before adapter staging.
-                    _ipc_apply_bucket_sequence(base_cached_buckets, is_lora_stage=False, phase_tag="base")
-                    if self.is_lora and adapter_names_to_register:
-                        peft_configs = getattr(self.models_unwrapped[0], "peft_config", None) or {}
-                        missing_cfg = [a for a in adapter_names_to_register if a not in peft_configs]
-                        if missing_cfg:
-                            raise RuntimeError(
-                                f"selective_sync_active_cache: missing peft_config for adapters {missing_cfg}"
-                            )
-                        # Stage one adapter at a time, then register so custom_add_lora consumes the correct tensors.
-                        for adapter_name in adapter_names_to_register:
-                            buckets = adapter_cached_buckets.get(adapter_name, [])
-                            if not buckets:
-                                raise RuntimeError(
-                                    f"selective_sync_active_cache: no cached buckets for adapter={adapter_name!r}; "
-                                    "promote_active_adapter_checkpoint must be called before sync"
-                                )
-                            _ipc_apply_bucket_sequence(
-                                buckets,
-                                is_lora_stage=True,
-                                phase_tag="adapter",
-                                adapter_name=adapter_name,
-                            )
-                            if co_infer_rank == 0:
-                                # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
-                                ray.get(
-                                    co_infer_worker.add_lora.remote(
-                                        adapter_name=adapter_name, peft_config=asdict(peft_configs[adapter_name])
-                                    )
-                                )
-
-            # Broadcast path (separated workers): ephemeral collective group managed by ModelUpdateService.
-            # comm_plan=None is valid for leaders when all targets are colocated (IPC-only path):
-            # ModelUpdateService intentionally passes None in that case (no NCCL group needed).
-            assert comm_plan is not None or not is_leader or not broadcast_target_dp_ranks, (
-                "selective_sync_active_cache: comm_plan must be provided for leader ranks that have "
-                "broadcast targets. Self-setup (comm_plan is None) is no longer supported; use ModelUpdateService."
-            )
-            group_name = None
-            broadcast_workers = None
-            if broadcast_target_dp_ranks and comm_plan is not None and bool(is_leader):
-                # ModelUpdateService set up the group ahead of time; retrieve group_name and receivers.
-                model_update_name = str(model_update_name)
-                if int(self.worker.rank) not in comm_plan:
-                    raise RuntimeError(
-                        "selective_sync_active_cache comm_plan missing sender rank. "
-                        f"sender_rank={int(self.worker.rank)} keys={sorted(int(k) for k in comm_plan.keys())}"
-                    )
-                comm_plan_args = comm_plan[int(self.worker.rank)]
-                group_name = str(comm_plan_args["group_name"])
-                planned_ranks = sorted({int(td["rank"]) for td in comm_plan_args.get("tgt_devices", [])})
-                broadcast_workers = [tgt_workers[r] for r in planned_ranks]
-                logger.info(
-                    "[rlix][selective_sync] broadcast_setup_from_comm_plan "
-                    f"sync_id={sync_id} model_update_name={model_update_name} group_name={group_name} "
-                    f"broadcast_dp_ranks={planned_ranks}"
+            if world_rank not in comm_plan:
+                raise RuntimeError(
+                    "selective_sync_active_cache comm_plan missing owner rank. "
+                    f"owner_rank={world_rank} keys={sorted(int(k) for k in comm_plan.keys())}"
                 )
-                # Reuse one broadcast helper for base and adapter phases to avoid diverging send/apply behavior.
-                def _broadcast_apply_bucket_sequence(
-                    bucket_sequence: List[Any], *, is_lora_stage: bool, phase_tag: str, adapter_name: Optional[str] = None
-                ) -> None:
-                    for bucket_idx, serialized_tensors in enumerate(bucket_sequence):
-                        bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_tensors)
-                        # Cache stores bucket as raw bytes; reconstruct to sender GPU for NCCL broadcast.
-                        bucket_bytes = bucket_with_meta.get("bucket_bytes")
-                        tensors_meta = bucket_with_meta.get("tensors_meta")
-                        if bucket_bytes is None or tensors_meta is None:
-                            raise RuntimeError("selective_sync_active_cache cache missing bucket_bytes/tensors_meta")
-                        bucket_cpu = torch.frombuffer(memoryview(bucket_bytes), dtype=torch.int8)
-                        bucket = bucket_cpu.to(current_platform.device_type).contiguous()
-                        named_params = named_tensors_from_bucket(bucket=bucket, tensors_meta=tensors_meta)
+            comm_plan_args = comm_plan[world_rank]
+            group_name: Optional[str] = str(comm_plan_args["group_name"])
+            ipc_targets: List[Dict[str, Any]] = comm_plan_args.get("ipc_targets", [])
+            broadcast_local_ranks_by_dp_rank: Dict[int, List[int]] = comm_plan_args.get(
+                "broadcast_local_ranks_by_dp_rank", {}
+            )
+            planned_broadcast_ranks = sorted({int(td["rank"]) for td in comm_plan_args.get("tgt_devices", [])})
+            broadcast_workers = [tgt_workers[r] for r in planned_broadcast_ranks]
 
+            def _transport_bucket_sequence(
+                bucket_sequence: List[Any],
+                *,
+                is_lora_stage: bool,
+                phase_tag: str,
+                adapter_label: Optional[str] = None,
+            ) -> None:
+                """Transport one bucket sequence (base or adapter) to all target workers.
+
+                For each bucket: stage CPU->GPU once, then fan out via IPC to
+                colocated workers and NCCL broadcast to remote workers. GPU staging
+                buffer is freed after each bucket to limit peak VRAM.
+                """
+                for bucket_idx, (tensors_meta, cpu_bucket) in enumerate(bucket_sequence):
+                    # Stage once to GPU; reuse for IPC (serialized handle) and NCCL broadcast.
+                    gpu_bucket = cpu_bucket.to(current_platform.device_type).contiguous()
+
+                    # Transport workflow (IPC + NCCL overlap):
+                    # 1. Fire async: IPC sends to colocated workers (same node, GPU memory handle)
+                    # 2. Fire async: NCCL broadcasts to remote workers (cross-node, GPU-to-GPU)
+                    # 3. Barrier: wait on all IPC + NCCL to finish
+                    # 4. Free gpu_bucket — safe because all consumers have copied the data
+                    # IPC and NCCL run concurrently to hide transfer latency.
+
+                    # Step 1: IPC path — share staged GPU tensor with colocated workers.
+                    # Ensure CUDA IPC pickle uses GPU UUIDs instead of raw device indices,
+                    # so the receiver resolves the correct local device even when
+                    # CUDA_VISIBLE_DEVICES orderings differ between processes.
+                    monkey_patch_torch_reductions()
+                    ipc_refs: List[ray.ObjectRef] = []
+                    for ipc_entry in ipc_targets:
+                        tgt_dp_rank = int(ipc_entry["dp_rank"])
+                        ipc_local_ranks: List[int] = [int(r) for r in ipc_entry["local_ranks"]]
+                        # Serialize the GPU bucket once; all TP local ranks share the same handle.
+                        ipc_payload = MultiprocessingSerializer.serialize(
+                            {"bucket": gpu_bucket, "tensors_meta": tensors_meta}
+                        )
+                        # Build a list long enough to cover all TP ranks (worker indexes by self.rank).
+                        payload_list = [ipc_payload] * tgt_num_gpus_per_worker
+                        ipc_refs.append(
+                            tgt_workers[tgt_dp_rank].update_parameter_in_bucket.remote(
+                                payload_list,
+                                is_lora=is_lora_stage,
+                                ipc_local_ranks=ipc_local_ranks,
+                            )
+                        )
+
+                    # Step 2: NCCL path — broadcast to remote (non-colocated) workers.
+                    nccl_handles: List[Any] = []
+                    recv_refs: List[ray.ObjectRef] = []
+                    named_params: List[Any] = []
+                    if broadcast_workers:
+                        named_params = list(named_tensors_from_bucket(bucket=gpu_bucket, tensors_meta=tensors_meta))
                         names = [n for n, _ in named_params]
                         dtypes = [t.dtype for _, t in named_params]
                         shapes = [t.shape for _, t in named_params]
 
-                        logger.info(
-                            "[rlix][selective_sync] broadcast_bucket_enter "
-                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
-                            f"adapter={adapter_name} bucket_idx={bucket_idx} num_tensors={len(names)}"
-                        )
                         recv_refs = [
                             worker.broadcast_parameter.remote(
                                 group_name=group_name,
@@ -2380,13 +2192,15 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                                 dtypes=dtypes,
                                 shapes=shapes,
                                 is_lora=is_lora_stage,
+                                broadcast_local_ranks=broadcast_local_ranks_by_dp_rank.get(
+                                    int(planned_broadcast_ranks[worker_idx])
+                                ),
                             )
-                            for worker in broadcast_workers
+                            for worker_idx, worker in enumerate(broadcast_workers)
                         ]
 
-                        handles = []
                         for _, weight in named_params:
-                            handles.append(
+                            nccl_handles.append(
                                 collective.broadcast(
                                     tensor=weight,
                                     src_rank=0,
@@ -2394,183 +2208,158 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                                     async_op=True,
                                 )
                             )
-                        logger.info(
-                            "[rlix][selective_sync] broadcast_wait_enter "
-                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
-                            f"adapter={adapter_name} bucket_idx={bucket_idx} num_handles={len(handles)}"
-                        )
-                        for handle in handles:
-                            handle.wait()
-                        logger.info(
-                            "[rlix][selective_sync] broadcast_wait_exit "
-                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
-                            f"adapter={adapter_name} bucket_idx={bucket_idx}"
-                        )
-                        logger.info(
-                            "[rlix][selective_sync] broadcast_apply_enter "
-                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
-                            f"adapter={adapter_name} bucket_idx={bucket_idx} num_workers={len(broadcast_workers)}"
-                        )
-                        ray.get(recv_refs)
-                        logger.info(
-                            "[rlix][selective_sync] broadcast_apply_exit "
-                            f"sync_id={sync_id} group_name={group_name} phase={phase_tag} "
-                            f"adapter={adapter_name} bucket_idx={bucket_idx}"
-                        )
-                        # Free GPU bucket immediately after receivers finish.
-                        # named_params holds tensor views into bucket's CUDA storage; del it first
-                        # so the refcount on bucket drops to zero, matching the ROLL_multi_pipeline
-                        # pattern (finally: del gpu_bucket; empty_cache()).
-                        del named_params, handles, bucket, bucket_cpu
-                        current_platform.empty_cache()
 
-                # Apply base tensors first so vLLM model weights are restored before adapter registration.
-                _broadcast_apply_bucket_sequence(base_cached_buckets, is_lora_stage=False, phase_tag="base")
-                if self.is_lora and adapter_names_to_register and broadcast_workers:
-                    peft_configs = getattr(self.models_unwrapped[0], "peft_config", None) or {}
-                    missing_cfg = [a for a in adapter_names_to_register if a not in peft_configs]
-                    if missing_cfg:
+                    # Step 3+4: barrier — wait for all transfers, then free GPU memory.
+                    for nccl_handle in nccl_handles:
+                        nccl_handle.wait()
+                    ray.get(ipc_refs + recv_refs)
+                    del gpu_bucket, nccl_handles, named_params
+                    current_platform.empty_cache()
+
+            # --- Transport: base buckets first, then per-adapter buckets ---
+            _transport_bucket_sequence(base_cached_buckets, is_lora_stage=False, phase_tag="base")
+
+            if self.is_lora and adapter_names_to_register:
+                peft_configs = getattr(self.models_unwrapped[0], "peft_config", None) or {}
+                missing_cfg = [a for a in adapter_names_to_register if a not in peft_configs]
+                if missing_cfg:
+                    raise RuntimeError(
+                        f"selective_sync_active_cache: missing peft_config for adapters {missing_cfg}"
+                    )
+                for adapter_label in adapter_names_to_register:
+                    buckets = adapter_cached_buckets.get(adapter_label, [])
+                    if not buckets:
                         raise RuntimeError(
-                            f"selective_sync_active_cache: missing peft_config for adapters {missing_cfg}"
+                            f"selective_sync_active_cache: no cached buckets for adapter={adapter_label!r}; "
+                            "promote_active_adapter_checkpoint must be called before sync"
                         )
-                    # Stage one adapter at a time, then register it so staged tensors are consumed immediately.
-                    for adapter_name in adapter_names_to_register:
-                        buckets = adapter_cached_buckets.get(adapter_name, [])
-                        if not buckets:
-                            raise RuntimeError(
-                                f"selective_sync_active_cache: no cached buckets for adapter={adapter_name!r}; "
-                                "promote_active_adapter_checkpoint must be called before sync"
-                            )
-                        _broadcast_apply_bucket_sequence(
-                            buckets,
-                            is_lora_stage=True,
-                            phase_tag="adapter",
-                            adapter_name=adapter_name,
-                        )
-                        # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
-                        ray.get(
-                            [
-                                worker.add_lora.remote(
-                                    adapter_name=adapter_name, peft_config=asdict(peft_configs[adapter_name])
-                                )
-                                for worker in broadcast_workers
-                            ]
-                        )
-                # Destroy groups before dist.barrier(): ncclCommDestroy blocks if called after barrier.
-                logger.info(
-                    "[rlix][selective_sync] broadcast_teardown_enter "
-                    f"sync_id={sync_id} group_name={group_name}"
-                )
-                collective.destroy_collective_group(group_name)
-                ray.get([w.destroy_collective_group.remote(group_name, model_update_name) for w in broadcast_workers])
-                logger.info(
-                    "[rlix][selective_sync] broadcast_teardown_exit "
-                    f"sync_id={sync_id} group_name={group_name}"
-                )
+                    _transport_bucket_sequence(
+                        buckets,
+                        is_lora_stage=True,
+                        phase_tag="adapter",
+                        adapter_label=adapter_label,
+                    )
+                    # Compute the union of IPC and broadcast local ranks for this adapter's add_lora call.
+                    # Collect all unique target actors across both paths.
+                    adapter_target_actor_dp_ranks: Set[int] = set()
+                    ipc_local_ranks_by_dp: Dict[int, List[int]] = {
+                        int(entry["dp_rank"]): [int(r) for r in entry["local_ranks"]]
+                        for entry in ipc_targets
+                    }
+                    for entry in ipc_targets:
+                        adapter_target_actor_dp_ranks.add(int(entry["dp_rank"]))
+                    for dp_rank in planned_broadcast_ranks:
+                        adapter_target_actor_dp_ranks.add(int(dp_rank))
 
-            # Critical: ensure all sender ranks complete this sync before allowing another to start.
-            logger.info("[rlix][selective_sync] barrier_enter " f"sync_id={sync_id} world_rank={world_rank}")
-            _safe_dist_barrier()
-            logger.info(
-                "[rlix][selective_sync] barrier_exit "
-                f"sync_id={sync_id} world_rank={world_rank} elapsed_s={time.perf_counter() - sync_t0:.3f}"
-            )
+                    for dp_rank in sorted(adapter_target_actor_dp_ranks):
+                        ipc_lr = ipc_local_ranks_by_dp.get(dp_rank, [])
+                        broadcast_lr = broadcast_local_ranks_by_dp_rank.get(dp_rank, [])
+                        lora_local_ranks = sorted(set(ipc_lr) | set(broadcast_lr)) or None
+                        ray.get(
+                            tgt_workers[dp_rank].add_lora.remote(
+                                adapter_name=adapter_label,
+                                peft_config=asdict(peft_configs[adapter_label]),
+                                lora_local_ranks=lora_local_ranks,
+                            )
+                        )
+
+            # --- Teardown broadcast group once after all replay completes ---
+            if broadcast_workers:
+                collective.destroy_collective_group(group_name)
+                ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
+
+        # Lock released. No dist.barrier() here: ray.get(sync_refs) in ModelUpdateService
+        # waits for all train workers to complete before the next sync is allowed.
+
+    def _translate_offload_include(
+        self, include: Optional[List[OffloadStateType]]
+    ) -> Tuple[bool, List[MegatronOffloadStateType]]:
+        """Derive request intent from caller's include arg.
+
+        Returns:
+            wants_model_params: whether model_params reload/offload is requested.
+            translated: Megatron-internal state types corresponding to requested states.
+                When include is None (all states), returns all three types explicitly.
+        """
+        if include is None:
+            return True, [
+                MegatronOffloadStateType.model_params,
+                MegatronOffloadStateType.other_params,
+                MegatronOffloadStateType.optimizer_states,
+            ]
+        translated: List[MegatronOffloadStateType] = []
+        if OffloadStateType.model_params in include:
+            translated.append(MegatronOffloadStateType.model_params)
+        if OffloadStateType.other_params in include:
+            translated.append(MegatronOffloadStateType.other_params)
+        if OffloadStateType.optimizer_states in include:
+            translated.append(MegatronOffloadStateType.optimizer_states)
+        return OffloadStateType.model_params in include, translated
 
     def load_states(self, include=None, non_blocking=False):
-        # Per-adapter mode must honor include semantics so RLix can fully release GPU memory
-        # during train->infer handoff (model + optimizer states), then restore on demand.
-        if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
-            include_states = []
-            if include is None or OffloadStateType.model_params in include:
-                # Include optimizer-managed trainable model params (e.g., active LoRA weights) in per-adapter mode.
-                reload_megatron_no_grad_module(model_chunks=self.model.get_models())
-                include_states.append(MegatronOffloadStateType.model_params)
-            if include is None or OffloadStateType.other_params in include:
-                include_states.append(MegatronOffloadStateType.other_params)
-            if include is None or OffloadStateType.optimizer_states in include:
-                include_states.append(MegatronOffloadStateType.optimizer_states)
-            if include_states:
-                self.optimizer.reload_states(include=include_states, non_blocking=non_blocking)
-            return
+        """Reload optimizer and model states back to GPU.
 
-        if include is not None:
-            include_states = []
-            if OffloadStateType.model_params in include:
-                reload_megatron_no_grad_module(model_chunks=self.model.get_models())
-                include_states.append(MegatronOffloadStateType.model_params)
-            if OffloadStateType.other_params in include:
-                include_states.append(MegatronOffloadStateType.other_params)
-            if OffloadStateType.optimizer_states in include:
-                include_states.append(MegatronOffloadStateType.optimizer_states)
-            include = include_states
-        self.optimizer.reload_states(include=include, non_blocking=non_blocking)
+        Behavior by caller context:
+        - isolated + include=None: no-grad swap runs, optimizer gets explicit full list
+        - non-isolated + include=None: no no-grad swap, optimizer gets raw None
+        - either + explicit include with model_params: no-grad swap runs, optimizer gets translated list
+        - either + explicit include without model_params: no no-grad swap
+        - isolated + include=[]: no no-grad swap, optimizer call skipped
+        - non-isolated + include=[]: no no-grad swap, optimizer called with []
+        """
+        wants_model_params, translated_include = self._translate_offload_include(include)
+
+        # Manual no-grad reload needed when:
+        # - Isolated optimizer: always (optimizer doesn't manage frozen base params)
+        # - Explicit include with model_params: optimizer gets a filtered list,
+        #   so it won't reload no-grad params on its own
+        # Skipped only for non-isolated + include=None where the optimizer handles all.
+        if wants_model_params and (self.is_lora_optimizer_isolated or include is not None):
+            reload_megatron_no_grad_module(model_chunks=self.model.get_models())
+
+        # Isolated path: always pass explicit translated list (never raw None).
+        # Non-isolated path: preserve raw None so optimizer uses its default "all" handling.
+        if self.is_lora_optimizer_isolated:
+            if translated_include:
+                self.optimizer.reload_states(include=translated_include, non_blocking=non_blocking)
+        else:
+            optimizer_include = None if include is None else translated_include
+            self.optimizer.reload_states(include=optimizer_include, non_blocking=non_blocking)
 
     def offload_states(self, include=None, non_blocking=False, pin_memory=True):
-        # Per-adapter mode must honor include semantics so RLix can fully release GPU memory
-        # during train->infer handoff (model + optimizer states), then restore on demand.
-        if getattr(self, "lora_optimizer_mode", "shared") == "per_adapter":
-            include_states = []
-            if include is None or OffloadStateType.model_params in include:
-                # Include optimizer-managed trainable model params (e.g., active LoRA weights) in per-adapter mode.
-                offload_megatron_no_grad_module(
-                    model_chunks=self.model.get_models(), pin_memory=pin_memory
-                )
-                include_states.append(MegatronOffloadStateType.model_params)
-            if include is None or OffloadStateType.other_params in include:
-                include_states.append(MegatronOffloadStateType.other_params)
-            if include is None or OffloadStateType.optimizer_states in include:
-                include_states.append(MegatronOffloadStateType.optimizer_states)
-            if include_states:
-                self.optimizer.offload_states(
-                    include=include_states,
-                    non_blocking=non_blocking,
-                    pin_memory=pin_memory,
-                )
-            RotaryEmbedding.forward.cache_clear()
-            current_platform.empty_cache()
-            # [debug] Same post-offload snapshot as the non-per-adapter path below.
-            import torch
-            _alloc_gb = torch.cuda.memory_allocated() / 1024**3
-            _reserv_gb = torch.cuda.memory_reserved() / 1024**3
-            _free_bytes, _total_bytes = torch.cuda.mem_get_info()
-            _device_used_gb = (_total_bytes - _free_bytes) / 1024**3
-            logger.info(
-                f"[debug][megatron_offload_done] allocated={_alloc_gb:.3f}GB "
-                f"reserved={_reserv_gb:.3f}GB "
-                f"device_used={_device_used_gb:.3f}GB device_total={_total_bytes / 1024**3:.3f}GB"
-            )
-            return
+        """Offload optimizer and model states from GPU.
 
-        if include is not None:
-            include_states = []
-            if OffloadStateType.model_params in include:
-                offload_megatron_no_grad_module(
-                    model_chunks=self.model.get_models(), pin_memory=pin_memory
+        Behavior by caller context:
+        - isolated + include=None: no-grad swap runs, optimizer gets explicit full list
+        - non-isolated + include=None: no no-grad swap, optimizer gets raw None
+        - either + explicit include with model_params: no-grad swap runs, optimizer gets translated list
+        - either + explicit include without model_params: no no-grad swap
+        - isolated + include=[]: no no-grad swap, optimizer call skipped
+        - non-isolated + include=[]: no no-grad swap, optimizer called with []
+        - rotary cache clear + CUDA cache clear always runs
+        """
+        wants_model_params, translated_include = self._translate_offload_include(include)
+
+        # Same manual no-grad condition as load_states.
+        if wants_model_params and (self.is_lora_optimizer_isolated or include is not None):
+            offload_megatron_no_grad_module(
+                model_chunks=self.model.get_models(), pin_memory=pin_memory,
+            )
+
+        if self.is_lora_optimizer_isolated:
+            if translated_include:
+                self.optimizer.offload_states(
+                    include=translated_include, non_blocking=non_blocking, pin_memory=pin_memory,
                 )
-                include_states.append(MegatronOffloadStateType.model_params)
-            if OffloadStateType.other_params in include:
-                include_states.append(MegatronOffloadStateType.other_params)
-            if OffloadStateType.optimizer_states in include:
-                include_states.append(MegatronOffloadStateType.optimizer_states)
-            include = include_states
-        self.optimizer.offload_states(
-            include=include, non_blocking=non_blocking, pin_memory=pin_memory
-        )
+        else:
+            optimizer_include = None if include is None else translated_include
+            self.optimizer.offload_states(
+                include=optimizer_include, non_blocking=non_blocking, pin_memory=pin_memory,
+            )
+
+        # Unconditional cleanup after offload (both paths, matches current behavior).
         RotaryEmbedding.forward.cache_clear()
         current_platform.empty_cache()
-        # [debug] Confirm GPU memory is freed after offload+empty_cache.
-        # This runs before _release_static_cluster signals the scheduler so it
-        # reveals whether VRAM is actually available before expansion is planned.
-        import torch
-        _alloc_gb = torch.cuda.memory_allocated() / 1024**3
-        _reserv_gb = torch.cuda.memory_reserved() / 1024**3
-        _free_bytes, _total_bytes = torch.cuda.mem_get_info()
-        _device_used_gb = (_total_bytes - _free_bytes) / 1024**3
-        logger.info(
-            f"[debug][megatron_offload_done] allocated={_alloc_gb:.3f}GB "
-            f"reserved={_reserv_gb:.3f}GB "
-            f"device_used={_device_used_gb:.3f}GB device_total={_total_bytes / 1024**3:.3f}GB"
-        )
 
     def setup_model_update(self, infer_cluster, model_update_name: str):
         assert model_update_name not in self.weight_updaters
@@ -2626,22 +2415,28 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             )
             self._validate_access_integrity = False
         # Compatibility: older Megatron builds do not expose get_data_modulo_expert_parallel_rank().
-        elif not dist.is_initialized() or (
-            mpu.get_data_modulo_expert_parallel_rank()
-            if hasattr(mpu, "get_data_modulo_expert_parallel_rank")
-            else mpu.get_data_parallel_rank(with_context_parallel=False)
-        ) == 0:
+        # Save optimizer when single-process (no dist) OR when data-parallel rank is 0.
+        elif (not dist.is_initialized()) or (
+            (
+                mpu.get_data_modulo_expert_parallel_rank()
+                if hasattr(mpu, "get_data_modulo_expert_parallel_rank")
+                else mpu.get_data_parallel_rank(with_context_parallel=False)
+            )
+            == 0
+        ):
             torch.save(self.optimizer.state_dict(), os.path.join(checkpoint_dir, OPTIMIZER_NAME))
             logger.info(f"Saving optimizer state to {os.path.join(checkpoint_dir, OPTIMIZER_NAME)}")
 
         if dist.is_initialized():
             _safe_dist_barrier()
 
-        # save lr_scheduler
+        # save lr_scheduler — isolated mode saves a dict with {"mode": "isolated",
+        # "schedulers": {adapter_name: state_dict, ...}} so load_checkpoint can restore each
+        # adapter's LR schedule independently.
         if dist.get_rank() == 0:
             if self.adapter_schedulers is not None:
                 scheduler_state = {
-                    "mode": "per_adapter",
+                    "mode": "isolated",
                     "schedulers": {k: v.state_dict() for k, v in self.adapter_schedulers.items()},
                 }
             else:
@@ -2656,6 +2451,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             "cuda_rng_state": current_platform.get_rng_state(),
             "rng_tracker_states": tensor_parallel.get_cuda_rng_tracker().get_states(),
         }
+        # Per-adapter RNG states enable deterministic per-adapter dropout across checkpoint restarts.
         if getattr(self, "adapter_rng_states", None) is not None:
             rng_states["adapter_rng_states"] = self.adapter_rng_states
         rgn_path = os.path.join(save_dir, RNG_STATE_DIR, f"rng_state_{dist.get_rank()}.pth")
@@ -2706,11 +2502,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         # load lr_scheduler
         scheduler_state = torch.load(os.path.join(load_dir, SCHEDULER_NAME), weights_only=False)
-        if isinstance(scheduler_state, dict) and scheduler_state.get("mode") == "per_adapter":
+        if isinstance(scheduler_state, dict) and scheduler_state.get("mode") == "isolated":
             if self.adapter_schedulers is None:
                 raise RuntimeError(
-                    "Checkpoint was saved in per_adapter scheduler mode but current strategy "
-                    "has no adapter_schedulers (lora_optimizer_mode mismatch)."
+                    "Checkpoint contains shared-mode LoRA scheduler state which is no longer supported. "
+                    "Only per-adapter LoRA checkpoints can be resumed."
                 )
             for adapter_name, state in scheduler_state["schedulers"].items():
                 if adapter_name not in self.adapter_schedulers:

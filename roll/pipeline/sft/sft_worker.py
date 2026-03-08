@@ -44,13 +44,11 @@ class SFTWorker(Worker):
 
     @register(Dispatch.DP_MP_DISPATCH_FIRST, clear_cache=False)
     def train_step_lora(self, data: DataProto):
-        """Multi-LoRA training step.
+        """Single-adapter-per-call LoRA training step.
 
         Routes to ``MegatronTrainStrategy.train_step_lora`` which dispatches
-        per-adapter optimizer.step() when ``lora_optimizer_mode='per_adapter'``.
-
-        The microbatch must carry ``non_tensor_batch["lora_name"]`` to
-        identify which adapter owns the batch.
+        the per-adapter optimizer.step() for the adapter identified by
+        ``non_tensor_batch["lora_name"]``.
         """
         if data.meta_info is None:
             data.meta_info = {}
@@ -106,19 +104,27 @@ class SFTWorker(Worker):
     def get_lora_tensors(self, adapter_name: str) -> Dict[str, torch.Tensor]:
         """Return a CPU copy of all LoRA parameter tensors for *adapter_name*.
 
-        Called on all workers; caller typically uses ``result[0]`` (rank-0)
-        since all DP/TP ranks hold the same LoRA weights.
+        Dispatched to all workers (ONE_TO_ALL); callers typically use ``result[0]``
+        (rank-0 copy) since all DP/TP ranks hold identical LoRA weights.
+
+        Note: used only by integration tests. Not called in any production pipeline.
         """
         return self.strategy.get_lora_tensors(adapter_name)
 
     @register(Dispatch.ONE_TO_ALL)
     def set_lora_tensors(self, adapter_name: str, tensors: Dict[str, torch.Tensor]) -> int:
-        """Overwrite LoRA parameters for *adapter_name* in-place on all workers."""
+        """Overwrite LoRA parameters for *adapter_name* in-place on all workers.
+
+        Note: used only by integration tests. Not called in any production pipeline.
+        """
         return self.strategy.set_lora_tensors(adapter_name=adapter_name, tensors=tensors)
 
     @register(Dispatch.ONE_TO_ALL)
     def copy_lora_params(self, src_adapter: str, dst_adapter: str) -> int:
-        """Copy LoRA parameters from *src_adapter* to *dst_adapter* on all workers."""
+        """Copy LoRA parameters from *src_adapter* to *dst_adapter* on all workers.
+
+        Note: used only by integration tests. Not called in any production pipeline.
+        """
         return self.strategy.copy_lora_params(src_adapter=src_adapter, dst_adapter=dst_adapter)
 
     def loss_func(self, data: DataProto, output_tensor: torch.Tensor):

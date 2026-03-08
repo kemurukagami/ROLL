@@ -81,6 +81,9 @@ class StudentWorker(Worker):
                 load_kwargs={"include": None},
         ):
             data = data.to(current_platform.device_type)
+            # Broadcast non_tensor_batch to all PP/TP/CP ranks so LoRA routing and
+            # multimodal inputs are available on every stage after get_data_input.
+            data.meta_info["_broadcast_non_tensor_batch"] = True
             data = self.strategy.get_data_input(data)
             if self.rank_info.is_pipeline_last_stage:
                 # Retrieve the teacher logits
@@ -147,6 +150,9 @@ class StudentWorker(Worker):
     def val_step(self, data: DataProto):
         data = data.to(current_platform.device_type)
         data.meta_info["micro_batch_size"] = self.worker_config.infer_batch_size
+        # Broadcast non_tensor_batch to all PP/TP/CP ranks so LoRA routing and
+        # multimodal inputs are available on every stage after get_data_input.
+        data.meta_info["_broadcast_non_tensor_batch"] = True
         data = self.strategy.get_data_input(data)
         if "labels" in data.batch.keys():
             # rename key: labels -> labels_for_loss

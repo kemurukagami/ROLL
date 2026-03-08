@@ -956,6 +956,28 @@ def postprocess_generate(
 
 
 def get_dist_info_from_comm_plan(comm_plan, rank_in_cluster, rank_in_worker):
+    """Find this worker's NCCL group rank and plan args from a comm_plan.
+
+    comm_plan structure:
+        {src_rank: {"tgt_devices": [{"rank": cluster_rank, "device": {"rank": worker_rank}, ...}, ...],
+                    "group_name": str, "master_addr": str, "master_port": int, ...}}
+    Each key is the sender's cluster rank.  tgt_devices lists all receiver devices in
+    the NCCL group, ordered by insertion.  The sender is always rank 0 in the group;
+    receivers are assigned ranks 1..N in tgt_devices order.
+
+    Args:
+        comm_plan: the full plan dict as described above.
+        rank_in_cluster: this worker actor's cluster-level rank (Ray actor index).
+        rank_in_worker: this GPU's local rank within the worker (0 for single-GPU workers,
+            0..TP_size-1 for tensor-parallel workers).
+
+    Returns:
+        (group_rank, comm_plan_args) if this worker is a receiver in any group,
+        (None, None) if this worker does not appear in any group (skip setup).
+
+    group_rank is 1-indexed: rank 1 is the first receiver, rank 2 the second, etc.
+    (The sender occupies rank 0 and calls setup_collective_group with rank=0 separately.)
+    """
     for src_rank, comm_plan_args in comm_plan.items():
         start_rank = 0
         for tgt_device in comm_plan_args["tgt_devices"]:

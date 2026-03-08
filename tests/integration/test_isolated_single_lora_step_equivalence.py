@@ -1,13 +1,13 @@
 """
-Integration tests: per_adapter single-LoRA step equivalence (sequential clusters).
+Integration tests: isolated single-LoRA step equivalence (sequential clusters).
 
 Strategy
 --------
 Run the two clusters **sequentially** on the *same* GPU set so GPU requirements are
 halved compared to running them in parallel.
 
-Phase 1 — per_adapter cluster (multi-LoRA, ROLL_rlix ported strategy):
-  - Register all adapters under ``lora_optimizer_mode="per_adapter"``.
+Phase 1 — isolated cluster (multi-LoRA, ROLL_rlix ported strategy):
+  - Register all adapters under ``is_lora_optimizer_isolated=True``.
   - For each adapter in turn, run ``train_step_lora`` for *n_steps* steps.
   - Record the scalar loss returned at every step.
   - Teardown.
@@ -67,7 +67,7 @@ The test enforces this via four mechanisms:
    TP dropout, weight init) starts from the same state.
 
 Phase 1 dependencies (must be ported into ROLL_rlix before tests pass):
-  - ``MegatronTrainStrategy.train_step_lora``  with ``lora_optimizer_mode="per_adapter"``
+  - ``MegatronTrainStrategy.train_step_lora``  with ``is_lora_optimizer_isolated=True``
   - ``Worker.train_step_lora``
   - ``Worker.{get_lora_tensors, set_lora_tensors, copy_lora_params}``
 """
@@ -168,7 +168,7 @@ def _system_envs() -> dict:
     return {"PYTHONPATH": pythonpath}
 
 
-def _per_adapter_worker_config(
+def _isolated_worker_config(
     *,
     adapter_names: list[str],
     model_dir: str,
@@ -177,7 +177,7 @@ def _per_adapter_worker_config(
     pp: int = 1,
     gradient_accumulation_steps: int = 1,
 ) -> WorkerConfig:
-    """WorkerConfig for the per_adapter multi-LoRA cluster.
+    """WorkerConfig for the isolated multi-LoRA cluster.
 
     Determinism:
     - ``lora_dropout=0.0``   — no randomness in LoRA layers.
@@ -212,8 +212,8 @@ def _per_adapter_worker_config(
                 "expert_model_parallel_size": 1,
                 "context_parallel_size": 1,
                 "overlap_p2p_comm": False,
-                "use_distributed_optimizer": False,   # required by per_adapter prototype
-                "lora_optimizer_mode": "per_adapter",
+                "use_distributed_optimizer": False,   # required by isolated prototype
+                "is_lora_optimizer_isolated": True,
             },
         ),
         device_mapping=f"list(range(0, {dp * tp * pp}))",
@@ -233,10 +233,10 @@ def _reference_worker_config(
 ) -> WorkerConfig:
     """WorkerConfig for an upstream single-LoRA reference cluster.
 
-    Uses the *same* GPU set as the per_adapter cluster (sequential execution).
+    Uses the *same* GPU set as the isolated cluster (sequential execution).
 
     Determinism: applies the same ``model_config_kwargs`` and ``lora_dropout=0.0``
-    as the per_adapter cluster so both phases are identically dropout-free.
+    as the isolated cluster so both phases are identically dropout-free.
     """
     adapters = {
         adapter_name: LoraArguments(lora_rank=8, lora_alpha=16, lora_dropout=0.0, lora_target=_LORA_TARGETS)
@@ -279,7 +279,7 @@ def _make_microbatch(input_ids: torch.Tensor, adapter_name: str, global_step: in
 
     Determinism: ``is_offload_optimizer_states_in_train_step=False`` disables the
     async CPU↔GPU optimizer-state offload that happens between steps.  In
-    ``per_adapter`` mode the optimizer states are always kept resident anyway, but
+    ``isolated`` mode the optimizer states are always kept resident anyway, but
     setting this on the reference cluster prevents any timing-dependent numerical
     differences from asynchronous offload.
     """
@@ -354,9 +354,9 @@ def _run_equivalence_test(
     phase1_order: str = "sequential",
 ) -> None:
     """
-    Phase 1: per_adapter multi-LoRA cluster
+    Phase 1: isolated multi-LoRA cluster
     ----------------------------------------
-    1. Create cluster (all adapters, ``lora_optimizer_mode="per_adapter"``).
+    1. Create cluster (all adapters, ``is_lora_optimizer_isolated=True``).
     2. Seed all adapters with identical initial weights (copy from first).
     3. Save those initial weights for Phase 2 reference clusters.
     4. Train all adapters for *n_steps* steps under one of two orderings
@@ -375,7 +375,7 @@ def _run_equivalence_test(
                    train_step_lora(adapter, step)
 
        Both orderings must produce the *same* per-adapter per-step loss because
-       ``per_adapter`` mode isolates each adapter's optimizer state so that one
+       ``isolated`` mode isolates each adapter's optimizer state so that one
        adapter's step does NOT affect any other adapter's weight or momentum.
     5. Teardown cluster.
 
@@ -392,7 +392,7 @@ def _run_equivalence_test(
     Assertion
     ---------
     For every (adapter, step) pair:
-      per_adapter_loss[adapter][step] == reference_loss[adapter][step].
+      isolated_loss[adapter][step] == reference_loss[adapter][step].
 
     Determinism
     -----------
@@ -403,7 +403,7 @@ def _run_equivalence_test(
     - Driver-side RNG is reset via ``_seed_driver(seed)`` before both phases.
     - Both clusters use the same ``pipeline_config.seed`` (worker-side Megatron RNG).
     """
-    debug_trace = os.environ.get("RLIX_DEBUG_PER_ADAPTER", "") not in ("", "0", "false", "False")
+    debug_trace = os.environ.get("RLIX_DEBUG_ISOLATED_LORA", "") not in ("", "0", "false", "False")
 
     # Fixed token sequences, one per step (different steps → different data,
     # making the multi-step comparison more discriminating).
@@ -425,11 +425,11 @@ def _run_equivalence_test(
     ]
 
     # -----------------------------------------------------------------------
-    # Phase 1: per_adapter cluster
+    # Phase 1: isolated cluster
     # Reset driver-side RNG so host-side tensor construction is reproducible.
     # -----------------------------------------------------------------------
     _seed_driver(seed)
-    pa_cfg = _per_adapter_worker_config(
+    pa_cfg = _isolated_worker_config(
         adapter_names=adapter_names,
         model_dir=model_dir,
         dp=dp,
@@ -438,7 +438,7 @@ def _run_equivalence_test(
         gradient_accumulation_steps=ga_steps,
     )
     pa_cluster = Cluster(
-        name=_unique_cluster_name("multi_lora_per_adapter"),
+        name=_unique_cluster_name("multi_lora_isolated"),
         worker_cls=pa_cfg.worker_cls,
         resource_manager=resource_manager,
         worker_config=pa_cfg,
@@ -464,8 +464,8 @@ def _run_equivalence_test(
         }
 
     # Train all adapters for n_steps steps under the requested ordering.
-    per_adapter_losses: dict[str, list[float]] = {name: [] for name in adapter_names}
-    per_adapter_lora_trace: dict[str, list[dict[str, torch.Tensor]]] = {
+    isolated_losses: dict[str, list[float]] = {name: [] for name in adapter_names}
+    isolated_lora_trace: dict[str, list[dict[str, torch.Tensor]]] = {
         name: [] for name in adapter_names
     }
 
@@ -476,14 +476,14 @@ def _run_equivalence_test(
             for step in range(n_steps):
                 mb = _make_microbatch(step_input_ids[step], name, global_step=step)
                 result = pa_cluster.train_step_lora(mb)
-                per_adapter_losses[name].append(_extract_loss(result))
+                isolated_losses[name].append(_extract_loss(result))
                 if debug_trace:
-                    per_adapter_lora_trace[name].append(pa_cluster.get_lora_tensors(name)[0])
+                    isolated_lora_trace[name].append(pa_cluster.get_lora_tensors(name)[0])
 
     elif phase1_order == "interleaved":
         # Round-robin: one step per adapter per outer iteration.
         # Verifies that interleaving does NOT corrupt any adapter's loss
-        # trajectory — the key correctness claim of per_adapter optimizer
+        # trajectory — the key correctness claim of isolated optimizer
         # isolation.  Each adapter has its own step counter so global_step
         # is per-adapter, matching what the reference cluster sees.
         adapter_step: dict[str, int] = {name: 0 for name in adapter_names}
@@ -492,9 +492,9 @@ def _run_equivalence_test(
                 s = adapter_step[name]
                 mb = _make_microbatch(step_input_ids[s], name, global_step=s)
                 result = pa_cluster.train_step_lora(mb)
-                per_adapter_losses[name].append(_extract_loss(result))
+                isolated_losses[name].append(_extract_loss(result))
                 if debug_trace:
-                    per_adapter_lora_trace[name].append(pa_cluster.get_lora_tensors(name)[0])
+                    isolated_lora_trace[name].append(pa_cluster.get_lora_tensors(name)[0])
                 adapter_step[name] += 1
 
     else:
@@ -550,13 +550,13 @@ def _run_equivalence_test(
         reference_losses[name] = step_losses
 
     if debug_trace:
-        # Lightweight diff report to bisect divergence between per_adapter and reference runs.
+        # Lightweight diff report to bisect divergence between isolated and reference runs.
         for name in adapter_names:
             if init_weights is None:
                 continue
             init_tensors = init_weights[name]
             for step in range(n_steps):
-                pa_tensors = per_adapter_lora_trace[name][step]
+                pa_tensors = isolated_lora_trace[name][step]
                 ref_tensors = reference_lora_trace[name][step]
                 max_diff = 0.0
                 max_key = None
@@ -580,13 +580,13 @@ def _run_equivalence_test(
                     if ref_d > max_ref_delta:
                         max_ref_delta = ref_d
                 print(f"[debug] adapter={name} step={step} max_lora_param_abs_diff={max_diff:.6e} key={max_key}")
-                print(f"[debug] adapter={name} step={step} max_abs_delta_vs_init: per_adapter={max_pa_delta:.6e} reference={max_ref_delta:.6e}")
+                print(f"[debug] adapter={name} step={step} max_abs_delta_vs_init: isolated={max_pa_delta:.6e} reference={max_ref_delta:.6e}")
 
     # -----------------------------------------------------------------------
-    # Assert: per_adapter loss == reference loss at every (adapter, step)
+    # Assert: isolated loss == reference loss at every (adapter, step)
     # -----------------------------------------------------------------------
     for name in adapter_names:
-        pa_losses = per_adapter_losses[name]
+        pa_losses = isolated_losses[name]
         ref_losses = reference_losses[name]
         assert len(pa_losses) == len(ref_losses) == n_steps, (
             f"[adapter={name}] Unexpected step count: pa={len(pa_losses)}, ref={len(ref_losses)}"
@@ -602,7 +602,7 @@ def _run_equivalence_test(
                 msg=(
                     f"Loss mismatch at adapter={name!r} step={step} "
                     f"[dp={dp}, tp={tp}, pp={pp}]: "
-                    f"per_adapter={pa_loss:.8f}, reference={ref_loss:.8f}"
+                    f"isolated={pa_loss:.8f}, reference={ref_loss:.8f}"
                 ),
             )
 
@@ -615,7 +615,7 @@ def _run_equivalence_test(
     torch.cuda.device_count() < 1,
     reason="TC-1 requires >= 1 CUDA device (dp=1, tp=1).",
 )
-def test_tc1_per_adapter_single_lora_step_dp1_tp1():
+def test_tc1_isolated_single_lora_step_dp1_tp1():
     """
     TC-1  dp=1, tp=1, adapters=[a, b], n_steps=3.
 
@@ -657,7 +657,7 @@ def test_tc1_per_adapter_single_lora_step_dp1_tp1():
     torch.cuda.device_count() < 2,
     reason="TC-2 requires >= 2 CUDA devices (dp=2, tp=1).",
 )
-def test_tc2_per_adapter_single_lora_step_dp2_tp1():
+def test_tc2_isolated_single_lora_step_dp2_tp1():
     """
     TC-2  dp=2, tp=1, adapters=[a, b, c], n_steps=3.
 
@@ -695,7 +695,7 @@ def test_tc2_per_adapter_single_lora_step_dp2_tp1():
     torch.cuda.device_count() < 2,
     reason="TC-3 requires >= 2 CUDA devices (dp=1, tp=2).",
 )
-def test_tc3_per_adapter_single_lora_step_dp1_tp2():
+def test_tc3_isolated_single_lora_step_dp1_tp2():
     """
     TC-3  dp=1, tp=2, adapters=[a, b, c], n_steps=3.
 
@@ -733,7 +733,7 @@ def test_tc3_per_adapter_single_lora_step_dp1_tp2():
     torch.cuda.device_count() < 4,
     reason="TC-4 requires >= 4 CUDA devices (dp=2, tp=2).",
 )
-def test_tc4_per_adapter_single_lora_step_dp2_tp2():
+def test_tc4_isolated_single_lora_step_dp2_tp2():
     """
     TC-4  dp=2, tp=2, adapters=[a, b, c], n_steps=3.
 
@@ -772,7 +772,7 @@ def test_tc4_per_adapter_single_lora_step_dp2_tp2():
     torch.cuda.device_count() < 2,
     reason="TC-5 requires >= 2 CUDA devices (dp=1, tp=1, pp=2).",
 )
-def test_tc5_per_adapter_single_lora_step_dp1_tp1_pp2():
+def test_tc5_isolated_single_lora_step_dp1_tp1_pp2():
     """
     TC-5  dp=1, tp=1, pp=2, adapters=[a, b, c], n_steps=1.
 
@@ -811,7 +811,7 @@ def test_tc5_per_adapter_single_lora_step_dp1_tp1_pp2():
     torch.cuda.device_count() < 4,
     reason="TC-6 requires >= 4 CUDA devices (dp=1, tp=2, pp=2).",
 )
-def test_tc6_per_adapter_single_lora_step_dp1_tp2_pp2():
+def test_tc6_isolated_single_lora_step_dp1_tp2_pp2():
     """
     TC-6  dp=1, tp=2, pp=2, adapters=[a, b, c], n_steps=1.
 
@@ -850,7 +850,7 @@ def test_tc6_per_adapter_single_lora_step_dp1_tp2_pp2():
     torch.cuda.device_count() < 4,
     reason="TC-7 requires >= 4 CUDA devices (dp=2, tp=1, pp=2).",
 )
-def test_tc7_per_adapter_single_lora_step_dp2_tp1_pp2():
+def test_tc7_isolated_single_lora_step_dp2_tp1_pp2():
     """
     TC-7  dp=2, tp=1, pp=2, adapters=[a, b, c], n_steps=1.
 

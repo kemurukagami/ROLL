@@ -262,8 +262,10 @@ class DistillVLMPipeline(BasePipeline):
                 metrics_mgr.clear_metrics()
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
+                # VLM batches carry multimodal data in non_tensor_batch; broadcast to all PP/TP/CP ranks.
                 batch.meta_info = {"global_step": global_step, "is_offload_states": False,
-                                   "is_offload_optimizer_states_in_train_step": False, "loss_mask_keys": ["labels_for_loss"]}
+                                   "is_offload_optimizer_states_in_train_step": False, "loss_mask_keys": ["labels_for_loss"],
+                                   "_broadcast_non_tensor_batch": True}
                 batch_offset = self.logits_transfer_group.apply_offset_by_dp(batch)
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     with Timer(name="teacher_forward", logger=None) as teacher_timer:

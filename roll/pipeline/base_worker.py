@@ -114,10 +114,10 @@ class ActorWorker(Worker):
 
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def train_step_lora(self, data: DataProto):
-        """Multi-LoRA training step.
+        """Single-adapter-per-call LoRA training step.
 
-        Routes per-adapter microbatches via ``non_tensor_batch["lora_name"]`` to
-        ``MegatronTrainStrategy.train_step_lora`` with ``lora_optimizer_mode="per_adapter"``.
+        Routes microbatches via ``non_tensor_batch["lora_name"]`` to
+        ``MegatronTrainStrategy.train_step_lora`` with per-adapter optimizer.
         """
         global_step = data.meta_info.get("global_step", 0)
         is_offload_states = data.meta_info.get("is_offload_states", True)
@@ -168,32 +168,11 @@ class ActorWorker(Worker):
             lora_metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
             # Use append_to_dict to match train_step accumulation pattern (consistent with reducers).
             append_to_dict(metrics, lora_metrics)
-            # Build CPU bucket cache for dirty adapters while GPU weights are still resident.
-            # Only applicable when RLix selective sync is enabled (DO_TIME_SHARING mode).
-            # Must run before state_offload_manger offloads weights back to CPU.
-            if DO_TIME_SHARING:
-                # per_adapter_step is set by RLixMultiLoraPipeline.run() via meta_info["global_step"].
-                per_adapter_step = int(data.meta_info.get("global_step", 0))
-                checkpoint_version = int(data.meta_info.get("checkpoint_version", per_adapter_step))
-                valid_adapters = set((self.worker_config.model_args.adapters or {}).keys())
-                lora_arr = (data.non_tensor_batch or {}).get("lora_name")
-                if lora_arr is not None and valid_adapters:
-                    # Deduplicate while preserving order (dict.fromkeys trick).
-                    dirty = list(dict.fromkeys(
-                        s for s in (str(n) for n in lora_arr.tolist()) if s in valid_adapters
-                    ))
-                    for adapter in dirty:
-                        if callable(getattr(self.strategy, "_build_latest_bucket_cache", None)):
-                            self.strategy._build_latest_bucket_cache(
-                                checkpoint_version=checkpoint_version,
-                                adapter_name=adapter,
-                            )
             # Mirror train_step summary metrics so dashboards remain comparable in multi-LoRA mode.
             # For per-adapter optimizer mode, avoid using the top-level scheduler LR because it can
             # diverge from actual adapter schedulers; prefer active-adapter LR(s).
             if "actor/lr" not in metrics:
-                lora_mode = getattr(self.strategy, "lora_optimizer_mode", None)
-                if lora_mode == "per_adapter" and getattr(self.strategy, "adapter_schedulers", None):
+                if getattr(self.strategy, "adapter_schedulers", None):
                     active_adapters = []
                     lora_arr = data.non_tensor_batch.get("lora_name", None) if data.non_tensor_batch else None
                     if lora_arr is not None:

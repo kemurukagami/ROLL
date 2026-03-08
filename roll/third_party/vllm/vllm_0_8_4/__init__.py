@@ -21,11 +21,12 @@ if not hasattr(_LoRALRUCache, "_LRUCache__update") and hasattr(_LRUCache, "_LRUC
     setattr(_LoRALRUCache, "_LRUCache__update", _LRUCache._LRUCache__touch)
 
 # Patch vLLM v1 dummy profiling run to avoid indexing with a NumPy int64 array.
+# Source: vllm/v1/worker/gpu_model_runner.py::GPUModelRunner._dummy_run (vllm==0.8.4)
 #
 # vllm==0.8.4 builds `logit_indices` as a NumPy array and uses it to index a torch.Tensor
 # (`hidden_states[logit_indices]`). In some environments this raises:
 #   RuntimeError: Could not infer dtype of numpy.int64
-# Convert indices to a torch.LongTensor on the correct device before indexing.
+# Fix: convert indices to torch.LongTensor on the correct device before indexing (lines 80-81).
 import vllm.v1.worker.gpu_model_runner as _v1_gpu_model_runner
 import torch as _torch
 
@@ -144,7 +145,8 @@ def abort_requests(
 OutputProcessor.abort_requests = abort_requests
 
 
-# patch qwen3 fp8
+# Patch Qwen3 fp8 block quantization offset/size calculation.
+# Source: vllm/model_executor/layers/linear.py::QKVParallelLinear.weight_loader_v2 (vllm==0.8.4)
 # https://github.com/vllm-project/vllm/issues/17327
 # https://github.com/vllm-project/vllm/pull/17318
 from vllm.model_executor.layers.linear import QKVParallelLinear

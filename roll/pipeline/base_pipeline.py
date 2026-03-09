@@ -174,6 +174,80 @@ class BasePipeline:
                     except Exception as e:
                         logger.warning(f"Failed to delete checkpoint {ckpt_dir}: {e}")
 
+    # -- Partial-GPU helpers: translate GPU IDs to DP ranks for shrink/expand --
+    # Subclasses must set _infer_gpus_per_dp_rank and _infer_device_mapping during __init__.
+
+    _infer_gpus_per_dp_rank: int = 0
+    _infer_device_mapping: List[int] = []
+
+    def _target_gpus_to_dp_ranks_to_remove(self, *, target_gpus: List[int]) -> List[int]:
+        """Translate target GPU IDs to DP ranks for shrink (intersection semantics).
+
+        A DP rank is included if ANY of its GPUs overlap with target_gpus.
+        This is used for shrink operations where we want to offload any rank
+        that touches the training GPU set.
+        """
+        if not isinstance(target_gpus, list) or not target_gpus:
+            raise ValueError("target_gpus must be a non-empty list[int]")
+        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
+        device_mapping = list(self._infer_device_mapping)
+        if len(device_mapping) % gpus_per_dp_rank != 0:
+            raise RuntimeError("device_mapping length must be divisible by gpus_per_dp_rank")
+        target = set(int(gpu_id) for gpu_id in target_gpus)
+        min_gpu = min(target)
+        max_gpu = max(target)
+        if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
+            logger.warning(
+                f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
+                f"({gpus_per_dp_rank}). DP rank boundary violation detected "
+                f"for target GPUs {sorted(target)}. "
+                f"Rollout DP ranks may not cleanly map to training GPUs."
+            )
+        max_dp = len(device_mapping) // gpus_per_dp_rank
+        out: List[int] = []
+        for dp_rank in range(max_dp):
+            start = dp_rank * gpus_per_dp_rank
+            dp_gpus = set(int(gpu_id) for gpu_id in device_mapping[start : start + gpus_per_dp_rank])
+            if dp_gpus.intersection(target):
+                out.append(dp_rank)
+        if not out:
+            raise RuntimeError("No dp ranks matched target_gpus for shrink")
+        return out
+
+    def _target_gpus_to_dp_ranks_to_add(self, *, target_gpus: List[int]) -> List[int]:
+        """Translate target GPU IDs to DP ranks for expand (subset semantics).
+
+        A DP rank is included only if ALL its GPUs are in target_gpus.
+        This is used for expand operations where we only want to activate ranks
+        whose full GPU slice is available.
+        """
+        if not isinstance(target_gpus, list) or not target_gpus:
+            raise ValueError("target_gpus must be a non-empty list[int]")
+        gpus_per_dp_rank = int(self._infer_gpus_per_dp_rank)
+        device_mapping = list(self._infer_device_mapping)
+        if len(device_mapping) % gpus_per_dp_rank != 0:
+            raise RuntimeError("device_mapping length must be divisible by gpus_per_dp_rank")
+        target = set(int(gpu_id) for gpu_id in target_gpus)
+        min_gpu = min(target)
+        max_gpu = max(target)
+        if min_gpu % gpus_per_dp_rank != 0 or (max_gpu + 1) % gpus_per_dp_rank != 0:
+            logger.warning(
+                f"Target GPU range [{min_gpu}, {max_gpu}] not aligned with DP granularity "
+                f"({gpus_per_dp_rank}). DP rank boundary violation detected "
+                f"for target GPUs {sorted(target)}. "
+                f"Rollout DP ranks may not cleanly map to training GPUs."
+            )
+        max_dp = len(device_mapping) // gpus_per_dp_rank
+        out: List[int] = []
+        for dp_rank in range(max_dp):
+            start = dp_rank * gpus_per_dp_rank
+            dp_gpus = set(int(gpu_id) for gpu_id in device_mapping[start : start + gpus_per_dp_rank])
+            if dp_gpus and dp_gpus.issubset(target):
+                out.append(dp_rank)
+        if not out:
+            raise RuntimeError("No dp ranks matched target_gpus for expand")
+        return out
+
     def download_models(self, *clusters: Cluster):
         node2pg: Dict[str, PlacementGroup] = {}
         node2model_names: Dict[str, set[str]] = defaultdict(set)

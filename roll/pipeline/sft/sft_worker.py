@@ -31,9 +31,9 @@ class SFTWorker(Worker):
 
     @register(Dispatch.DP_MP_DISPATCH_FIRST, clear_cache=False)
     def train_step(self, data: DataProto):
+        # Caller must provide meta_info; guard against None for get_data_input.
         if data.meta_info is None:
             data.meta_info = {}
-        data.meta_info.setdefault("_broadcast_non_tensor_batch", True)
         data = self.strategy.get_data_input(data)
         data = data.to(current_platform.device_type)
 
@@ -50,18 +50,18 @@ class SFTWorker(Worker):
         the per-adapter optimizer.step() for the adapter identified by
         ``non_tensor_batch["lora_name"]``.
         """
-        if data.meta_info is None:
-            data.meta_info = {}
-        # Broadcast non_tensor_batch (including lora_name) to all TP/PP ranks first.
-        # ensure_lora_name_in_batch runs after so every rank has the full non_tensor_batch.
-        data.meta_info.setdefault("_broadcast_non_tensor_batch", True)
+        # Caller must set _broadcast_non_tensor_batch=True so LoRA routing keys reach all ranks.
+        if not (data.meta_info or {}).get("_broadcast_non_tensor_batch"):
+            raise RuntimeError(
+                "train_step_lora requires caller to set meta_info['_broadcast_non_tensor_batch'] = True"
+            )
         data = self.strategy.get_data_input(data)
         # Validate/fill lora_name after broadcast — all ranks now have non_tensor_batch.
-        _bs = data.batch.batch_size[0] if data.batch is not None else None
+        batch_size = data.batch.batch_size[0] if data.batch is not None else None
         ensure_lora_name_in_batch(
             data.non_tensor_batch,
             adapters=self.worker_config.model_args.adapters,
-            batch_size=_bs,
+            batch_size=batch_size,
         )
         data = data.to(current_platform.device_type)
         metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)

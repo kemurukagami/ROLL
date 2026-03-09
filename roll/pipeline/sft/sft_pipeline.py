@@ -208,7 +208,8 @@ class SFTPipeline(BasePipeline):
                 with Timer(name="step_train", logger=None) as step_train_timer:
                     batch: DataProto = DataProto.from_single_dict(batch_dict)
                     batch.meta_info = {"global_step": global_step, "is_offload_optimizer_states_in_train_step": False,
-                                       "loss_mask_keys": ["labels"]}
+                                       "loss_mask_keys": ["labels"],
+                                       "_broadcast_non_tensor_batch": True}
                     # Reorder data for DP rank load balancing
                     batch_balance_metrics = batch_balance(batch, dp_size=self.sft_train.dp_size,
                                                           minibatch_size=self.global_train_batch_size)

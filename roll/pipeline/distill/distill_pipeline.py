@@ -285,7 +285,8 @@ class DistillPipeline(BasePipeline):
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
                 batch.meta_info = {"global_step": global_step, "is_offload_states": False, "is_offload_optimizer_states_in_train_step": False,
-                                   'loss_mask_keys': ['labels_for_loss']}
+                                   'loss_mask_keys': ['labels_for_loss'],
+                                   "_broadcast_non_tensor_batch": True}
                 # Reorder data for DP rank load balancing
                 batch_balance_metrics = batch_balance(batch, dp_size=self.student.dp_size, minibatch_size=self.batch_size)
                 metrics_mgr.add_metrics(batch_balance_metrics)
@@ -338,7 +339,8 @@ class DistillPipeline(BasePipeline):
         val_loss_list = []
         for batch_dict in self.val_dataloader:
             batch: DataProto = DataProto.from_single_dict(batch_dict)
-            batch.meta_info = {"is_offload_optimizer_states_in_train_step": False}
+            batch.meta_info = {"is_offload_optimizer_states_in_train_step": False,
+                              "_broadcast_non_tensor_batch": True}
             val_metrics_refs = self.student.val_step(batch, blocking=False)
             val_metrics = DataProto.materialize_concat(data_refs=val_metrics_refs)
             val_metrics = val_metrics.meta_info.pop("metrics", {})

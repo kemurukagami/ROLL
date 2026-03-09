@@ -19,8 +19,6 @@ from roll.pipeline.agentic.agentic_config import AgenticConfig, EnvManagerConfig
 from roll.pipeline.agentic.agentic_pipeline import (
     compute_rollout_traj_metrics,
     compute_train_data_metrics,
-    target_gpus_to_dp_ranks_to_remove,
-    target_gpus_to_dp_ranks_to_add,
 )
 from roll.pipeline.agentic.utils import (
     agentic_compute_advantage,
@@ -650,10 +648,8 @@ class AgenticMultiLoraPipeline(BasePipeline):
                                             len(pending_by_tag),
                                         )
                                     # Translate target_gpus to dp_ranks using TP/PP-aware mapping.
-                                    dp_ranks = target_gpus_to_dp_ranks_to_remove(
+                                    dp_ranks = self._target_gpus_to_dp_ranks_to_remove(
                                         target_gpus=target_gpus,
-                                        gpus_per_dp_rank=self._infer_gpus_per_dp_rank,
-                                        device_mapping=self._infer_device_mapping,
                                     )
                                     # Multi-scheduler safety: shrink (routing update + abort/drain) must be applied to
                                     # every RequestScheduler that can dispatch to the soon-to-be-offloaded ranks.
@@ -849,10 +845,8 @@ class AgenticMultiLoraPipeline(BasePipeline):
                                             target_gpus,
                                         )
                                     # Translate target_gpus to dp_ranks using TP/PP-aware mapping.
-                                    dp_ranks = target_gpus_to_dp_ranks_to_add(
+                                    dp_ranks = self._target_gpus_to_dp_ranks_to_add(
                                         target_gpus=target_gpus,
-                                        gpus_per_dp_rank=self._infer_gpus_per_dp_rank,
-                                        device_mapping=self._infer_device_mapping,
                                     )
                                     # Expand sequentially: first scheduler loads model states, then others
                                     # update routing only. Parallel expand would allow routing to new ranks

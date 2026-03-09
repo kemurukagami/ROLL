@@ -75,6 +75,9 @@ class ActorWorker(Worker):
             is_offload_states=is_offload_states,
             load_kwargs={"include": [OffloadStateType.model_params, OffloadStateType.other_params]},
         ):
+            # TODO: to(device) before get_data_input() is legacy order — broadcast_object_list
+            # serializes GPU tensors back to CPU. Prefer get_data_input() first (as in train_step_lora)
+            # to broadcast while data is still on CPU, then move to GPU once.
             data = data.to(current_platform.device_type)
             data = self.strategy.get_data_input(data)
             per_device_train_batch_size = self.worker_config.training_args.per_device_train_batch_size
@@ -96,16 +99,18 @@ class ActorWorker(Worker):
                     dataloader_kwargs={"shuffle": True},
                 )
 
-            for batch_idx, backward_batch in tqdm(enumerate(dataloader),
-                                                  desc=f"{self.worker_name} train global step {global_step}",
-                                                  total=data.batch.batch_size[0] * self.pipeline_config.ppo_epochs // backward_batch_size):
+            # Count actual iterations instead of static formula — dynamic batching can change the count.
+            actual_backward_steps = 0
+            for backward_batch in tqdm(dataloader,
+                                       desc=f"{self.worker_name} train global step {global_step}"):
                 pg_metrics = self.strategy.train_step(batch=backward_batch, loss_func=self.loss_func)
                 if self.worker_config.use_dynamic_batching_in_train or self.worker_config.use_sequence_packing:
                     pg_metrics = reduce_metrics(pg_metrics)
                 append_to_dict(metrics, pg_metrics)
+                actual_backward_steps += 1
 
             metrics["actor/lr"] = self.strategy.scheduler.get_last_lr()[0]
-            metrics["actor/backward_steps"] = data.batch.batch_size[0] * self.pipeline_config.ppo_epochs // backward_batch_size
+            metrics["actor/backward_steps"] = actual_backward_steps
             data.to("cpu")
 
         self._logprobs_cache.clear()
@@ -124,6 +129,12 @@ class ActorWorker(Worker):
         metrics = {}
         self.logger.info(f"{self.worker_name} lora train global step {global_step}")
 
+        # Fail fast before loading GPU states — caller must broadcast non_tensor_batch for LoRA routing.
+        if not (data.meta_info or {}).get("_broadcast_non_tensor_batch"):
+            raise RuntimeError(
+                "train_step_lora requires caller to set meta_info['_broadcast_non_tensor_batch'] = True"
+            )
+
         # Keep train_step_lora state lifecycle consistent with train_step:
         # reload model params before forward, then offload afterwards.
         with state_offload_manger(
@@ -141,33 +152,42 @@ class ActorWorker(Worker):
             # DP_MP_DISPATCH_FIRST sends batch=None to non-source TP/CP ranks; only normalize routing
             # keys on the source shard before strategy broadcast reconstructs full DataProto everywhere.
             if data.batch is not None:
-                _bs = data.batch.batch_size[0]
+                batch_size = data.batch.batch_size[0]
                 ensure_lora_name_in_batch(
                     data.non_tensor_batch,
                     adapters=self.worker_config.model_args.adapters,
-                    batch_size=_bs,
+                    batch_size=batch_size,
                 )
-            # Ensure non-tensor adapter routing keys are broadcast to all Megatron ranks after dispatch-first.
-            if self.worker_config.model_args.adapters is not None:
-                if data.meta_info is None:
-                    data.meta_info = {}
-                data.meta_info["_broadcast_non_tensor_batch"] = True
-            # Multi-LoRA uses _broadcast_non_tensor_batch=True, which broadcasts full DataProto objects.
-            # Re-apply device placement after broadcast so embedding indices never stay on CPU.
+            # Broadcast non_tensor_batch then move tensors to GPU.
             data = self.strategy.get_data_input(data)
             data = data.to(current_platform.device_type)
-            # Root-cause tracing: always log once per worker so Ray env propagation is not required.
-            if data.batch is not None and not getattr(self, "_logged_train_step_lora_device_once", False):
-                trace_keys = ["input_ids", "attention_mask", "response_mask", "labels"]
-                trace = {
-                    k: str(data.batch[k].device) for k in trace_keys if k in data.batch and isinstance(data.batch[k], torch.Tensor)
-                }
-                self.logger.info(f"[device_trace][worker/train_step_lora] devices={trace}")
-                self._logged_train_step_lora_device_once = True
 
-            lora_metrics = self.strategy.train_step_lora(data, loss_func=self.loss_func)
-            # Use append_to_dict to match train_step accumulation pattern (consistent with reducers).
-            append_to_dict(metrics, lora_metrics)
+            # PPO epoch loop — mirrors train_step() so LoRA training runs the same number of
+            # optimizer steps as full-model training when ppo_epochs > 1.
+            if self.worker_config.use_dynamic_batching_in_train:
+                dataloader = make_mini_batch_iter_for_dynamic_batching(
+                    data=data,
+                    epochs=self.pipeline_config.ppo_epochs,
+                    ga_steps=self.worker_config.training_args.gradient_accumulation_steps,
+                )
+            else:
+                dataloader = data.make_iterator(
+                    mini_batch_size=backward_batch_size,
+                    epochs=self.pipeline_config.ppo_epochs,
+                    seed=self.pipeline_config.seed,
+                    dataloader_kwargs={"shuffle": True},
+                )
+
+            # Count actual iterations instead of static formula — dynamic batching can change the count.
+            actual_backward_steps = 0
+            for backward_batch in dataloader:
+                lora_metrics = self.strategy.train_step_lora(backward_batch, loss_func=self.loss_func)
+                if self.worker_config.use_dynamic_batching_in_train or self.worker_config.use_sequence_packing:
+                    lora_metrics = reduce_metrics(lora_metrics)
+                # Use append_to_dict to match train_step accumulation pattern (consistent with reducers).
+                append_to_dict(metrics, lora_metrics)
+                actual_backward_steps += 1
+
             # Mirror train_step summary metrics so dashboards remain comparable in multi-LoRA mode.
             # For per-adapter optimizer mode, avoid using the top-level scheduler LR because it can
             # diverge from actual adapter schedulers; prefer active-adapter LR(s).
@@ -189,8 +209,8 @@ class ActorWorker(Worker):
                         metrics["actor/lr"] = sum(lr_values) / len(lr_values)
                 elif hasattr(self.strategy, "scheduler") and self.strategy.scheduler is not None:
                     metrics["actor/lr"] = self.strategy.scheduler.get_last_lr()[0]
-            if data.batch is not None:
-                metrics["actor/backward_steps"] = data.batch.batch_size[0] // max(backward_batch_size, 1)
+            # Use actual loop count instead of static formula to handle dynamic batching correctly.
+            metrics["actor/backward_steps"] = actual_backward_steps
             data.to("cpu")
 
         # Keep cache lifecycle consistent with train_step to avoid stale logprob cache accumulation.
@@ -475,15 +495,10 @@ class InferWorker(Worker):
         assert getattr(self, "strategy", None) is not None, "worker has no strategy to load"
         if self.rank_info.dp_rank in target_dp_ranks:
             is_loaded = self._get_strategy_load_state()
-            if is_loaded:
-                # Already loaded — vllm_strategy.add_lora() set is_model_in_gpu=True because
+            if not is_loaded:
+                # NOT Already loaded — vllm_strategy.add_lora() set is_model_in_gpu=True because
                 # custom_add_lora calls load_states() on the worker before this point.
                 # Nothing to do; skip the no-op collective RPC.
-                self.logger.info(
-                    f"Worker {self.rank} (DP {self.rank_info.dp_rank}) "
-                    "load_states_partial: already loaded (add_lora preloaded), skipping"
-                )
-            else:
                 await self.strategy.load_states()
                 self.logger.info(f"Worker {self.rank} (DP {self.rank_info.dp_rank}) loaded states")
         else:
@@ -629,35 +644,7 @@ class InferWorker(Worker):
         generation_config["eos_token_id"] = [self.tokenizer.eos_token_id, self.tokenizer.pad_token_id]
         generation_config["pad_token_id"] = self.tokenizer.pad_token_id
         data.meta_info["generation_config"] = generation_config
-        request_id = data.meta_info.get("request_id")
-        src_rank = data.meta_info.get("src_rank")
-        global_step = data.meta_info.get("global_step")
-        max_new_tokens = generation_config.get("max_new_tokens")
-
-        t0 = time.time()
-        if getattr(self, "rank_info", None) is not None and int(self.rank_info.tp_rank) == 0 and src_rank == 0:
-            self.logger.info(
-                f"[InferWorker] generate_request enter"
-                f" request_id={request_id}"
-                f" src_rank={src_rank} global_step={global_step} max_new_tokens={max_new_tokens}"
-            )
-
         data = await self.strategy.generate_request(data=data)
-
-        elapsed_s = time.time() - t0
-        if getattr(self, "rank_info", None) is not None and int(self.rank_info.tp_rank) == 0 and src_rank == 0:
-            if elapsed_s >= 30.0:
-                self.logger.warning(
-                    f"[InferWorker] generate_request slow"
-                    f" elapsed_s={elapsed_s:.3f} request_id={request_id}"
-                    f" src_rank={src_rank} global_step={global_step}"
-                )
-            else:
-                self.logger.info(
-                    f"[InferWorker] generate_request exit"
-                    f" elapsed_s={elapsed_s:.3f} request_id={request_id}"
-                    f" src_rank={src_rank} global_step={global_step}"
-                )
         data.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
         data.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
         return data

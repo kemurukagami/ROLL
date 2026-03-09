@@ -19,7 +19,7 @@ from roll.pipeline.agentic.env_manager.traj_env_manager import TrajEnvManager
 from roll.utils.constants import DO_TIME_SHARING, GenerateStopReason, EpisodeStopReason
 from roll.utils.functionals import pad_to_length, aggregate_metrics
 from roll.utils.hash_utils import compute_object_hash
-from roll.utils.lora_routing import normalize_domain
+
 
 
 class AgentNativeStepEnvManager(TrajEnvManager):
@@ -75,8 +75,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                     self.stop_reason = EpisodeStopReason.MAX_LENGTH
                 elif stop_reason == GenerateStopReason.ABORT:
                     self.stop_reason = EpisodeStopReason.ABORT
-                    if DO_TIME_SHARING:
-                        self.rollout_cache.attempt += 1
+
+                    self.rollout_cache.attempt += 1
             self.log_stats["current_step"].append(self.current_step)
             self.log_stats["generate_time"].append(round(generate_timer.last))
 
@@ -222,19 +222,9 @@ class AgentNativeStepEnvManager(TrajEnvManager):
             "position_ids": position_ids,
         }, batch_size=input_ids.shape[0])
         # Inject lora_name for inference routing; single-adapter uses sole key, multi-adapter validates normalized tag.
-        if self.pipeline_config.actor_infer.model_args.adapters is not None:
-            adapters = self.pipeline_config.actor_infer.model_args.adapters
-            if len(adapters) == 1:
-                lm_input.non_tensor_batch["lora_name"] = np.array([next(iter(adapters.keys()))], dtype=object)
-            else:
-                normalized = normalize_domain(self.rollout_cache.tag)
-                valid_adapters = set(adapters.keys())
-                if normalized not in valid_adapters:
-                    raise RuntimeError(
-                        f"Env tag {self.rollout_cache.tag!r} normalizes to {normalized!r} "
-                        f"which is not in configured adapters: {sorted(valid_adapters)}"
-                    )
-                lm_input.non_tensor_batch["lora_name"] = np.array([normalized], dtype=object)
+        lora_name = self._resolve_lora_name(self.pipeline_config.actor_infer.model_args.adapters)
+        if lora_name is not None:
+            lm_input.non_tensor_batch["lora_name"] = np.array([lora_name], dtype=object)
 
         current_cache["prompt_ids"] = prompt_ids
         current_cache['state_hash'] = compute_object_hash(messages)
@@ -257,21 +247,8 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         samples: List[DataProto] = []
         step_rewards = [i['reward'] for i in self.rollout_cache.history]
         episode_score = sum(step_rewards)
-        # Compute lora_name for training routing once per rollout; tag is constant across steps.
-        if self.pipeline_config.actor_train.model_args.adapters is not None:
-            adapters = self.pipeline_config.actor_train.model_args.adapters
-            if len(adapters) == 1:
-                _lora_name = next(iter(adapters.keys()))
-            else:
-                _lora_name = normalize_domain(self.rollout_cache.tag)
-                _valid = set(adapters.keys())
-                if _lora_name not in _valid:
-                    raise RuntimeError(
-                        f"Env tag {self.rollout_cache.tag!r} normalizes to {_lora_name!r} "
-                        f"which is not in configured adapters: {sorted(_valid)}"
-                    )
-        else:
-            _lora_name = self.rollout_cache.tag
+        # Resolve lora_name once per rollout; adapter map and tag are rollout-constant.
+        _lora_name = self._resolve_lora_name(self.pipeline_config.actor_train.model_args.adapters)
 
         # Initialize lists for step length statistics
         step_prompt_length_list = []
@@ -336,7 +313,7 @@ class AgentNativeStepEnvManager(TrajEnvManager):
                     "env_ids": np.array([self.rollout_cache.env_id], dtype=object),
                     "group_ids": np.array([self.rollout_cache.group_id], dtype=object),
                     "tags": np.array([self.rollout_cache.tag], dtype=object),
-                    "lora_name": np.array([_lora_name], dtype=object),
+                    **({"lora_name": np.array([_lora_name], dtype=object)} if _lora_name is not None else {}),
                     "step_scores": np.array([history["reward"]], dtype=object), # step-level reward, return by env
                     "episode_scores": np.array([episode_score], dtype=object),
                     "state_hash": np.array([history['state_hash']], dtype=object),
@@ -494,26 +471,16 @@ class AgentNativeStepEnvManager(TrajEnvManager):
         infer_logprobs = torch.zeros((1, seq_len - 1), dtype=torch.float)
         lm_input.batch["infer_logprobs"] = infer_logprobs
 
-        # Inject lora_name even for placeholder rollouts so strict routing does not fail later.
-        if self.pipeline_config.actor_train.model_args.adapters is not None:
-            adapters = self.pipeline_config.actor_train.model_args.adapters
-            if len(adapters) == 1:
-                _lora_name = next(iter(adapters.keys()))
-            else:
-                _lora_name = normalize_domain(self.env_config['tag'])
-                _valid = set(adapters.keys())
-                if _lora_name not in _valid:
-                    raise RuntimeError(
-                        f"Env tag {self.env_config['tag']!r} normalizes to {_lora_name!r} "
-                        f"which is not in configured adapters: {sorted(_valid)}"
-                    )
-        else:
-            _lora_name = self.env_config['tag']
+        # Inject lora_name only when adapters are configured; uses env_config tag since rollout_cache may not exist.
+        _placeholder_lora_name = self._resolve_lora_name(
+            self.pipeline_config.actor_train.model_args.adapters, tag=self.env_config['tag']
+        )
+        _placeholder_lora = {"lora_name": np.array([_placeholder_lora_name], dtype=object)} if _placeholder_lora_name is not None else {}
         lm_input.non_tensor_batch = {
             "env_ids": np.array([self.env_config['env_id']], dtype=object),
             "group_ids": np.array([self.env_config['group_id']], dtype=object),
             "tags": np.array([self.env_config['tag']], dtype=object),
-            "lora_name": np.array([_lora_name], dtype=object),
+            **_placeholder_lora,
             "step_scores": np.array([0], dtype=object),
             "episode_scores": np.array([0], dtype=object),
             "state_hash": np.array([''], dtype=object),

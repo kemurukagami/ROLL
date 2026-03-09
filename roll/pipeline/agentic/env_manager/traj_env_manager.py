@@ -105,12 +105,6 @@ class TrajEnvManager(BaseEnvManager):
         assert "seed" in data.meta_info
         self.running = True
         self.group_seed = data.meta_info['seed'] + self.env_config['group_seed']
-        if self.env_config["env_id"] == 0:
-            self.logger.info(
-                f"[TrajEnvManager] run_rollout_loop enter tag={self.env_config.get('tag')} "
-                f"group_id={self.env_config.get('group_id')} env_id={self.env_config.get('env_id')} "
-                f"base_seed={data.meta_info.get('seed')} group_seed={self.group_seed}"
-            )
         rollout_cache: RolloutCache = self.reset()
         start_step = self.current_step
 
@@ -130,8 +124,7 @@ class TrajEnvManager(BaseEnvManager):
                 elif stop_reason == GenerateStopReason.ABORT:
                     # Retry the same turn (same step) after abort. This is used to survive
                     # shrink/rebalance aborts. Each retry increments attempt so request_ids remain unique.
-                    if DO_TIME_SHARING:
-                        self.rollout_cache.attempt += 1
+                    self.rollout_cache.attempt += 1
             log_stats["step_time"].append(step_timer.last)
 
             if self.running and (rollout_cache.terminated or stop_reason == GenerateStopReason.MAX_LENGTH):
@@ -154,20 +147,10 @@ class TrajEnvManager(BaseEnvManager):
                                           group_id=self.env_config['group_id'],
                                           tag=self.env_config['tag'])
 
-        if self.env_config["env_id"] == 0:
-            self.logger.info(
-                f"[TrajEnvManager] reset: waiting for episode_id "
-                f"group_id={self.env_config.get('group_id')} env_id={self.env_config.get('env_id')}"
-            )
         self.episode_id = ray.get(self.output_queue.get_episode_id.remote(
             self.env_config['group_id'],
             self.env_config['env_id']
         ))
-        if self.env_config["env_id"] == 0:
-            self.logger.info(
-                f"[TrajEnvManager] reset: got episode_id={self.episode_id} "
-                f"group_id={self.env_config.get('group_id')} env_id={self.env_config.get('env_id')}"
-            )
         if self.episode_id is None:
             assert not self.running
             return None
@@ -255,6 +238,26 @@ class TrajEnvManager(BaseEnvManager):
         lm_output.meta_info["stop_reason"] = GenerateStopReason.FINISH
         return lm_output
 
+    def _resolve_lora_name(self, adapters: dict | None, tag: str | None = None) -> str | None:
+        """Resolve LoRA adapter name from configured adapters and env tag.
+
+        Returns the resolved adapter name, or None if no adapters configured.
+        Defaults to self.rollout_cache.tag if tag is not provided.
+        """
+        if adapters is None:
+            return None
+        if len(adapters) == 1:
+            return next(iter(adapters.keys()))
+        resolved_tag = tag if tag is not None else self.rollout_cache.tag
+        normalized = normalize_domain(resolved_tag)
+        valid_adapters = set(adapters.keys())
+        if normalized not in valid_adapters:
+            raise RuntimeError(
+                f"Env tag {resolved_tag!r} normalizes to {normalized!r} "
+                f"which is not in configured adapters: {sorted(valid_adapters)}"
+            )
+        return normalized
+
     def format_messages(self, history: RolloutCache) -> DataProto:
         content = self.rollout_cache.history[-1]
 
@@ -302,19 +305,9 @@ class TrajEnvManager(BaseEnvManager):
             "position_ids": position_ids,
         }, batch_size=input_ids.shape[0])
         # Inject lora_name for inference routing; single-adapter uses sole key, multi-adapter validates normalized tag.
-        if self.pipeline_config.actor_infer.model_args.adapters is not None:
-            adapters = self.pipeline_config.actor_infer.model_args.adapters
-            if len(adapters) == 1:
-                lm_input.non_tensor_batch["lora_name"] = np.array([next(iter(adapters.keys()))], dtype=object)
-            else:
-                normalized = normalize_domain(self.rollout_cache.tag)
-                valid_adapters = set(adapters.keys())
-                if normalized not in valid_adapters:
-                    raise RuntimeError(
-                        f"Env tag {self.rollout_cache.tag!r} normalizes to {normalized!r} "
-                        f"which is not in configured adapters: {sorted(valid_adapters)}"
-                    )
-                lm_input.non_tensor_batch["lora_name"] = np.array([normalized], dtype=object)
+        lora_name = self._resolve_lora_name(self.pipeline_config.actor_infer.model_args.adapters)
+        if lora_name is not None:
+            lm_input.non_tensor_batch["lora_name"] = np.array([lora_name], dtype=object)
         content["prompt_ids"] = prompt_ids
         content["messages"] = messages
         return lm_input
@@ -392,29 +385,18 @@ class TrajEnvManager(BaseEnvManager):
             infer_logprobs = pad_to_length(infer_logprobs, length=self.pipeline_config.sequence_length, pad_value=0)
             lm_input.batch["infer_logprobs"] = infer_logprobs[:, 1:]
 
-        # Compute lora_name for training routing; single-adapter uses sole key, multi-adapter validates normalized tag.
-        if self.pipeline_config.actor_train.model_args.adapters is not None:
-            adapters = self.pipeline_config.actor_train.model_args.adapters
-            if len(adapters) == 1:
-                _lora_name = next(iter(adapters.keys()))
-            else:
-                _lora_name = normalize_domain(self.rollout_cache.tag)
-                _valid = set(adapters.keys())
-                if _lora_name not in _valid:
-                    raise RuntimeError(
-                        f"Env tag {self.rollout_cache.tag!r} normalizes to {_lora_name!r} "
-                        f"which is not in configured adapters: {sorted(_valid)}"
-                    )
-        else:
-            _lora_name = self.rollout_cache.tag
-        lm_input.non_tensor_batch.update({
+        non_tensor_update = {
             "env_ids": np.array([self.rollout_cache.env_id], dtype=object),
             "group_ids": np.array([self.rollout_cache.group_id], dtype=object),
             "tags": np.array([self.rollout_cache.tag], dtype=object),
-            "lora_name": np.array([_lora_name], dtype=object),
             "step_scores": np.array([scores], dtype=object),
             "episode_scores": np.array([episode_score], dtype=object),
-        })
+        }
+        # Inject lora_name only when adapters are configured; non-LoRA paths never read it.
+        lora_name = self._resolve_lora_name(self.pipeline_config.actor_train.model_args.adapters)
+        if lora_name is not None:
+            non_tensor_update["lora_name"] = np.array([lora_name], dtype=object)
+        lm_input.non_tensor_batch.update(non_tensor_update)
 
         metrics_agg_mode = self.rollout_cache.history[-1].get('metrics_agg_mode', {})
         history_metrics = [item.get("metrics", {}) for item in self.rollout_cache.history]

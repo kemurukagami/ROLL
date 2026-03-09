@@ -47,6 +47,15 @@ class FSDP2WeightUpdater:
     def __init__(
         self, pipeline_config: PPOConfig, infer_cluster, worker_config, model_update_name: str, model, is_lora
     ):
+        # gather_fsdp2_weights and _add_lora_to_infer_workers both export only the default adapter;
+        # fail fast before any weight gather or broadcast in multi-LoRA configs.
+        if is_lora:
+            adapters = getattr(getattr(worker_config, "model_args", None), "adapters", None)
+            if adapters is not None and len(adapters) > 1:
+                raise RuntimeError(
+                    "FSDP2 model_update does not support multi-LoRA. "
+                    f"Configured adapters: {sorted(adapters.keys())}"
+                )
         self.pipeline_config = pipeline_config
         self.worker_config = worker_config
         self.model_update_name = model_update_name
@@ -318,7 +327,6 @@ class FSDP2WeightUpdater:
         if dist.get_rank() != 0 or not self.is_lora:
             return
         peft_config = self.model.peft_config.get("default", None)
-        # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
         ray.get(
-            [worker.add_lora.remote(adapter_name="default", peft_config=asdict(peft_config)) for worker in self.model_update_infer_workers]
+            [worker.add_lora.remote(peft_config=asdict(peft_config)) for worker in self.model_update_infer_workers]
         )

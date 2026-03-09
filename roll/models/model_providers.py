@@ -149,46 +149,19 @@ def freeze_model(model, model_args: "ModelArguments"):
             param.requires_grad_(False)
 
 
-# Inspired by: https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/model/adapter.py
-def setup_lora_training(
-    config, model, model_args: "ModelArguments", is_trainable: Optional[bool] = False, is_mca: Optional[bool] = False
-):
-    model.enable_input_require_grads()
-    if is_trainable:
-
-        def get_target_modules(model: "torch.nn.Module", model_args: "ModelArguments"):
-            target_modules = model_args.lora_target
-            if "all-linear" in model_args.lora_target:
-                target_modules.remove("all-linear")
-                target_modules += find_all_linear_modules(model)
-            if "all-embedding" in model_args.lora_target:
-                target_modules.remove("all-embedding")
-                target_modules += find_all_embedding_modules(model)
-            if "all-router" in model_args.lora_target:
-                target_modules.remove("all-router")
-                target_modules += find_all_router_modules(model)
-            return target_modules
-
-        target_modules = get_target_modules(model, model_args)
-        lora_config = {
-            "r": model_args.lora_rank,
-            "target_modules": target_modules,
-            "lora_alpha": model_args.lora_alpha,
-            "lora_dropout": model_args.lora_dropout,
-            "modules_to_save": model_args.additional_target,
-        }
-        if not is_mca:
-            lora_config.update({"task_type": TaskType.CAUSAL_LM})
-        model = get_peft_model(
-            model, LoraConfig(**lora_config), autocast_adapter_dtype=model_args.autocast_adapter_dtype
-        )
-    return model
-
-
 def _resolve_lora_target_modules(model: "torch.nn.Module", lora_target: Any) -> Any:
     """Resolve magic targets like 'all-linear' into explicit module-name lists.
 
-    Note: PEFT's LoraConfig supports either a list[str] of module names or a regex string.
+    Accepts lora_target as a comma-separated string, a list of module names, or a regex
+    string (detected by a heuristic check for common regex metacharacters).  Magic tokens
+    'all-linear', 'all-embedding', and 'all-router' are expanded by introspecting the
+    model's named modules via mcore_adapter helpers.
+
+    Returns either a list[str] of concrete module names or a regex string (passthrough).
+
+    Note: unlike upstream's get_target_modules which mutates model_args.lora_target in-place
+    via .remove(), this function creates new lists to avoid corrupting the config when called
+    multiple times on the same model_args (e.g. actor model + MCA model).
     """
 
     def _split_targets(target: Any) -> Any:
@@ -196,7 +169,7 @@ def _resolve_lora_target_modules(model: "torch.nn.Module", lora_target: Any) -> 
             return []
         if isinstance(target, str):
             # Treat as regex when it looks like one; otherwise split on commas.
-            if any(c in target for c in ["*", "$", "|", "("]):
+            if any(c in target for c in ["*", "$", "|", "(", "^", "[", "+", "?", "\\"]):
                 return target
             return [item.strip() for item in target.split(",") if item.strip()]
         return list(target)
@@ -217,14 +190,30 @@ def _resolve_lora_target_modules(model: "torch.nn.Module", lora_target: Any) -> 
     return target_modules
 
 
+
+
+# Inspired by: https://github.com/hiyouga/LLaMA-Factory/blob/main/src/llamafactory/model/adapter.py
 def setup_lora_training_from_adapters(
-    config,
     model,
     adapters: dict,
     is_trainable: Optional[bool] = False,
     is_mca: Optional[bool] = False,
 ):
-    """Apply one or more LoRA adapters described by ``model_args.adapters``."""
+    """Wrap model with one or more named LoRA adapters from the adapters dict.
+
+    Each entry in adapters maps adapter_name -> adapter_args with per-adapter
+    lora_rank, lora_target, lora_alpha, lora_dropout, and additional_target.
+    Target modules are resolved against the pre-LoRA base model to avoid
+    LoRA-on-LoRA when adding multiple adapters.
+
+    Post-setup active-adapter policy:
+    - is_mca=True (Megatron): all adapters activated so Megatron allocates grad
+      buffers for every adapter before wrapping. Per-step routing switches later.
+    - is_mca=False (HF/FSDP2/DeepSpeed): only the first adapter is activated,
+      matching upstream single-adapter semantics.
+
+    When is_trainable is False, only enables input require grads without adding LoRA.
+    """
     model.enable_input_require_grads()
     if not is_trainable:
         return model
@@ -232,28 +221,26 @@ def setup_lora_training_from_adapters(
     base_model = model
     target_modules_map: dict[str, Any] = {}
     for adapter_name, adapter_args in adapters.items():
+        lora_target = getattr(adapter_args, "lora_target", None)
+        if lora_target is None:
+            raise ValueError(f"adapter '{adapter_name}' has no lora_target — cannot create LoRA config.")
         # Resolve module targets against the *pre-LoRA* model to avoid LoRA-on-LoRA
         # when adding multiple adapters.
-        target_modules_map[adapter_name] = _resolve_lora_target_modules(
-            base_model, getattr(adapter_args, "lora_target", None)
-        )
+        target_modules_map[adapter_name] = _resolve_lora_target_modules(base_model, lora_target)
 
+    # First adapter uses get_peft_model() to wrap base model into PeftModel;
+    # subsequent adapters use add_adapter() on the already-wrapped PeftModel.
     peft_model = None
     for adapter_name, adapter_args in adapters.items():
         target_modules = target_modules_map[adapter_name]
-        lora_rank = int(getattr(adapter_args, "lora_rank", 8))
-        lora_alpha = getattr(adapter_args, "lora_alpha", None) or (lora_rank * 2)
-        lora_dropout = float(getattr(adapter_args, "lora_dropout", 0.0) or 0.0)
-        modules_to_save = getattr(adapter_args, "additional_target", None)
-        if isinstance(modules_to_save, str):
-            modules_to_save = [item.strip() for item in modules_to_save.split(",") if item.strip()]
-
+        # adapter_args is always a LoraArguments dataclass pre-normalized by _normalize_adapters;
+        # direct attribute access so misuse fails fast instead of silently using defaults.
         lora_config: dict = {
-            "r": lora_rank,
+            "r": adapter_args.lora_rank,
             "target_modules": target_modules,
-            "lora_alpha": lora_alpha,
-            "lora_dropout": lora_dropout,
-            "modules_to_save": modules_to_save,
+            "lora_alpha": adapter_args.lora_alpha,
+            "lora_dropout": adapter_args.lora_dropout,
+            "modules_to_save": adapter_args.additional_target,
         }
         if not is_mca:
             lora_config.update({"task_type": TaskType.CAUSAL_LM})
@@ -264,7 +251,7 @@ def setup_lora_training_from_adapters(
                 base_model,
                 peft_config,
                 adapter_name=adapter_name,
-                autocast_adapter_dtype=getattr(adapter_args, "autocast_adapter_dtype", True),
+                autocast_adapter_dtype=adapter_args.autocast_adapter_dtype,
             )
         else:
             peft_model.add_adapter(adapter_name, peft_config)
@@ -275,17 +262,22 @@ def setup_lora_training_from_adapters(
             if base is not None and hasattr(base, "_cast_adapter_dtype"):
                 base._cast_adapter_dtype(
                     adapter_name=adapter_name,
-                    autocast_adapter_dtype=getattr(adapter_args, "autocast_adapter_dtype", True),
+                    autocast_adapter_dtype=adapter_args.autocast_adapter_dtype,
                 )
 
     if peft_model is None:
         raise ValueError("adapters is empty but setup_lora_training_from_adapters was called.")
 
-    # Important: PEFT freezes newly-added adapters by default. We need all adapters' params to be
-    # trainable *before* Megatron wraps the model (so grad buffers / main_grad are allocated for
-    # every adapter). Per-step routing will still activate a single adapter at runtime.
-    peft_model.base_model.set_adapter(list(adapters.keys()))
+    # Megatron (is_mca): activate ALL adapters so PEFT marks every adapter trainable before
+    # Megatron wraps the model (grad buffers / main_grad allocated for every adapter).
+    # Per-step routing will call set_adapter(single_name) at runtime.
+    # Non-Megatron: activate only the first adapter to match upstream single-adapter semantics.
+    if is_mca:
+        peft_model.base_model.set_adapter(list(adapters.keys()))
+    else:
+        peft_model.base_model.set_adapter(next(iter(adapters)))
     return peft_model
+
 
 
 def load_model(
@@ -361,10 +353,11 @@ def load_model(
 
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
 
-    if model_args.lora_target is None:
+    # adapters is always populated by __post_init__ when LoRA is enabled.
+    if model_args.adapters is None:
         freeze_model(model, model_args)
     else:
-        model = setup_lora_training(config, model, model_args, is_trainable)
+        model = setup_lora_training_from_adapters(model, model_args.adapters, is_trainable)
 
     if add_valuehead:
         from trl import AutoModelForCausalLMWithValueHead
@@ -572,7 +565,8 @@ def default_actor_model_provider(
         if model_args.moe_aux_loss_coef is not None and training_args.moe_aux_loss_coeff is None:
             training_args.moe_aux_loss_coeff = model_args.moe_aux_loss_coef
         model = AutoModel.from_pretrained(model_args.model_name_or_path, training_args)
-        lora_enabled = (model_args.lora_target is not None) or (model_args.adapters is not None)
+        # adapters is always populated by __post_init__ when LoRA is enabled.
+        lora_enabled = model_args.adapters is not None
         if is_trainable:
             model.train()
             for param in model.parameters():
@@ -587,18 +581,12 @@ def default_actor_model_provider(
         else:
             apply_megatron_lora()
             set_linear_is_expert(model[0])
-            if model_args.adapters is not None:
-                model.models[0] = setup_lora_training_from_adapters(
-                    model[0].config,
-                    model[0],
-                    model_args.adapters,
-                    is_trainable,
-                    is_mca=True,
-                )
-            else:
-                model.models[0] = setup_lora_training(
-                    model[0].config, model[0], model_args, is_trainable, is_mca=True
-                )
+            model.models[0] = setup_lora_training_from_adapters(
+                model[0],
+                model_args.adapters,
+                is_trainable,
+                is_mca=True,
+            )
         patch_model(model, config, use_mcore=True)
     else:
         # hf

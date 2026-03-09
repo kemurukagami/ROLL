@@ -552,6 +552,14 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
         self.model.load_checkpoint(load_dir, tag=tag, **kwargs)
 
     def collect_lora_params(self):
+        # Both ZeRO-3 and non-ZeRO-3 paths export only the default adapter;
+        # fail fast before any silent single-adapter export in multi-LoRA configs.
+        adapters = self.worker_config.model_args.adapters
+        if adapters is not None and len(adapters) > 1:
+            raise RuntimeError(
+                "DeepSpeed LoRA collection does not support multi-LoRA. "
+                f"Configured adapters: {sorted(adapters.keys())}"
+            )
         peft_model = self.unwrap_model()
         if not self.ds_config.is_zero3():
             lora_state_dict = get_peft_model_state_dict(peft_model)
@@ -570,7 +578,8 @@ class DeepSpeedTrainStrategy(DeepSpeedInferStrategy, TrainStrategy):
 
     def setup_model_update(self, infer_cluster, model_update_name: str):
         assert model_update_name not in self.weight_updaters
-        is_lora = self.worker_config.model_args.lora_target is not None
+        # Use adapters (not lora_target) so explicit multi-LoRA configs are recognized.
+        is_lora = self.worker_config.model_args.adapters is not None
         self.weight_updaters[model_update_name] = DeepSpeedWeightUpdater(
             pipeline_config=self.worker.pipeline_config,
             infer_cluster=infer_cluster,

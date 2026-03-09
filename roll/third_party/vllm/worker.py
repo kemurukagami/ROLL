@@ -337,11 +337,19 @@ class WorkerBase:
             sub_params = dict(submod.named_parameters(remove_duplicate=False))
             if not any(".base_layer." in k for k in sub_params):
                 continue
-            sub_aliases = {
-                k.replace(".base_layer.", "."): v
-                for k, v in sub_params.items()
-                if ".base_layer." in k and k.replace(".base_layer.", ".") not in sub_params
-            }
+            # Build aliases stripping ".base_layer." — fail fast if both the
+            # wrapped key and its canonical form exist in the same submodule.
+            sub_aliases = {}
+            for param_name, param_value in sub_params.items():
+                if ".base_layer." not in param_name:
+                    continue
+                canonical = param_name.replace(".base_layer.", ".")
+                if canonical in sub_params:
+                    raise ValueError(
+                        f"base_layer alias collision: both '{param_name}' and '{canonical}' "
+                        f"exist in submodule parameters"
+                    )
+                sub_aliases[canonical] = param_value
             orig = submod.named_parameters
 
             # _make_aliased is a factory to avoid the classic Python late-binding closure bug.

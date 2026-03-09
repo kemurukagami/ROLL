@@ -636,7 +636,8 @@ class FSDP2StrategyBase(InferenceStrategy):
         finally:
             clear_fsdp2_init_context()
 
-        self.is_lora = self.worker_config.model_args.lora_target is not None
+        # Use adapters (not lora_target) so explicit multi-LoRA configs are recognized.
+        self.is_lora = self.worker_config.model_args.adapters is not None
 
         return model, torch_dtype, cp_size
 
@@ -1254,7 +1255,8 @@ class FSDP2TrainStrategy(FSDP2InferStrategy, TrainStrategy):
 
     def setup_model_update(self, infer_cluster, model_update_name: str):
         assert model_update_name not in self.weight_updaters
-        is_lora = self.worker_config.model_args.lora_target is not None
+        # Use adapters (not lora_target) so explicit multi-LoRA configs are recognized.
+        is_lora = self.worker_config.model_args.adapters is not None
         self.weight_updaters[model_update_name] = FSDP2WeightUpdater(
             pipeline_config=self.worker.pipeline_config,
             infer_cluster=infer_cluster,

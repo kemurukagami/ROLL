@@ -1053,7 +1053,8 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self._cache_map: Dict[int, List[Any]] = {}
         self._latest_cached: Optional[int] = None
         self._active_cached: Optional[int] = None
-        self._selective_update_weights_meta = None
+        # weights_meta is computed per-adapter inside _build_latest_bucket_cache()
+        # so that metadata names match the adapter-specific state dict keys.
         # Single global cache owner: pp0/dp0/tp0/cp0 only; set during initialize().
         self._is_cache_owner: bool = False
 
@@ -1918,8 +1919,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         cache_key = int(checkpoint_version)
 
         with self._cache_lock:
-            if self._selective_update_weights_meta is None:
-                self._selective_update_weights_meta = gather_weights_meta_cross_pp(self.models_unwrapped)
+            # Compute weights_meta with the actual adapter_name so metadata names match
+            # the state dict keys used by gather_all_hf_weights (base vs LoRA names).
+            weights_meta = gather_weights_meta_cross_pp(self.models_unwrapped, adapter_name=adapter_name)
 
             # All PP ranks must participate in gather_all_hf_weights (PP collective).
             # Only the cache owner stores results; non-owners drain and discard each batch.
@@ -1927,7 +1929,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             for hf_named_weights in gather_all_hf_weights(
                 self.models_unwrapped,
                 buffer_size=buffer_size,
-                weights_meta=self._selective_update_weights_meta,
+                weights_meta=weights_meta,
                 adapter_name=adapter_name,
             ):
                 if not self._is_cache_owner:

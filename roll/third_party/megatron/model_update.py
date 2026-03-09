@@ -109,7 +109,7 @@ def gather_and_convert_weights(
     all_named_weights = []
     for i, (name, weight) in enumerate(hf_named_weights):
         gathered_weights = [torch.empty_like(weight) for _ in range(ep_group_size)]
-        handles.append(dist.all_gather(gathered_weights, weight, group=ep_group, async_op=True))
+        handles.append(dist.all_gather(gathered_weights, weight.contiguous(), group=ep_group, async_op=True))
         for rank, gathered_weight in enumerate(gathered_weights):
             ep_name = all_names[rank][i]
             all_named_weights.append((ep_name, gathered_weight))
@@ -161,10 +161,23 @@ def _gather_hf_weights(
 def _iter_vp_stage_named_weights(
     models: list[McaGPTModel], model_converter: ModelConverter, adapter_name: str | None = None
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield (mcore_name, tensor) pairs across all virtual pipeline stages.
+
+    adapter_name=None: export base model weights only (LoRA keys filtered out,
+        `.base_layer.` prefix stripped to restore canonical mcore names).
+    adapter_name="<name>": export only that adapter's LoRA delta weights.
+    Non-PeftModel: export full state dict as-is.
+
+    NOTE: Semantic difference from upstream PEFT — upstream's
+    ``get_peft_model_state_dict(adapter_name=None)`` exports the *default*
+    adapter's LoRA state, whereas here ``adapter_name=None`` means "export
+    base weights only, with LoRA keys stripped".  Callers must pass an
+    explicit adapter name to get LoRA delta weights.
+    """
     for vp_stage, model in enumerate(models):
         if is_peft_available() and isinstance(model, PeftModel):
-            # adapter_name=None means "base model cache": export base-only weights and normalize
-            # LoRA wrapper naming so converter sees canonical Megatron names.
+            # adapter_name=None: export base weights only, stripping PEFT wrapper
+            # naming (`.base_layer.`) so ModelConverter sees canonical mcore names.
             if adapter_name is None:
                 full_state_dict = model.state_dict_for_save_checkpoint()
                 mcore_state_dict = {}
@@ -174,6 +187,13 @@ def _iter_vp_stage_named_weights(
                     # LoRA wrappers expose base tensors as "...base_layer.<tensor>"; converter expects
                     # the original tensor names without the wrapper hop.
                     normalized_name = name.replace(".base_layer.", ".")
+                    # Fail fast if stripping ".base_layer." produces a key that already exists,
+                    # which would silently overwrite an unrelated weight.
+                    if normalized_name in mcore_state_dict:
+                        raise ValueError(
+                            f"base_layer name collision: '{name}' normalizes to '{normalized_name}' "
+                            f"which already exists in state dict"
+                        )
                     mcore_state_dict[normalized_name] = weight
             else:
                 mcore_state_dict = get_peft_model_state_dict(
@@ -194,6 +214,13 @@ def gather_pp_stage_hf_weights(
     # gather tp&ep weights, not including pipeline parallel
     if not mpu.model_parallel_is_initialized():
         raise RuntimeError("Model parallelism must be initialized before save as hf inflight.")
+
+    # Resolve lora_rank from peft_config if not already provided by caller
+    # (gather_all_hf_weights already resolves rank and passes it in **kwargs).
+    if "lora_rank" not in kwargs:
+        lora_rank = _resolve_lora_rank(models[0], adapter_name)
+        if lora_rank is not None:
+            kwargs["lora_rank"] = lora_rank
 
     model_config = models[0].config
     model_converter = ModelConverter(model_config, to_hf=True, efficient_mode=True)
@@ -244,45 +271,58 @@ def gather_weights_meta_cross_pp(models: list[McaGPTModel], adapter_name: str | 
     return expert_weights_meta + other_weights_meta
 
 
+def _resolve_lora_rank(model: McaGPTModel, adapter_name: str | None) -> int | None:
+    """Resolve LoRA rank from model.peft_config, the single source of truth.
+
+    Works for both PeftModel instances and project-specific wrappers that carry peft_config
+    without subclassing PeftModel.  Fails fast when an explicit adapter_name is requested
+    but not found in the config.
+    """
+    peft_configs = getattr(model, "peft_config", None)
+    if not isinstance(peft_configs, dict) or not peft_configs:
+        return None
+
+    if adapter_name is None:
+        # Best-effort: use any adapter's rank for converter ops during base-weight export.
+        peft_cfg = next(iter(peft_configs.values()))
+    else:
+        peft_cfg = peft_configs.get(adapter_name)
+        if peft_cfg is None:
+            raise RuntimeError(f"Missing peft_config for adapter {adapter_name!r}")
+
+    lora_rank = getattr(peft_cfg, "r", None)
+    return int(lora_rank) if lora_rank is not None else None
+
+
 def gather_all_hf_weights(
     models: list[McaGPTModel], buffer_size: int, weights_meta: Optional[list[dict]], adapter_name: str | None = None
 ):
-    # weights_meta: list of dict, each dict is {"name": str, "shape": list, "dtype": str, "pp_stage": int, "size": int}
+    """Gather weights across all parallelism dimensions (TP, EP, PP) and convert to HF naming.
+
+    Yields batches of (hf_name, tensor) pairs, bounded by buffer_size.
+
+    Without PP (pp_size <= 1): delegates to gather_pp_stage_hf_weights for TP/EP gather only.
+    With PP: broadcasts each weight from its owning PP stage to all ranks, then gathers TP/EP.
+    Weights are processed in buffered batches to limit peak memory.
+
+    weights_meta: pre-computed list from gather_weights_meta_cross_pp(), each entry is
+        {"name": str, "shape": list, "dtype": str, "pp_stage": int, "size": int}.
+        Only needed when pp_size > 1; ignored otherwise.
+    """
     if not mpu.model_parallel_is_initialized():
         raise RuntimeError("Model parallelism must be initialized before save as hf inflight.")
 
     kwargs: dict = {}
-    lora_rank = None
-    # We may be doing LoRA model_update even when `models[0]` is not a `PeftModel` wrapper,
-    # but still carries `peft_config` (project-specific). Detect LoRA rank robustly and
-    # log once to help diagnose remote failures like:
-    #   TypeError: Template.get_lora_conver_op() missing 1 required positional argument: 'lora_rank'
-    peft_configs = getattr(models[0], "peft_config", None)
-    if adapter_name is not None and isinstance(peft_configs, dict):
-        peft_cfg = peft_configs.get(adapter_name)
-        if peft_cfg is not None and hasattr(peft_cfg, "r"):
-            lora_rank = getattr(peft_cfg, "r")
-    elif adapter_name is None and isinstance(peft_configs, dict) and peft_configs:
-        # Fallback for full-state PEFT export: use any configured adapter rank for converter ops.
-        # Multi-LoRA configs are expected to use a consistent LoRA rank across adapters.
-        first_cfg = next(iter(peft_configs.values()))
-        if first_cfg is not None and hasattr(first_cfg, "r"):
-            lora_rank = getattr(first_cfg, "r")
-
-    is_peft_model = bool(is_peft_available() and "PeftModel" in globals() and isinstance(models[0], PeftModel))  # type: ignore[name-defined]
-    if lora_rank is None and is_peft_model and adapter_name is not None:
-        lora_rank = models[0].peft_config[adapter_name].r
-
+    lora_rank = _resolve_lora_rank(models[0], adapter_name)
     if lora_rank is not None:
-        kwargs["lora_rank"] = int(lora_rank)
+        kwargs["lora_rank"] = lora_rank
 
     if dist.is_initialized() and dist.get_rank() == 0:
         logger.info(
-            "gather_all_hf_weights: adapter=%r lora_rank=%s model_cls=%s peft_model=%s",
+            "gather_all_hf_weights: adapter=%r lora_rank=%s model_cls=%s",
             adapter_name,
             lora_rank,
             type(models[0]).__name__,
-            is_peft_model,
         )
 
     pp_size = models[0].config.pipeline_model_parallel_size
@@ -346,6 +386,8 @@ class MegatronWeightUpdater:
         self._model_update_buffer_size = (
             pipeline_config.model_update_buffer_size_mb * 1024 * 1024
         )  # Convert MB to bytes
+        # Uses `adapters` (not legacy `lora_target`) because __post_init__ normalizes
+        # single-LoRA configs into the `adapters` dict, so this covers both cases.
         self.is_lora = self.worker_config.model_args.adapters is not None
         self.infer_worker_config = infer_cluster.worker_config
         self.infer_cluster = infer_cluster
@@ -362,7 +404,6 @@ class MegatronWeightUpdater:
         # Separated mode attributes
         self.model_update_group_name = None
         self._model_update_locker = None
-        self._weights_meta = None
 
         if self.is_colocated:
             self._setup_colocated_model_update()
@@ -410,7 +451,8 @@ class MegatronWeightUpdater:
                 )
             self._setup_broadcast_group()
 
-        self._weights_meta = gather_weights_meta_cross_pp(self.models_unwrapped)
+        # weights_meta is computed per-adapter inside _gather_and_distribute_weights()
+        # so that metadata names match the adapter-specific state dict keys.
 
     def _setup_separated_model_update(self):
         self._model_update_locker = Locker.options(
@@ -448,7 +490,6 @@ class MegatronWeightUpdater:
                 group_name=self.model_update_group_name,
                 rank_offset=i * num_gpus_per_infer_worker + 1,
                 world_size=infer_device_num + 1,
-                backend="gloo",
             )
             for i, infer_worker in enumerate(self._broadcast_workers)
         ]
@@ -458,7 +499,6 @@ class MegatronWeightUpdater:
             group_name=self.model_update_group_name,
             master_addr=master_address,
             master_port=master_port,
-            backend="gloo",
         )
         ray.get(refs)
 
@@ -467,9 +507,6 @@ class MegatronWeightUpdater:
     def _broadcast_to_infer_workers(self, hf_named_weights) -> list[ray.ObjectRef]:
         if not self._broadcast_workers:
             return []
-        group_backend = collective.get_group_backend(self.model_update_group_name)
-        if group_backend is None:
-            raise RuntimeError(f"Model update collective group not initialized: {self.model_update_group_name!r}")
         refs = [
             worker.broadcast_parameter.remote(
                 group_name=self.model_update_group_name,
@@ -482,8 +519,6 @@ class MegatronWeightUpdater:
         ]
         handles = []
         for _, weight in hf_named_weights:
-            if group_backend == "gloo" and weight.is_cuda:
-                weight = weight.to("cpu")
             handles.append(
                 collective.broadcast(tensor=weight, src_rank=0, group_name=self.model_update_group_name, async_op=True)
             )
@@ -492,6 +527,12 @@ class MegatronWeightUpdater:
         return refs
 
     def _colocated_model_update(self, *, adapters_to_update: list[str] | None = None):
+        """Transfer weights to colocated inference workers via CUDA IPC.
+
+        LoRA mode: loops over each adapter, transfers only LoRA delta weights (not base model),
+        then calls add_lora() to register the adapter in the inference engine.
+        Base mode: transfers full model weights in a single pass.
+        """
         co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
         if self.is_lora:
             peft_configs = self.models_unwrapped[0].peft_config
@@ -499,37 +540,50 @@ class MegatronWeightUpdater:
             for adapter_name, peft_config in peft_configs.items():
                 if selected is not None and adapter_name not in selected:
                     continue
-                self._process_colocated_weight_update(adapter_name)
+                self._gather_and_distribute_weights(adapter_name)
+                # Register adapter on all infer workers (colocated + broadcast).
+                # BLOCKING: upstream was fire-and-forget which races with inference requests.
+                # Fix vs upstream: upstream only registered on _co_infer_worker.
+                # Pure colocated: add_lora on _co_infer_worker only.
+                # Partial overlap: add_lora on both _co_infer_worker and _broadcast_workers.
+                # Pure separated: handled by _separated_model_update() on _broadcast_workers.
+                add_lora_refs: list[ray.ObjectRef] = []
                 if co_infer_rank == 0 and self._co_infer_worker is not None:
-                    # BLOCKING: add_lora waits until adapter is loaded and visible in list_loras().
-                    ray.get(
+                    add_lora_refs.append(
                         self._co_infer_worker.add_lora.remote(
                             adapter_name=adapter_name, peft_config=asdict(peft_config)
                         )
                     )
-                # Colocated mode updates "mismatched" infer workers (non-overlapping GPUs) via broadcast.
-                # They also need the adapter to be registered in their vLLM engines; otherwise routed
-                # requests can fail with "Missing LoRA adapter in vLLM engine".
                 if dist.get_rank() == 0 and self._broadcast_workers:
-                    # BLOCKING: same as above - adapters are fully loaded before ray.get() returns.
-                    ray.get(
-                        [
-                            w.add_lora.remote(adapter_name=adapter_name, peft_config=asdict(peft_config))
-                            for w in self._broadcast_workers
-                        ]
+                    add_lora_refs.extend(
+                        w.add_lora.remote(adapter_name=adapter_name, peft_config=asdict(peft_config))
+                        for w in self._broadcast_workers
                     )
+                if add_lora_refs:
+                    ray.get(add_lora_refs)
         else:
-            self._process_colocated_weight_update(None)
+            self._gather_and_distribute_weights(None)
         return {}
 
-    def _process_colocated_weight_update(self, adapter_name: str | None = None):
+    def _gather_and_distribute_weights(self, adapter_name: str | None = None):
+        """Gather HF-format weights from this PP stage and push them to colocated inference workers.
+
+        Converts Megatron-Core weights to HF naming in buffered batches, serializes each batch,
+        and distributes to inference workers via gather (colocated) or broadcast (remote).
+
+        adapter_name: which adapter's weights to gather. None means base weights only
+            (LoRA keys stripped); a string means that adapter's LoRA delta weights.
+        """
         refs = []
         infer_parallel_size = dist.get_world_size(self._infer_parallel_cpu_group)
         co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
+        # Compute weights_meta with the actual adapter_name so metadata names match
+        # the state dict keys used by gather_all_hf_weights (base vs LoRA names).
+        weights_meta = gather_weights_meta_cross_pp(self.models_unwrapped, adapter_name=adapter_name)
         for hf_named_weights in gather_all_hf_weights(
             self.models_unwrapped,
             buffer_size=self._model_update_buffer_size,
-            weights_meta=self._weights_meta,
+            weights_meta=weights_meta,
             adapter_name=adapter_name,
         ):
             if self._co_infer_worker is not None:
@@ -557,39 +611,34 @@ class MegatronWeightUpdater:
             ray.get(refs)
 
     def _separated_model_update(self, *, adapters_to_update: list[str] | None = None):
+        """Broadcast weights from train workers to remote (non-colocated) infer workers.
+
+        Gathers HF-format weights from this PP stage in buffered batches and broadcasts
+        each batch under a distributed lock to avoid conflicts with inference requests.
+
+        LoRA mode: iterates over each adapter, broadcasts LoRA adapter weights, then registers
+        the adapter on infer workers via add_lora().
+        Base mode: broadcasts full model weights in a single pass.
+        """
         if not mpu.get_expert_data_parallel_rank() == 0:
             return {}
 
         logger.info(f"start broadcast model update {self.model_update_name}")
-        if self.worker_config.model_args.adapters is not None:
+        if self.is_lora:
             peft_configs = self.models_unwrapped[0].peft_config
             selected = set(adapters_to_update) if adapters_to_update is not None else None
             for adapter_name, peft_config in peft_configs.items():
                 if selected is not None and adapter_name not in selected:
                     continue
                 logger.info(f"model_update: broadcasting adapter={adapter_name!r}")
-                # mcore_adapter's LoRA weight conversion needs LoRA rank to map QKV shards correctly.
-                kwargs = {"lora_rank": peft_config.r}
-                first_bucket = True
                 for hf_named_weights in gather_pp_stage_hf_weights(
                     self.models_unwrapped,
                     buffer_size=self._model_update_buffer_size,
                     adapter_name=adapter_name,
-                    **kwargs,
                 ):
                     if not self._broadcast_workers:
                         continue
-                    if first_bucket:
-                        first_bucket = False
-                        logger.info(
-                            f"model_update: first bucket adapter={adapter_name!r} tensors={len(hf_named_weights)} "
-                            f"backend={collective.get_group_backend(self.model_update_group_name)!r}"
-                        )
-                    while not ray.get(self._model_update_locker.acquire.remote()):
-                        time.sleep(0.1)
-                    refs = self._broadcast_to_infer_workers(hf_named_weights)
-                    ray.get(refs)
-                    ray.get(self._model_update_locker.release.remote())
+                    self._broadcast_bucket_under_lock(hf_named_weights)
                 # After broadcasting LoRA tensors, register the adapter on all infer workers.
                 if self._broadcast_workers:
                     logger.info(f"model_update: registering adapter={adapter_name!r} on infer workers")
@@ -606,9 +655,15 @@ class MegatronWeightUpdater:
             ):
                 if not self._broadcast_workers:
                     continue
-                while not ray.get(self._model_update_locker.acquire.remote()):
-                    time.sleep(0.1)
-                refs = self._broadcast_to_infer_workers(hf_named_weights)
-                ray.get(refs)
-                ray.get(self._model_update_locker.release.remote())
+                self._broadcast_bucket_under_lock(hf_named_weights)
         return {}
+
+    def _broadcast_bucket_under_lock(self, hf_named_weights: list[tuple[str, torch.Tensor]]) -> None:
+        """Acquire model_update lock, broadcast one bucket to infer workers, then release."""
+        while not ray.get(self._model_update_locker.acquire.remote()):
+            time.sleep(0.1)
+        try:
+            refs = self._broadcast_to_infer_workers(hf_named_weights)
+            ray.get(refs)
+        finally:
+            ray.get(self._model_update_locker.release.remote())

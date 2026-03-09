@@ -181,8 +181,9 @@ class ModelArguments(LoraArguments):
             adapter_config.adapter_name = base
             if adapter_config.lora_alpha is None or adapter_config.lora_alpha <= 0:
                 adapter_config.lora_alpha = adapter_config.lora_rank * 2
+            # Skip splitting when lora_target looks like a regex (contains regex special chars).
             if adapter_config.lora_target is not None and not any(
-                c in adapter_config.lora_target for c in ["*", "$", "|", "("]
+                c in adapter_config.lora_target for c in ["*", "$", "|", "(", "^", "[", "+", "?", "\\"]
             ):
                 adapter_config.lora_target = self._split_arg(adapter_config.lora_target)
             adapter_config.additional_target = self._split_arg(adapter_config.additional_target)
@@ -219,8 +220,8 @@ class ModelArguments(LoraArguments):
         # No-LoRA: neither adapters nor lora_target set. Nothing to do.
 
         # --- Fields that apply regardless of LoRA mode ---
-        if self.lora_target is not None and not any(c in self.lora_target for c in ["*", "$", "|", "("]):
-            # split when lora_target is not regex expression
+        # Skip splitting when lora_target looks like a regex (contains regex special chars).
+        if self.lora_target is not None and not any(c in self.lora_target for c in ["*", "$", "|", "(", "^", "[", "+", "?", "\\"]):
             self.lora_target = self._split_arg(self.lora_target)
         self.freeze_module_prefix: Optional[List[str]] = self._split_arg(self.freeze_module_prefix)
         self.additional_target: Optional[List[str]] = self._split_arg(self.additional_target)

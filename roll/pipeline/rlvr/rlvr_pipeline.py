@@ -41,7 +41,7 @@ from roll.utils.train_infer_corrections import apply_train_infer_correction_to_b
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
 from roll.utils.metrics.metrics_manager import MetricsManager
-from roll.utils.offload_states import OffloadStateType
+
 
 
 logger = get_logger()
@@ -435,7 +435,8 @@ class RLVRPipeline(BasePipeline):
                 with Timer(name="step_stop_server", logger=None) as step_stop_server_timer:
                     if self.pipeline_config.async_pipeline:
                         ray.get([scheduler.pause_sampling.remote() for scheduler in self.generate_schedulers.values()])
-                        self.actor_infer.offload_states(include=OffloadStateType.other_params)
+                        # Full offload: stop generation server, discard KV cache + LoRA (will restart after model update).
+                        self.actor_infer.offload_states()
                 metrics_mgr.add_metric("time/step_stop_server", step_stop_server_timer.last)
 
                 with Timer(name="step_model_update", logger=None) as step_model_update_timer:

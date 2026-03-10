@@ -40,7 +40,7 @@ from roll.utils.functionals import (
 from roll.utils.train_infer_corrections import apply_train_infer_correction_to_batch
 from roll.utils.kl_controller import get_kl_controller
 from roll.utils.logging import get_logger
-from roll.utils.offload_states import OffloadStateType
+
 
 
 logger = get_logger()
@@ -214,6 +214,8 @@ class AgenticPipeline(BasePipeline):
 
         self.running = RunningMoments()
 
+        # TODO: sync LoRA adapters to actor_infer before first rollout (see AgenticMultiLoraPipeline._initial_model_update).
+
         # Validate partial GPU mode configuration and set self.partial_gpu_mode
         if self.pipeline_config.partial_gpu_mode:
             self.partial_gpu_mode = self._validate_partial_gpu_config()
@@ -281,9 +283,9 @@ class AgenticPipeline(BasePipeline):
                     # Suspend rollout scheduler to pause request processing
                     ray.get(self.train_rollout_scheduler.suspend.remote())
 
-                    # Stop generation server if using async mode (will restart after model update)
+                    # Full offload: stop generation server, discard KV cache + LoRA (will restart after model update).
                     if self.pipeline_config.async_pipeline:
-                        self.actor_infer.offload_states(include=OffloadStateType.other_params)
+                        self.actor_infer.offload_states()
 
                     # PHASE 3: Model Update
                     with Timer(name="model_update", logger=None) as model_update_timer:
@@ -303,6 +305,13 @@ class AgenticPipeline(BasePipeline):
                     #          model_update just loaded states to [0,1,2,3], so update routing state to match.
                     #          Use skip_load=True to avoid re-loading already-loaded model states.
                     if self.partial_gpu_mode and global_step > 0:
+                        target_gpus = []
+                        if hasattr(self.actor_train.worker_config, 'device_mapping') and self.actor_train.worker_config.device_mapping:
+                            target_gpus.extend(self.actor_train.worker_config.device_mapping)
+                        if self.pipeline_config.adv_estimator == "gae":
+                            if hasattr(self.critic.worker_config, 'device_mapping') and self.critic.worker_config.device_mapping:
+                                target_gpus.extend(self.critic.worker_config.device_mapping)
+
                         # Routing restore after model_update: model_update loaded states to all GPUs in actor_infer's
                         # device_mapping. Expand should restore routing without re-loading.
                         #
@@ -314,7 +323,7 @@ class AgenticPipeline(BasePipeline):
                         # semantics), effectively reducing rollout parallelism. The callee pair
                         # (_target_gpus_to_dp_ranks_to_remove / _target_gpus_to_dp_ranks_to_add) handles this safely
                         # but the lost rank is silent — only the alignment warning in the callee signals it.
-                        dp_ranks_to_add = self._target_gpus_to_dp_ranks_to_add(target_gpus=list(self._infer_device_mapping))
+                        dp_ranks_to_add = self._target_gpus_to_dp_ranks_to_add(target_gpus=target_gpus)
                         expand_metrics = self._expand_workers(dp_ranks_to_add=dp_ranks_to_add, train_skip_load=True)
                         logger.info(f"Expand routing state: {expand_metrics}")
                         metrics.update({"expand/" + k: v for k, v in expand_metrics.items()})
@@ -377,7 +386,7 @@ class AgenticPipeline(BasePipeline):
                     #   During training: actor_train uses freed GPUs [0,1]
                     #   Next iteration: model_update reloads actor_infer to all GPUs [0,1,2,3]
                     elif self.partial_gpu_mode:
-                        with Timer(name="cal_ref_log_probs", logger=None) as shrink_timer:
+                        with Timer(name="exec_shrink", logger=None) as shrink_timer:
                             target_gpus = []
                             # Collect actor_train GPUs
                             if hasattr(self.actor_train.worker_config, 'device_mapping') and self.actor_train.worker_config.device_mapping:

@@ -10,6 +10,12 @@ hydra:
     dir: .
   output_subdir: null
 
+track_with: wandb
+tracker_kwargs:
+  entity: "khd6t7hdhn-university-of-pennsylvania"
+  project: "rlix"
+  api_key: "PLACEHOLDER_WANDB_API_KEY"
+
 pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
 
 
@@ -94,7 +100,7 @@ actor_train:
       pipeline_model_parallel_size: 1
       expert_model_parallel_size: 1
       use_distributed_optimizer: false
-      lora_optimizer_mode: per_adapter
+      is_lora_optimizer_isolated: true
       recompute_granularity: full
       sequence_parallel: true
       overlap_grad_reduce: false # Per-adapter LoRA mode requires overlap_grad_reduce disabled to avoid grad-sync hang.

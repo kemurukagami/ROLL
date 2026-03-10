@@ -1,4 +1,5 @@
 import json
+import os
 from functools import wraps
 from typing import Optional, Dict, Any
 
@@ -156,6 +157,40 @@ class StdoutTracker(BaseTracker):
 
     def finish(self):
         pass
+
+
+def create_lora_tracker(
+    tracker_name: str,
+    lora_name: str,
+    config: dict,
+    **base_kwargs: Any,
+) -> BaseTracker:
+    """Create a tracker instance scoped to a single LoRA adapter.
+
+    Shapes kwargs per-backend so each LoRA gets its own run/log directory:
+    - TensorBoard: appends lora_name to log_dir
+    - W&B: appends lora_name to run name
+    - Swanlab: appends lora_name to experiment_name
+    - Stdout: no change (stateless)
+    """
+    from copy import deepcopy
+    kwargs = deepcopy(base_kwargs)
+
+    if tracker_name == "tensorboard":
+        # Each LoRA adapter gets its own TensorBoard subdirectory.
+        if "log_dir" in kwargs:
+            kwargs["log_dir"] = os.path.join(kwargs["log_dir"], lora_name)
+    elif tracker_name == "wandb":
+        # Each LoRA adapter gets its own W&B run with a suffixed name.
+        base_name = kwargs.get("name")
+        kwargs["name"] = f"{base_name}/{lora_name}" if base_name else lora_name
+    elif tracker_name == "swanlab":
+        # Each LoRA adapter gets its own Swanlab experiment.
+        base_exp = kwargs.get("experiment_name")
+        kwargs["experiment_name"] = f"{base_exp}/{lora_name}" if base_exp else lora_name
+    # stdout: no per-lora shaping needed
+
+    return create_tracker(tracker_name=tracker_name, config=config, **kwargs)
 
 
 def create_tracker(tracker_name: str, config: dict, **kwargs) -> BaseTracker:

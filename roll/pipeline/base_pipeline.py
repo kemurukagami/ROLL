@@ -58,11 +58,22 @@ class BasePipeline:
             load_dir = os.path.join(self.resume_from_checkpoint, "pipeline")
             self.state = WorkerState.load_from_json(load_dir=load_dir, tag="pipeline")
 
-            def resume_metrics():
-                for metrics in self.state.log_history:
-                    self.tracker.log(values=metrics, step=metrics["system/step"])
-
-            self.resume_futures.append(self.executor.submit(resume_metrics))
+            # Skip log_history replay for multi-LoRA checkpoints: per-LoRA tracker logs
+            # are not reconstructable from minimal log_history entries.
+            saved_tag_to_adapter = self.state.kv.get("tag_to_adapter")
+            is_multi_lora_resume = (
+                isinstance(saved_tag_to_adapter, dict) and len(set(saved_tag_to_adapter.values())) > 1
+            )
+            if is_multi_lora_resume:
+                logger.warning(
+                    "Resuming from a multi-LoRA checkpoint. Skipping log_history replay: "
+                    "per-LoRA tracker logs are not reconstructable from minimal log_history entries."
+                )
+            else:
+                def resume_metrics():
+                    for metrics in self.state.log_history:
+                        self.tracker.log(values=metrics, step=metrics["system/step"])
+                self.resume_futures.append(self.executor.submit(resume_metrics))
 
     def run(self):
         pass
@@ -97,7 +108,9 @@ class BasePipeline:
         metrics = self.state.log_history[-1]
         metrics["system/step"] = global_step
         if global_step > 0 and (
-            global_step % self.pipeline_config.save_steps == 0 or global_step == self.pipeline_config.max_steps - 1
+            global_step % self.pipeline_config.save_steps == 0
+            or global_step == self.pipeline_config.max_steps - 1
+            or is_last_step
         ):
             ckpt_metrics_refss = []
             for cluster in self.checkpoint_clusters:

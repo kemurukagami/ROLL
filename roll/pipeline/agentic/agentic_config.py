@@ -288,7 +288,8 @@ class AgenticConfig(PPOConfig):
         elif self.train_env_manager.max_traj_per_env < 0:
             self.train_env_manager.max_traj_per_env = traj_per_env
         logger.info(f"train_env_manager.max_traj_per_env: {self.train_env_manager.max_traj_per_env}")
-        assert self.train_env_manager.max_traj_per_env >= traj_per_env, f"max_traj_per_env must be >= {traj_per_env}"
+        # Ensure max_traj_per_env meets the minimum floor for the given batch and env count.
+        self.ensure_min_traj_per_env(self.train_env_manager, self.rollout_batch_size)
 
         # Validate rollout_batch_size is compatible with group_size
         # The scheduler collects trajectories in complete groups to maintain variance reduction properties
@@ -322,7 +323,8 @@ class AgenticConfig(PPOConfig):
             if self.val_env_manager.max_traj_per_env < 0:
                 self.val_env_manager.max_traj_per_env = traj_per_env
         logger.info(f"val_env_manager.max_traj_per_env: {self.val_env_manager.max_traj_per_env}")
-        assert self.val_env_manager.max_traj_per_env >= traj_per_env, f"max_traj_per_env must be >= {traj_per_env}"
+        # Ensure max_traj_per_env meets the minimum floor for the given batch and env count.
+        self.ensure_min_traj_per_env(self.val_env_manager, self.val_batch_size)
 
         if (
             hasattr(self, "actor_infer")
@@ -387,3 +389,14 @@ class AgenticConfig(PPOConfig):
             done_groups += n_group
         assert done_groups == env_manager_config.num_env_groups, f"{done_groups=} is not { env_manager_config.num_env_groups=}"
         env_manager_config.env_configs = env_configs
+
+    def ensure_min_traj_per_env(self, env_manager_config: EnvManagerConfig, batch_size: int) -> None:
+        """Ensure max_traj_per_env is sufficient for the given env count and batch size."""
+        env_count = env_manager_config.num_env_groups * env_manager_config.group_size
+        min_traj_per_env = (batch_size + env_count - 1) // env_count
+        if env_manager_config.max_traj_per_env < min_traj_per_env:
+            logger.warning(
+                "Overriding max_traj_per_env: %d -> %d (batch_size=%d, env_count=%d)",
+                env_manager_config.max_traj_per_env, min_traj_per_env, batch_size, env_count,
+            )
+            env_manager_config.max_traj_per_env = min_traj_per_env

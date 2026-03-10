@@ -208,7 +208,7 @@ class Worker:
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_states(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:
-            self.strategy.load_states()
+            self.strategy.load_states(*args, **kwargs)
         else:
             self.logger.warning("worker has not strategy")
     
@@ -228,7 +228,7 @@ class Worker:
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def offload_states(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:
-            self.strategy.offload_states()
+            self.strategy.offload_states(*args, **kwargs)
         else:
             self.logger.warning("worker has not strategy")
 

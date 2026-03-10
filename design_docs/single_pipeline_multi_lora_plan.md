@@ -1238,3 +1238,46 @@ PYTHONPATH=/workspace/RLix/external/ROLL_rlix /venv/main/bin/python \
 Result:
 - Completed with exit code `0`
 - Log contains `pipeline complete!`
+
+---
+
+## Multi-LoRA Runtime Semantics (updated 2026-03-09)
+
+### Tick model
+
+Single-adapter first-ready ticks only (no barrier mode). Each tick processes exactly
+one ready tag batch via `train_step_lora`. If the invariant breaks, both pipelines
+fail fast.
+
+### Step counters
+
+- `lora_step[adapter_name]`: per-adapter training step. Source of truth for rollout
+  `global_step` metadata, `dump_rollout_trajectories`, `model_update_lora_subset`,
+  and per-LoRA tracker step.
+- `global_tick`: monotonic counter across all adapters. Used for checkpoint ids,
+  `state.step`, `eval_steps` cadence, `logging_steps` gate, and `system/global_tick`
+  metric.
+
+### Checkpoint and resume
+
+State persisted in `state.kv` after each tick (both pipelines):
+- `lora_step_by_adapter`: `dict[str, int]` — per-adapter step counters.
+- `global_tick`: `int` — monotonic tick counter.
+- `tag_to_adapter`: `dict[str, str]` — env tag to adapter mapping (validated on resume).
+
+`state.log_history` receives only minimal `{"system/step": global_tick}` entries.
+Full per-LoRA metrics are not persisted because the base `resume_metrics()` replay
+path (line 62-63 of `base_pipeline.py`) logs without `lora_name`, which would produce
+wrong data for multi-LoRA `ml_tracker` runs. On multi-LoRA resume, `base_pipeline.__init__`
+detects `tag_to_adapter` in `state.kv` and skips `resume_metrics()` entirely.
+
+`do_checkpoint` fires when `is_last_step=True` (all adapters done), in addition to the
+existing `save_steps` and `max_steps - 1` conditions.
+
+### `batch_balance`
+
+Both pipelines now call `batch_balance` in the same positions as the production
+`agentic_pipeline.py`:
+- Before ref log-prob compute (Target A only — companion B stubs ref log probs).
+- Before old log-prob compute.
+- Before `train_step_lora` (with `logging_prefix="global_seqlen/actor_train"`).

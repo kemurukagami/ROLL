@@ -891,6 +891,10 @@ class AgenticMultiLoraPipeline(BasePipeline):
                             adapter_metrics["system/lora_step"] = lora_step[adapter_for_tag]
 
                         # Model update boundary: suspend rollouts only for model_update.
+                        # TODO: fine-granular rollout interruption — currently we abort ALL loras' rollouts
+                        # and force-sync ALL adapters. Better approach: only abort/interrupt requests for the
+                        # just-trained adapter (dirty_adapters), leave other loras' in-flight rollouts running,
+                        # and sync only the updated adapter weights instead of all_adapters.
                         with Timer(name="model_update", logger=None) as model_update_timer:
                             ray.get([sched.suspend.remote() for sched in self.rollout_schedulers.values()])
 
@@ -900,7 +904,7 @@ class AgenticMultiLoraPipeline(BasePipeline):
                             # Full offload destroys all LoRA tensors on infer side — must re-sync every adapter.
                             # Train-side weights are preserved in pinned CPU memory across offload cycles.
                             all_adapters = set(self.pipeline_config.actor_train.model_args.adapters.keys()) if self.pipeline_config.actor_train.model_args.adapters else None
-                            model_update_metrics = self.model_update_lora_subset(lora_step[adapter_for_tag], adapters_to_update=all_adapters)
+                            model_update_metrics = self.model_update_lora_subset(global_tick, adapters_to_update=all_adapters)
                             tick_metrics.update(model_update_metrics)
                             for name in dirty_adapters:
                                 lora_metrics.setdefault(name, {}).update(model_update_metrics)

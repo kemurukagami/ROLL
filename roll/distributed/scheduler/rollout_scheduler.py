@@ -1146,15 +1146,7 @@ class RolloutScheduler(RolloutMockMixin):
         # Delegate complete expand operation to RequestScheduler (atomic under routing_lock)
         result = await self.generate_scheduler.expand_workers.remote(dp_ranks, skip_load)
 
-                # Add timing from RolloutScheduler perspective
+        # Add timing from RolloutScheduler perspective
+        result["rollout_scheduler_duration_ms"] = (time.time() - start_time) * 1000
 
-                result["rollout_scheduler_duration_ms"] = (time.time() - start_time) * 1000
-
-        
-
-                return result
-
-        
-
-        
-
+        return result

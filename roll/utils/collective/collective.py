@@ -144,6 +144,12 @@ def broadcast_object_list(object_list, src=None, group_name="default", device=No
     dist.broadcast_object_list(object_list, src=src, group_src=group_src, group=_group_mgr.get_group_by_name(group_name))
 
 
+def is_group_exist(group_name: str) -> bool:
+    """Check if a collective group with the given name exists."""
+    global _group_mgr
+    return _group_mgr.is_group_exist(group_name)
+
+
 def destroy_collective_group(group_name: str) -> None:
     global _group_mgr
     _group_mgr.destroy_collective_group(group_name)

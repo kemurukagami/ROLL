@@ -10,7 +10,7 @@ hydra:
     dir: .
   output_subdir: null
 
-# pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
+pipeline_cls: roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline
 
 
 

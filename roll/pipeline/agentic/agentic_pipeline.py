@@ -56,6 +56,17 @@ class AgenticPipeline(BasePipeline):
         self.pipeline_config: AgenticConfig
 
         self.pipeline_config.set_max_steps(max_steps=self.pipeline_config.max_steps)
+
+        # AgenticPipeline supports at most one adapter (the auto-converted "default").
+        # Multi-adapter training requires AgenticMultiLoraPipeline for per-adapter step counting.
+        if self.pipeline_config.actor_train.model_args.is_multi_lora:
+            adapter_names = sorted(self.pipeline_config.actor_train.model_args.adapters.keys())
+            raise RuntimeError(
+                f"AgenticPipeline supports at most 1 LoRA adapter, got {len(adapter_names)}: {adapter_names}. "
+                "For multi-adapter training, set pipeline_cls to "
+                "roll.pipeline.agentic.agentic_multi_lora_pipeline.AgenticMultiLoraPipeline."
+            )
+
         self.use_ref_model = self.pipeline_config.enable_reference and (not is_lora_training(self.pipeline_config))
 
         # Derived configuration for partial GPU mode (auto-detected from device_mapping)

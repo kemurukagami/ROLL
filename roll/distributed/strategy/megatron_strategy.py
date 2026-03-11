@@ -2049,6 +2049,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             raise RuntimeError("tgt_device_mapping length must be divisible by tgt_num_gpus_per_worker")
 
         world_rank = int(self.worker.rank)
+        logger.info(f"[rlix][selective_sync_active_cache] enter world_rank={world_rank} is_cache_owner={self._is_cache_owner}")
 
         # Non-owners have no cache and do no transport.
         # ray.get(sync_refs) in ModelUpdateService provides the sync barrier for all train workers.
@@ -2058,7 +2059,9 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         # Owner acquires lock for the entire replay (cache lookup + all transport + group teardown).
         # This prevents concurrent promote_active_checkpoint or _build_latest_bucket_cache from
         # racing with in-flight transport.
+        logger.info("[rlix][selective_sync_active_cache] acquiring _cache_lock")
         with self._cache_lock:
+            logger.info("[rlix][selective_sync_active_cache] _cache_lock acquired")
             # --- Cache lookup ---
             adapter_names_to_register: List[str] = []
             base_cached_buckets: List[Any] = []
@@ -2129,6 +2132,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             )
             planned_broadcast_ranks = sorted({int(td["rank"]) for td in comm_plan_args.get("tgt_devices", [])})
             broadcast_workers = [tgt_workers[r] for r in planned_broadcast_ranks]
+            logger.info(
+                f"[rlix][selective_sync_active_cache] comm_plan decoded: "
+                f"group_name={group_name} ipc_targets={len(ipc_targets)} "
+                f"broadcast_ranks={planned_broadcast_ranks} "
+                f"base_buckets={len(base_cached_buckets)} is_lora={self.is_lora}"
+            )
 
             def _transport_bucket_sequence(
                 bucket_sequence: List[Any],
@@ -2144,8 +2153,10 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 buffer is freed after each bucket to limit peak VRAM.
                 """
                 for bucket_idx, (tensors_meta, cpu_bucket) in enumerate(bucket_sequence):
+                    logger.info(f"[rlix][transport] bucket={bucket_idx}/{len(bucket_sequence)} phase={phase_tag} staging_to_gpu")
                     # Stage once to GPU; reuse for IPC (serialized handle) and NCCL broadcast.
                     gpu_bucket = cpu_bucket.to(current_platform.device_type).contiguous()
+                    logger.info(f"[rlix][transport] bucket={bucket_idx} staged_to_gpu")
 
                     # Transport workflow (IPC + NCCL overlap):
                     # 1. Fire async: IPC sends to colocated workers (same node, GPU memory handle)
@@ -2212,9 +2223,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                             )
 
                     # Step 3+4: barrier — wait for all transfers, then free GPU memory.
+                    logger.info(f"[rlix][transport] bucket={bucket_idx} waiting nccl_handles={len(nccl_handles)} ipc_refs={len(ipc_refs)} recv_refs={len(recv_refs)}")
                     for nccl_handle in nccl_handles:
                         nccl_handle.wait()
+                    logger.info(f"[rlix][transport] bucket={bucket_idx} nccl_done, waiting ray.get")
                     ray.get(ipc_refs + recv_refs)
+                    logger.info(f"[rlix][transport] bucket={bucket_idx} all_done")
                     del gpu_bucket, nccl_handles, named_params
                     current_platform.empty_cache()
 
@@ -2267,8 +2281,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
             # --- Teardown broadcast group once after all replay completes ---
             if broadcast_workers:
+                logger.info(f"[rlix][selective_sync_active_cache] teardown: destroying sender group {group_name}")
                 collective.destroy_collective_group(group_name)
+                logger.info(f"[rlix][selective_sync_active_cache] teardown: sender destroyed, destroying receiver groups")
                 ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
+                logger.info(f"[rlix][selective_sync_active_cache] teardown: all groups destroyed")
 
         # Lock released. No dist.barrier() here: ray.get(sync_refs) in ModelUpdateService
         # waits for all train workers to complete before the next sync is allowed.

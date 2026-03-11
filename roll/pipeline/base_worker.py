@@ -481,6 +481,16 @@ class InferWorker(Worker):
         await self.strategy.offload_states(*args, **kwargs)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def process_weights_after_loading(self, *args, **kwargs):
+        # Keep this path fully async for InferWorker. The base Worker implementation
+        # uses _maybe_await with a helper thread when an event loop is already running,
+        # which can deadlock vLLM collective RPC coroutines waiting on the actor loop.
+        # Running and awaiting here ensures the coroutine stays on the actor event loop.
+        strategy_result = self.strategy.process_weights_after_loading(*args, **kwargs)
+        if inspect.isawaitable(strategy_result):
+            await strategy_result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     async def load_states_partial(self, target_dp_ranks: List[int]):
         """Load states for workers whose dp_rank is in target_dp_ranks."""
 
@@ -571,6 +581,13 @@ class InferWorker(Worker):
 
     async def update_parameter_in_bucket(self, *args, **kwargs):
         await self.strategy.update_parameter_in_bucket(*args, **kwargs)
+
+    async def destroy_collective_group(self, group_name: str, model_update_name: str | None = None) -> None:
+        # Must be async to match InferWorker's async actor dispatch pattern.
+        # Without this override, Worker.destroy_collective_group (sync) runs in a threadpool
+        # where _maybe_await tries to drive collective_rpc_async on a fresh event loop,
+        # deadlocking the engine's ZMQ transport which is bound to the actor's main loop.
+        await self.strategy.destroy_collective_group(group_name, model_update_name)
 
     async def add_lora(self, *args, **kwargs):
         await self.strategy.add_lora(*args, **kwargs)

@@ -537,9 +537,15 @@ class MegatronWeightUpdater:
         if self.is_lora:
             peft_configs = self.models_unwrapped[0].peft_config
             selected = set(adapters_to_update) if adapters_to_update is not None else None
-            for adapter_name, peft_config in peft_configs.items():
-                if selected is not None and adapter_name not in selected:
-                    continue
+            # Materialize selected adapters once so registration order is explicit and
+            # consistent across colocated and broadcast worker paths.
+            adapter_items = [
+                (adapter_name, peft_config)
+                for adapter_name, peft_config in peft_configs.items()
+                if selected is None or adapter_name in selected
+            ]
+            for adapter_index, (adapter_name, peft_config) in enumerate(adapter_items):
+                wake_after_add = adapter_index == len(adapter_items) - 1
                 self._gather_and_distribute_weights(adapter_name)
                 # Register adapter on all infer workers (colocated + broadcast).
                 # BLOCKING: upstream was fire-and-forget which races with inference requests.
@@ -551,12 +557,18 @@ class MegatronWeightUpdater:
                 if co_infer_rank == 0 and self._co_infer_worker is not None:
                     add_lora_refs.append(
                         self._co_infer_worker.add_lora.remote(
-                            adapter_name=adapter_name, peft_config=asdict(peft_config)
+                            adapter_name=adapter_name,
+                            peft_config=asdict(peft_config),
+                            wake_after_add=wake_after_add,
                         )
                     )
                 if dist.get_rank() == 0 and self._broadcast_workers:
                     add_lora_refs.extend(
-                        w.add_lora.remote(adapter_name=adapter_name, peft_config=asdict(peft_config))
+                        w.add_lora.remote(
+                            adapter_name=adapter_name,
+                            peft_config=asdict(peft_config),
+                            wake_after_add=wake_after_add,
+                        )
                         for w in self._broadcast_workers
                     )
                 if add_lora_refs:
@@ -627,9 +639,15 @@ class MegatronWeightUpdater:
         if self.is_lora:
             peft_configs = self.models_unwrapped[0].peft_config
             selected = set(adapters_to_update) if adapters_to_update is not None else None
-            for adapter_name, peft_config in peft_configs.items():
-                if selected is not None and adapter_name not in selected:
-                    continue
+            # Materialize selected adapters once so registration order is explicit and
+            # matches colocated mode behavior.
+            adapter_items = [
+                (adapter_name, peft_config)
+                for adapter_name, peft_config in peft_configs.items()
+                if selected is None or adapter_name in selected
+            ]
+            for adapter_index, (adapter_name, peft_config) in enumerate(adapter_items):
+                wake_after_add = adapter_index == len(adapter_items) - 1
                 logger.info(f"model_update: broadcasting adapter={adapter_name!r}")
                 for hf_named_weights in gather_pp_stage_hf_weights(
                     self.models_unwrapped,
@@ -644,7 +662,11 @@ class MegatronWeightUpdater:
                     logger.info(f"model_update: registering adapter={adapter_name!r} on infer workers")
                     ray.get(
                         [
-                            w.add_lora.remote(adapter_name=adapter_name, peft_config=asdict(peft_config))
+                            w.add_lora.remote(
+                                adapter_name=adapter_name,
+                                peft_config=asdict(peft_config),
+                                wake_after_add=wake_after_add,
+                            )
                             for w in self._broadcast_workers
                         ]
                     )

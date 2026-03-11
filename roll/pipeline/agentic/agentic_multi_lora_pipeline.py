@@ -583,19 +583,19 @@ class AgenticMultiLoraPipeline(BasePipeline):
                 result.update({f"shrink/{idx}/{k}": v for k, v in shrink_metrics.items()})
             return result
 
-    def _expand_workers(self, *, dp_ranks_to_add: List[int]) -> Dict[str, Any]:
+    def _expand_workers(self, *, dp_ranks_to_add: List[int], train_skip_load: bool) -> Dict[str, Any]:
         """Expand inference back to training GPUs across all per-tag schedulers.
 
         Sequential pattern (mirrors agentic_pipeline._expand_workers):
-        - First scheduler does physical load (skip_load=False).
+        - First scheduler does physical load (skip_load determined by train_skip_load).
         - Rest do routing-only expand (skip_load=True).
         """
         if not isinstance(dp_ranks_to_add, list) or not dp_ranks_to_add:
             raise ValueError("dp_ranks_to_add must be a non-empty list[int]")
         with self._infer_resize_lock:
             all_schedulers = list(self.rollout_schedulers.values()) + list(self.val_rollout_schedulers.values())
-            # First scheduler loads model states.
-            first_metrics = ray.get(all_schedulers[0].expand_sampler.remote(dp_ranks_to_add, skip_load=False))
+            # First scheduler loads model states (skip if model_update already loaded them).
+            first_metrics = ray.get(all_schedulers[0].expand_sampler.remote(dp_ranks_to_add, skip_load=bool(train_skip_load)))
             # Rest do routing-only expand.
             rest_metrics = ray.get(
                 [sched.expand_sampler.remote(dp_ranks_to_add, skip_load=True) for sched in all_schedulers[1:]]

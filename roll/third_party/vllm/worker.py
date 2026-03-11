@@ -128,20 +128,30 @@ class WorkerBase:
         self.tensor_lora_manager = TensorLoraManager()
 
     # Use custom prefix because worker_extension_cls can not have conflicting method names with vllm worker.
-    def custom_add_lora(self, adapter_name: str, peft_config: dict, *, lora_local_ranks: Optional[List[int]] = None) -> bool:
+    def custom_add_lora(
+        self,
+        adapter_name: str,
+        peft_config: dict,
+        *,
+        lora_local_ranks: Optional[List[int]] = None,
+        wake_after_add: bool = True,
+    ) -> bool:
         """Register a LoRA adapter with vLLM on this worker.
 
         Pre-condition: staged LoRA tensors have already been delivered via add_weight calls.
-        Post-condition: the model is fully awake (weights + KV cache) and the adapter is
-        loaded in vLLM.  tensor_lora_manager._lora_names[adapter_name] is set only on success.
+        Post-condition: adapter is loaded in vLLM and tensor_lora_manager._lora_names[adapter_name]
+        is set only on success.
 
-        Why load_states() instead of reload_model():
+        Why conditional wake-up here:
         LoRA tensors are allocated outside the cumem "weights" pool.  If we only called
         reload_model() (which wakes weights only), the KV cache would remain uninitialised.
         A subsequent load_states_partial call that tries wake_up(["kv_cache"]) on a GPU
         that is already near-full with model weights + LoRA tensors would OOM.
-        load_states() is idempotent: after the first call both weight_loaded and
-        kv_cache_loaded are True, so additional calls are no-ops.
+        For multi-adapter updates:
+          - non-final adapters call reload_model() to keep broadcast memory low
+          - final adapter calls load_states() to initialize KV cache before rollout
+        We avoid follow-up strategy RPC verification after this call to prevent
+        reentrancy stalls.
 
         Registration is deferred to after vLLM confirms success so _lora_names only ever
         holds adapters that are actually resident on GPU.
@@ -164,16 +174,14 @@ class WorkerBase:
             else None
         )
         logger.info(
-            "[vllm][add_lora] enter adapter=%s int_id=%s staged_tensors=%s in_vllm_cache=%s weight_loaded=%s",
-            adapter_name, lora_int_id, staged_count, in_vllm_cache, self.weight_loaded,
+            "[vllm][add_lora] enter adapter=%s int_id=%s staged_tensors=%s in_vllm_cache=%s weight_loaded=%s wake_after_add=%s",
+            adapter_name, lora_int_id, staged_count, in_vllm_cache, self.weight_loaded, wake_after_add,
         )
-        # Must fully initialize (weights + KV cache) before allocating LoRA tensors.
-        # LoRA tensors are outside the cumem pool; calling reload_model() only here
-        # leaves KV cache un-initialized, causing OOM when load_states_partial later
-        # calls wake_up(["kv_cache"]) on a nearly-full GPU.
-        # load_states() is idempotent: the first add_lora call wakes up weights + KV cache;
-        # subsequent calls (e.g. registering a second adapter) skip wake_up via flag guards.
-        self.load_states()
+        # Ensure weights are resident before add_lora. Final adapter also wakes KV cache.
+        if wake_after_add:
+            self.load_states()
+        else:
+            self.reload_model()
         add_lora = getattr(getattr(self, "model_runner", None), "add_lora", None)
         if not callable(add_lora):
             raise NotImplementedError(

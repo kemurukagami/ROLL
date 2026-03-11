@@ -567,10 +567,17 @@ class VllmStrategy(InferenceStrategy):
 
     # offload/reload 接口
     async def load_states(self, *args, **kwargs):
-        await self.model.reset_prefix_cache()
+        # Ensure KV/block manager exists before reset_prefix_cache. Calling reset on an
+        # uninitialized engine state can block indefinitely.
+        logger.info("[vllm_strategy][load_states] enter is_model_in_gpu=%s", self.is_model_in_gpu)
         if not self.is_model_in_gpu:
+            logger.info("[vllm_strategy][load_states] calling model.load_states()")
             await self.model.load_states()
             self.is_model_in_gpu = True
+            logger.info("[vllm_strategy][load_states] model.load_states() done")
+        logger.info("[vllm_strategy][load_states] calling reset_prefix_cache()")
+        await self.model.reset_prefix_cache()
+        logger.info("[vllm_strategy][load_states] reset_prefix_cache() done")
 
     async def offload_states(self, include=None, non_blocking=False):
         await self.model.reset_prefix_cache()
@@ -689,14 +696,20 @@ class VllmStrategy(InferenceStrategy):
         del model_update_name
         await self.model.destroy_collective_group(group_name)
 
-    async def add_lora(self, adapter_name: str = "default", peft_config: dict = None, *, lora_local_ranks=None):
+    async def add_lora(
+        self,
+        adapter_name: str = "default",
+        peft_config: dict = None,
+        *,
+        lora_local_ranks=None,
+        wake_after_add: bool = True,
+    ):
         """Register a LoRA adapter with the vLLM inference engine.
 
         This method handles the full lifecycle of LoRA adapter registration:
           1. Validates the adapter name against the configured adapters dict
           2. Calls vLLM's add_lora RPC with the PEFT configuration
-          3. Verifies the adapter is visible in list_loras()
-          4. Updates internal GPU state tracking
+          3. Tracks readiness via wake_after_add without follow-up visibility RPCs
 
         The method is designed for multi-LoRA scenarios where different samples
         in a batch may need different adapters. Each adapter must be registered
@@ -714,18 +727,20 @@ class VllmStrategy(InferenceStrategy):
             peft_config: PEFT configuration dict containing LoRA parameters.
                 Required. The ``target_modules`` field is overwritten from the
                 configured adapter spec to ensure consistency.
-
+            wake_after_add: Whether this adapter registration should fully wake
+                the vLLM engine (weights + KV cache). For multi-adapter updates,
+                callers set this only on the last adapter.
         Raises:
             RuntimeError: If:
                 - ``peft_config`` is None
                 - ``adapter_name`` is not in the configured adapters
                 - ``adapter_name="default"`` in multi-LoRA mode (FSDP2 limitation)
-                - Adapter registration fails to produce an ID
-                - Adapter is not visible after registration within retry window
 
         Note:
-            - The ``is_model_in_gpu`` flag is set to True after registration because
-              vLLM's custom_add_lora loads weights into GPU memory before returning.
+            - This method intentionally avoids immediate post-registration visibility
+              RPC checks (``get_lora_id``/``list_loras``) to avoid reentrancy stalls.
+              Readiness is tracked via ``wake_after_add``: non-final adapters keep
+              KV cache asleep, while the final adapter marks the model ready.
             - For multi-LoRA with FSDP2 trainer, use explicit adapter names instead
               of the "default" placeholder to avoid ambiguity.
         """
@@ -750,35 +765,23 @@ class VllmStrategy(InferenceStrategy):
         peft_config["target_modules"] = sorted(adapters[adapter_name].lora_target)
         # Blocking RPC: does not return until custom_add_lora on the worker completes.
         # Inside custom_add_lora the sequence is:
-        #   1. load_states()          → reload_model() + wake_up(kv_cache): GPU fully initialized
+        #   1. reload_model()         → wake_up(["weights"]) only (no KV cache wake-up)
         #   2. vLLM.add_lora()        → LoRA tensors loaded to GPU, adapter registered in vLLM Python cache
         #   3. register(name, id)     → _lora_names updated only after vLLM confirms success
-        await self.model.add_lora(adapter_name, peft_config, lora_local_ranks=lora_local_ranks)
-        # Weights + KV cache + LoRA are all GPU-resident; _lora_names is up to date.
-        # Advance the strategy-level flag now so load_states_partial() can skip its no-op RPC.
-        self.is_model_in_gpu = True
-        # When lora_local_ranks masks some TP ranks, those ranks skip custom_add_lora so
-        # list_loras() on masked ranks returns empty — skip strategy-level verification here;
-        # worker-side success is sufficient. For non-masked calls, do the full check.
-        if lora_local_ranks is None:
-            lora_int_id = await self.get_lora_id(adapter_name)
-            logger.info(
-                "[vllm_strategy][add_lora] registered adapter=%s lora_int_id=%s is_model_in_gpu=%s",
-                adapter_name, lora_int_id, self.is_model_in_gpu,
-            )
-            if lora_int_id is None:
-                raise RuntimeError(f"LoRA adapter registration did not produce an id: adapter={adapter_name!r}")
-            loaded = _normalize_lora_int_ids_loaded(await self.model.list_loras())
-            if lora_int_id not in loaded:
-                raise RuntimeError(
-                    f"vllm_strategy.add_lora:not_visible_after_add: "
-                    f"adapter={adapter_name!r} lora_int_id={lora_int_id} loaded={loaded[:16]!r}"
-                )
-        else:
-            logger.info(
-                "[vllm_strategy][add_lora] registered adapter=%s (lora_local_ranks=%s, skipping per-rank verify)",
-                adapter_name, lora_local_ranks,
-            )
+        await self.model.add_lora(
+            adapter_name,
+            peft_config,
+            lora_local_ranks=lora_local_ranks,
+            wake_after_add=wake_after_add,
+        )
+        # No follow-up visibility RPCs here (get_lora_id/list_loras) to avoid
+        # reentrancy hazards. Trust worker-level add_lora success and track GPU
+        # readiness based on whether this call performed the final wake-up.
+        self.is_model_in_gpu = wake_after_add
+        logger.info(
+            "[vllm_strategy][add_lora] registered adapter=%s (worker-level ok; is_model_in_gpu=%s)",
+            adapter_name, self.is_model_in_gpu,
+        )
 
     async def get_lora_id(self, adapter_name: str) -> int | None:
         """Get the integer ID assigned by vLLM for a named LoRA adapter.

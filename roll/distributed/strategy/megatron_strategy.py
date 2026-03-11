@@ -1,5 +1,6 @@
 import math
 import os
+import pickle
 import random
 import threading
 from collections import defaultdict
@@ -2151,33 +2152,59 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 For each bucket: stage CPU->GPU once, then fan out via IPC to
                 colocated workers and NCCL broadcast to remote workers. GPU staging
                 buffer is freed after each bucket to limit peak VRAM.
+
+                When model_update_transport="cpu_pickle", the IPC path serializes the
+                CPU bucket directly with standard pickle (avoiding CUDA IPC). GPU
+                staging is skipped when there are no broadcast workers.
                 """
+                transport = self.worker.pipeline_config.model_update_transport
                 for bucket_idx, (tensors_meta, cpu_bucket) in enumerate(bucket_sequence):
-                    logger.info(f"[rlix][transport] bucket={bucket_idx}/{len(bucket_sequence)} phase={phase_tag} staging_to_gpu")
-                    # Stage once to GPU; reuse for IPC (serialized handle) and NCCL broadcast.
-                    gpu_bucket = cpu_bucket.to(current_platform.device_type).contiguous()
-                    logger.info(f"[rlix][transport] bucket={bucket_idx} staged_to_gpu")
+                    logger.info(f"[rlix][transport] bucket={bucket_idx}/{len(bucket_sequence)} phase={phase_tag} transport={transport}")
+
+                    # GPU staging is needed for NCCL broadcast or CUDA IPC serialization.
+                    # With cpu_pickle and no broadcast workers, skip GPU staging entirely.
+                    need_gpu_staging = bool(broadcast_workers) or transport == "cuda_ipc"
+                    gpu_bucket = None
+                    if need_gpu_staging:
+                        gpu_bucket = cpu_bucket.to(current_platform.device_type).contiguous()
+                        logger.info(f"[rlix][transport] bucket={bucket_idx} staged_to_gpu")
 
                     # Transport workflow (IPC + NCCL overlap):
-                    # 1. Fire async: IPC sends to colocated workers (same node, GPU memory handle)
+                    # 1. Fire async: IPC sends to colocated workers (same node)
                     # 2. Fire async: NCCL broadcasts to remote workers (cross-node, GPU-to-GPU)
                     # 3. Barrier: wait on all IPC + NCCL to finish
                     # 4. Free gpu_bucket — safe because all consumers have copied the data
                     # IPC and NCCL run concurrently to hide transfer latency.
 
-                    # Step 1: IPC path — share staged GPU tensor with colocated workers.
-                    # Ensure CUDA IPC pickle uses GPU UUIDs instead of raw device indices,
-                    # so the receiver resolves the correct local device even when
-                    # CUDA_VISIBLE_DEVICES orderings differ between processes.
-                    monkey_patch_torch_reductions()
+                    # Step 1: IPC path — serialize bucket once, then fan out to all colocated workers.
+                    # Payload is identical for every IPC target, so serialize before the loop.
+                    ipc_payload: Optional[bytes] = None
+                    if ipc_targets:
+                        if transport == "cpu_pickle":
+                            # CPU byte serialization: serialize CPU bucket directly with
+                            # standard pickle. Avoids CUDA IPC in restricted containers.
+                            ipc_payload = pickle.dumps(
+                                {"bucket": cpu_bucket.contiguous(), "tensors_meta": tensors_meta}
+                            )
+                        elif transport == "cuda_ipc":
+                            # CUDA IPC: serialize GPU tensor via ForkingPickler.
+                            # Ensure pickle uses GPU UUIDs instead of raw device indices,
+                            # so the receiver resolves the correct local device even when
+                            # CUDA_VISIBLE_DEVICES orderings differ between processes.
+                            monkey_patch_torch_reductions()
+                            ipc_payload = MultiprocessingSerializer.serialize(
+                                {"bucket": gpu_bucket, "tensors_meta": tensors_meta}
+                            )
+                        else:
+                            raise ValueError(
+                                f"Unsupported model_update_transport: {transport!r}. "
+                                f"Expected 'cuda_ipc' or 'cpu_pickle'."
+                            )
+
                     ipc_refs: List[ray.ObjectRef] = []
                     for ipc_entry in ipc_targets:
                         tgt_dp_rank = int(ipc_entry["dp_rank"])
                         ipc_local_ranks: List[int] = [int(r) for r in ipc_entry["local_ranks"]]
-                        # Serialize the GPU bucket once; all TP local ranks share the same handle.
-                        ipc_payload = MultiprocessingSerializer.serialize(
-                            {"bucket": gpu_bucket, "tensors_meta": tensors_meta}
-                        )
                         # Build a list long enough to cover all TP ranks (worker indexes by self.rank).
                         payload_list = [ipc_payload] * tgt_num_gpus_per_worker
                         ipc_refs.append(
@@ -2189,10 +2216,12 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                         )
 
                     # Step 2: NCCL path — broadcast to remote (non-colocated) workers.
+                    # Requires gpu_bucket; only entered when broadcast_workers is non-empty
+                    # (which guarantees gpu_bucket was staged above).
                     nccl_handles: List[Any] = []
                     recv_refs: List[ray.ObjectRef] = []
                     named_params: List[Any] = []
-                    if broadcast_workers:
+                    if broadcast_workers and gpu_bucket is not None:
                         named_params = list(named_tensors_from_bucket(bucket=gpu_bucket, tensors_meta=tensors_meta))
                         names = [n for n, _ in named_params]
                         dtypes = [t.dtype for _, t in named_params]
@@ -2229,8 +2258,10 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     logger.info(f"[rlix][transport] bucket={bucket_idx} nccl_done, waiting ray.get")
                     ray.get(ipc_refs + recv_refs)
                     logger.info(f"[rlix][transport] bucket={bucket_idx} all_done")
-                    del gpu_bucket, nccl_handles, named_params
-                    current_platform.empty_cache()
+                    del nccl_handles, named_params
+                    if gpu_bucket is not None:
+                        del gpu_bucket
+                        current_platform.empty_cache()
 
             # --- Transport: base buckets first, then per-adapter buckets ---
             _transport_bucket_sequence(base_cached_buckets, is_lora_stage=False, phase_tag="base")

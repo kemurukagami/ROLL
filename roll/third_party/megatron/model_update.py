@@ -600,7 +600,9 @@ class MegatronWeightUpdater:
         ):
             if self._co_infer_worker is not None:
                 serialized_tensors = serialize_named_weights(
-                    hf_named_weights, infer_strategy=self.infer_worker_config.strategy_args.strategy_name
+                    hf_named_weights,
+                    infer_strategy=self.infer_worker_config.strategy_args.strategy_name,
+                    model_update_transport=self.pipeline_config.model_update_transport,
                 )
                 infer_parallel_tensors = [None] * infer_parallel_size if co_infer_rank == 0 else None
                 dist.gather_object(

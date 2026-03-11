@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import json
+import pickle
 import time
 from collections import OrderedDict
 from typing import Iterable, List, Optional, Tuple
@@ -676,9 +677,11 @@ class WorkerBase:
           Stages each unpacked tensor in tensor_lora_manager.add_weight(), same as
           broadcast_parameter's LoRA path. Applied to vLLM later via custom_add_lora.
 
-        The bucket is always serialised as {"bucket": <torch.Tensor>, "tensors_meta": ...}
-        via CUDA IPC. Operators must run containers with --ipc=host or --cap-add SYS_PTRACE;
-        if CUDA IPC is blocked, deserialization will raise naturally (fail-fast).
+        The bucket is serialised as {"bucket": <torch.Tensor>, "tensors_meta": ...}
+        via either CUDA IPC (ForkingPickler, default) or CPU byte serialization
+        (standard pickle, model_update_transport="cpu_pickle"). pickle.loads() handles
+        both formats — the rebuild functions are resolved by name during unpickling
+        regardless of which pickler created the stream.
 
         named_params is materialised with list() because named_tensors_from_bucket returns a
         generator and generators can only be consumed once.
@@ -687,10 +690,12 @@ class WorkerBase:
         # returning early here prevents double-application of the same weights.
         if ipc_local_ranks is not None and self.rank not in ipc_local_ranks:
             return
+        # monkey_patch_torch_reductions is needed for CUDA IPC payloads (ensures GPU UUID
+        # mapping during rebuild_cuda_tensor). Harmless for CPU pickle payloads.
         monkey_patch_torch_reductions()
-        bucket_with_meta = MultiprocessingSerializer.deserialize(serialized_named_tensors[self.rank])
+        bucket_with_meta = pickle.loads(serialized_named_tensors[self.rank])
         bucket = bucket_with_meta["bucket"]
-        # FSDP2 CPUOffload may deliver a CPU tensor; move to device before slicing.
+        # Some transport/offload paths deliver a CPU tensor; upload to GPU before slicing.
         if not getattr(bucket, "is_cuda", False):
             bucket = bucket.to(device=self.device).contiguous()
         named_params = list(named_tensors_from_bucket(bucket=bucket, tensors_meta=bucket_with_meta["tensors_meta"]))

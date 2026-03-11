@@ -1,3 +1,4 @@
+import pickle
 from typing import Dict
 
 import torch
@@ -244,7 +245,21 @@ def named_tensors_from_bucket(bucket: "torch.Tensor", tensors_meta: list[dict]) 
     return reconstructed
 
 
-def serialize_named_weights(named_weights: list[tuple[str, torch.Tensor]], infer_strategy: str):
+def serialize_named_weights(
+    named_weights: list[tuple[str, torch.Tensor]],
+    infer_strategy: str,
+    model_update_transport: str = "cuda_ipc",
+) -> bytes:
+    """Serialize named weight tensors into bytes for cross-process transfer.
+
+    Args:
+        named_weights: list of (name, tensor) pairs to serialize.
+        infer_strategy: inference backend name ("sglang" or "vllm").
+        model_update_transport: "cuda_ipc" (default) for CUDA IPC via ForkingPickler,
+            or "cpu_pickle" for CPU byte serialization via standard pickle. The
+            cpu_pickle fallback avoids pidfd_getfd errors in restricted containers.
+    """
+    # sglang path — unchanged, always uses ForkingPickler + CUDA IPC.
     if infer_strategy == "sglang":
         from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -266,12 +281,28 @@ def serialize_named_weights(named_weights: list[tuple[str, torch.Tensor]], infer
         serialized_tensors = MultiprocessingSerializer.serialize(flattened_tensor_data)
         return serialized_tensors
 
+    # vLLM path — transport-dependent serialization.
     bucket, tensors_meta = _bucket_named_tensors(named_weights)
 
-    # FSDP2 CPUOffload delivers a CPU tensor; move to GPU before CUDA IPC serialization.
-    if not getattr(bucket, "is_cuda", False):
-        bucket = bucket.to(current_platform.device_type).contiguous()
-
-    # Always use CUDA IPC. If blocked (missing --ipc=host / --cap-add SYS_PTRACE), raises naturally.
-    monkey_patch_torch_reductions()
-    return MultiprocessingSerializer.serialize({"bucket": bucket, "tensors_meta": tensors_meta})
+    if model_update_transport == "cpu_pickle":
+        # CPU byte serialization fallback for restricted containers where CUDA IPC
+        # is unavailable. Uses standard pickle (not ForkingPickler) to serialize the
+        # CPU tensor via storage __reduce__, producing a self-contained byte payload.
+        # Not zero-copy — incurs GPU->CPU copy + full payload embedded in bytes.
+        if getattr(bucket, "is_cuda", False):
+            bucket = bucket.cpu()
+        bucket = bucket.contiguous()
+        return pickle.dumps({"bucket": bucket, "tensors_meta": tensors_meta})
+    elif model_update_transport == "cuda_ipc":
+        # CUDA IPC path (default): tensor stays on GPU, serialized via ForkingPickler
+        # which uses cudaIpcGetMemHandle. Requires CAP_SYS_PTRACE on Linux 5.6+.
+        if not getattr(bucket, "is_cuda", False):
+            bucket = bucket.to(current_platform.device_type)
+        bucket = bucket.contiguous()
+        monkey_patch_torch_reductions()
+        return MultiprocessingSerializer.serialize({"bucket": bucket, "tensors_meta": tensors_meta})
+    else:
+        raise ValueError(
+            f"Unsupported model_update_transport: {model_update_transport!r}. "
+            f"Expected 'cuda_ipc' or 'cpu_pickle'."
+        )

@@ -22,7 +22,7 @@ from roll.utils.functionals import append_to_dict
 from roll.utils.import_utils import safe_import_class
 from roll.utils.constants import DO_TIME_SHARING, RAY_NAMESPACE, rlix_env_vars
 from roll.utils.logging import get_logger
-from rlix.protocol.types import COORDINATOR_ACTOR_NAME_PREFIX, get_pipeline_namespace, ProgressReport
+from roll.utils.rlix_compat import COORDINATOR_ACTOR_NAME_PREFIX, get_pipeline_namespace, ProgressReport
 
 logger = get_logger()
 

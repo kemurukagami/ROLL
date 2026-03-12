@@ -7,8 +7,7 @@ from ray.util.placement_group import PlacementGroup
 
 from roll.platforms import current_platform
 from roll.utils.ray_utils import get_visible_gpus, get_node_rank
-# todo(tao) fixme: we shall make rlix optional, not installed won't causing import error
-from rlix.protocol.types import ROLL_RESOURCE_MANAGER_ACTOR_NAME, RLIX_NAMESPACE
+from roll.utils.rlix_compat import ROLL_RESOURCE_MANAGER_ACTOR_NAME, RLIX_NAMESPACE
 
 
 class ResourceManager:

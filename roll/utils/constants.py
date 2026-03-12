@@ -6,6 +6,14 @@ import os
 # Validate required env vars at import time so that misconfigured Ray workers
 # crash immediately with a clear message rather than failing deep in actor init.
 _RLIX_CONTROL_PLANE = os.environ.get("RLIX_CONTROL_PLANE", "")
+if _RLIX_CONTROL_PLANE == "rlix":
+    try:
+        import rlix  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "RLIX_CONTROL_PLANE=rlix requires the 'rlix' package. "
+            "Either install rlix or set RLIX_CONTROL_PLANE to a different value."
+        )
 DO_TIME_SHARING = _RLIX_CONTROL_PLANE == "rlix"  # True when running under RLix scheduler
 if _RLIX_CONTROL_PLANE == "rlix":
     ray_namespace = os.environ.get("ROLL_RAY_NAMESPACE")

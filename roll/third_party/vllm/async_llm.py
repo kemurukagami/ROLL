@@ -39,5 +39,11 @@ class CustomAsyncLLM(AsyncLLM):
         # Expose loaded adapter ids so strategy can verify routing readiness.
         return await self.engine_core.collective_rpc_async(method="custom_list_loras")
 
+    async def verify_model(self, expected_stats: dict | None = None) -> list:
+        """Dispatch custom_verify_model to all TP ranks and return per-rank stats."""
+        return await self.engine_core.collective_rpc_async(
+            method="custom_verify_model", kwargs={"expected_stats": expected_stats}
+        )
+
     async def process_weights_after_loading(self):
         await self.engine_core.collective_rpc_async(method="process_weights_after_loading")

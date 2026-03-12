@@ -592,6 +592,10 @@ class InferWorker(Worker):
     async def add_lora(self, *args, **kwargs):
         await self.strategy.add_lora(*args, **kwargs)
 
+    async def verify_model(self, *args, **kwargs):
+        """Async override — InferWorker runs on an async event loop."""
+        await self.strategy.verify_model(*args, **kwargs)
+
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE)
     async def generate(self, data: DataProto):
         """

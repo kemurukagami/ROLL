@@ -783,6 +783,50 @@ class VllmStrategy(InferenceStrategy):
             adapter_name, self.is_model_in_gpu,
         )
 
+    async def verify_model(self, expected_stats: dict) -> None:
+        """Verify post-sync weights match sender stats, with TP aggregation for base model.
+
+        Dispatches custom_verify_model to all TP ranks via collective_rpc_async.
+        Base stats: aggregated across TP ranks (sum-of-sums, max-of-maxes, min-of-mins)
+        because post-ingestion weights are TP-sharded.
+        LoRA stats: identical across TP ranks (broadcast sends same data to each rank),
+        so first rank's result is used directly.
+        """
+        from roll.utils.send_recv_utils import verify_weight_stats
+
+        per_rank_results = await self.model.verify_model(expected_stats=expected_stats)
+
+        # Normalize collective_rpc_async return format (same shape variations as get_lora_id).
+        if not isinstance(per_rank_results, list):
+            per_rank_results = [per_rank_results]
+        # Flatten nested [[result], ...] format from some vLLM versions.
+        if len(per_rank_results) == 1 and isinstance(per_rank_results[0], list):
+            per_rank_results = per_rank_results[0]
+
+        # Base model: TP-aggregate then compare against sender stats.
+        if "base" in expected_stats:
+            agg_sum = sum(rank_result["base"]["sum"] for rank_result in per_rank_results)
+            agg_max = max(rank_result["base"]["max"] for rank_result in per_rank_results)
+            agg_min = min(rank_result["base"]["min"] for rank_result in per_rank_results)
+            aggregated_base = {"sum": agg_sum, "max": agg_max, "min": agg_min}
+            verify_weight_stats(aggregated_base, expected_stats["base"], label="base")
+
+        # LoRA: all TP ranks have identical raw tensors; take first rank's result.
+        if "lora" in expected_stats:
+            first_rank_lora = per_rank_results[0].get("lora", {})
+            for adapter_name, expected_adapter_stats in expected_stats["lora"].items():
+                actual_adapter_stats = first_rank_lora.get(adapter_name)
+                if actual_adapter_stats is None:
+                    raise RuntimeError(
+                        f"verify_model: adapter {adapter_name!r} missing from rank 0 result; "
+                        f"available={sorted(first_rank_lora.keys())}"
+                    )
+                verify_weight_stats(
+                    actual_adapter_stats, expected_adapter_stats, label=f"lora/{adapter_name}"
+                )
+
+        logger.info("[vllm_strategy][verify_model] ok tp_ranks=%d", len(per_rank_results))
+
     async def get_lora_id(self, adapter_name: str) -> int | None:
         """Get the integer ID assigned by vLLM for a named LoRA adapter.
 

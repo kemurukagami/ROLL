@@ -79,7 +79,12 @@ from roll.utils.logging import get_logger
 from roll.utils.lora_routing import resolve_microbatch_lora_name
 from roll.utils.network_utils import collect_free_port, get_node_ip
 from roll.utils.offload_states import OffloadStateType
-from roll.utils.send_recv_utils import _bucket_named_tensors, monkey_patch_torch_reductions, named_tensors_from_bucket
+from roll.utils.send_recv_utils import (
+    _bucket_named_tensors,
+    compute_weight_stats,
+    monkey_patch_torch_reductions,
+    named_tensors_from_bucket,
+)
 from roll.utils.sequence_packing import make_micro_batch_iter_for_sequence_packing, restore_results_order
 
 
@@ -1059,12 +1064,16 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         # Single global cache owner: pp0/dp0/tp0/cp0 only; set during initialize().
         self._is_cache_owner: bool = False
 
+        # Sender stats for post-sync verification, keyed by cache version.
+        self._cache_stats: Dict[int, dict] = {}
         # Per-adapter versioned cache (multi-LoRA selective sync): same design as base
         # cache but keyed by adapter name, so each adapter's LoRA weights can be synced
         # independently at different versions.
         self._adapter_cache_map: Dict[str, Dict[int, List[Any]]] = {}
         self._latest_adapter_cached: Dict[str, Optional[int]] = {}
         self._active_adapter_cached: Dict[str, Optional[int]] = {}
+        # Per-adapter sender stats keyed by (adapter_name, cache_key).
+        self._adapter_cache_stats: Dict[tuple, dict] = {}
 
     def initialize(self, model_provider):
         self.seq_length = self.worker.pipeline_config.sequence_length
@@ -1927,6 +1936,11 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             # All PP ranks must participate in gather_all_hf_weights (PP collective).
             # Only the cache owner stores results; non-owners drain and discard each batch.
             cached_buckets: List[Any] = []
+            # Accumulate sender stats from globally-gathered weights for verification.
+            running_sum = 0.0
+            running_max = float("-inf")
+            running_min = float("inf")
+            batch_count = 0
             for hf_named_weights in gather_all_hf_weights(
                 self.models_unwrapped,
                 buffer_size=buffer_size,
@@ -1943,18 +1957,35 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     (str(name), weight.detach().to("cpu").contiguous())
                     for name, weight in hf_named_weights
                 ]
+                # Compute sender stats from cpu_named_weights before bucketing (bucketing
+                # flattens to int8, destroying the original dtype needed for stats).
+                batch_stats = compute_weight_stats(cpu_named_weights)
+                if batch_stats:
+                    running_sum += batch_stats["sum"]
+                    running_max = max(running_max, batch_stats["max"])
+                    running_min = min(running_min, batch_stats["min"])
+                    batch_count += 1
+
                 bucket, tensors_meta = _bucket_named_tensors(cpu_named_weights)  # CPU int8
                 cached_buckets.append((tensors_meta, bucket))
 
             if not self._is_cache_owner:
                 return
 
+            # Store sender stats alongside cached buckets for later verification.
+            sender_stats = {}
+            if batch_count > 0:
+                sender_stats = {"sum": running_sum, "max": running_max, "min": running_min}
+
             if adapter_name is not None:
                 self._adapter_cache_map.setdefault(adapter_name, {})[cache_key] = cached_buckets
                 self._latest_adapter_cached[adapter_name] = cache_key
+                # Store per-adapter stats keyed by (adapter_name, cache_key).
+                self._adapter_cache_stats[(adapter_name, cache_key)] = sender_stats
             else:
                 self._cache_map[cache_key] = cached_buckets
                 self._latest_cached = cache_key
+                self._cache_stats[cache_key] = sender_stats
 
     def promote_active_checkpoint(self, checkpoint_version: int) -> None:
         """Mark a cached version as the "active" snapshot for selective sync.
@@ -2055,7 +2086,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         # Non-owners have no cache and do no transport.
         # ray.get(sync_refs) in ModelUpdateService provides the sync barrier for all train workers.
         if not self._is_cache_owner:
-            return
+            return None
 
         # Owner acquires lock for the entire replay (cache lookup + all transport + group teardown).
         # This prevents concurrent promote_active_checkpoint or _build_latest_bucket_cache from
@@ -2318,8 +2349,26 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 ray.get([w.destroy_collective_group.remote(group_name) for w in broadcast_workers])
                 logger.info(f"[rlix][selective_sync_active_cache] teardown: all groups destroyed")
 
+        # Collect sender stats from cached versions for post-sync verification.
+        weight_stats: dict = {}
+        if base_cached_buckets:
+            base_key = self._active_cached
+            base_stats = self._cache_stats.get(base_key, {})
+            if base_stats:
+                weight_stats["base"] = base_stats
+        if adapter_cached_buckets:
+            lora_stats: dict = {}
+            for adapter_label in adapter_names_to_register:
+                adapter_key = self._active_adapter_cached.get(adapter_label)
+                adapter_stats = self._adapter_cache_stats.get((adapter_label, adapter_key), {})
+                if adapter_stats:
+                    lora_stats[adapter_label] = adapter_stats
+            if lora_stats:
+                weight_stats["lora"] = lora_stats
+
         # Lock released. No dist.barrier() here: ray.get(sync_refs) in ModelUpdateService
         # waits for all train workers to complete before the next sync is allowed.
+        return {"weight_stats": weight_stats} if weight_stats else None
 
     def _translate_offload_include(
         self, include: Optional[List[OffloadStateType]]

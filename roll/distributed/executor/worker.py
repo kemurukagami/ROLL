@@ -328,6 +328,7 @@ class Worker:
 
     def start_model_update(self, *args, **kwargs):
         metrics = {}
+        weight_stats: dict = {}
         if getattr(self, "strategy", None) is not None:
             with state_offload_manger(
                 strategy=self.strategy,
@@ -335,13 +336,16 @@ class Worker:
                 metric_infix=f"{self.cluster_name}/model_update",
                 load_kwargs={"include": [OffloadStateType.model_params]},
             ):
-                exec_metrics: Dict = self.strategy.model_update(*args, **kwargs)
+                exec_result: Dict = self.strategy.model_update(*args, **kwargs)
+            # Separate weight_stats from timing metrics before key-prefixing.
+            # weight_stats is a nested dict that would be corrupted by reduce_metrics_list.
+            weight_stats = exec_result.pop("weight_stats", {})
             metric_prefix = f"time/{self.cluster_name}/model_update"
-            metrics.update({f"{metric_prefix}/{k}": v for k, v in exec_metrics.items()})
+            metrics.update({f"{metric_prefix}/{k}": v for k, v in exec_result.items()})
         else:
             self.logger.warning("worker has not strategy")
 
-        output = DataProto(meta_info={"metrics": metrics})
+        output = DataProto(meta_info={"metrics": metrics, "weight_stats": weight_stats})
         return output
 
     def model_update_set_read_done_handle(self, *args, **kwargs):
@@ -463,7 +467,7 @@ class Worker:
             f"sync_id={sync_id} tgt_dp_ranks={list(tgt_dp_ranks)} "
             f"tgt_num_gpus_per_worker={tgt_num_gpus_per_worker}"
         )
-        fn(
+        result = fn(
             tgt_dp_ranks=tgt_dp_ranks,
             tgt_workers=tgt_workers,
             tgt_device_mapping=tgt_device_mapping,
@@ -472,10 +476,18 @@ class Worker:
             adapters_to_sync=adapters_to_sync,
         )
         self.logger.info(f"[rlix][selective_sync] worker_call_exit sync_id={sync_id}")
+        return result
 
     def add_lora(self, *args, **kwargs):
         if getattr(self, "strategy", None) is not None:
             self.strategy.add_lora(*args, **kwargs)
+        else:
+            self.logger.warning("worker has not strategy")
+
+    def verify_model(self, *args, **kwargs):
+        """Delegate post-sync weight verification to the strategy layer."""
+        if getattr(self, "strategy", None) is not None:
+            self.strategy.verify_model(*args, **kwargs)
         else:
             self.logger.warning("worker has not strategy")
 

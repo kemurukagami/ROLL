@@ -19,7 +19,7 @@ from roll.utils.collective import collective
 from roll.utils.constants import RAY_NAMESPACE
 from roll.utils.logging import get_logger
 from roll.utils.network_utils import collect_free_port, get_node_ip
-from roll.utils.send_recv_utils import serialize_named_weights
+from roll.utils.send_recv_utils import compute_weight_stats, serialize_named_weights
 
 
 if is_peft_available():
@@ -532,8 +532,16 @@ class MegatronWeightUpdater:
         LoRA mode: loops over each adapter, transfers only LoRA delta weights (not base model),
         then calls add_lora() to register the adapter in the inference engine.
         Base mode: transfers full model weights in a single pass.
+
+        Returns dict with timing info and weight_stats for post-sync verification.
+        Only dist.get_rank()==0 reports stats (all workers have identical globally-gathered
+        weights via gather_all_hf_weights; picking one avoids duplication).
         """
         co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
+        # Only global rank 0 reports stats; all workers have identical gathered weights.
+        is_stats_reporter = dist.get_rank() == 0
+        weight_stats: dict = {}
+
         if self.is_lora:
             peft_configs = self.models_unwrapped[0].peft_config
             selected = set(adapters_to_update) if adapters_to_update is not None else None
@@ -544,9 +552,13 @@ class MegatronWeightUpdater:
                 for adapter_name, peft_config in peft_configs.items()
                 if selected is None or adapter_name in selected
             ]
+            # Accumulate per-adapter sender stats for verification.
+            lora_stats: dict[str, dict[str, float]] = {}
             for adapter_index, (adapter_name, peft_config) in enumerate(adapter_items):
                 wake_after_add = adapter_index == len(adapter_items) - 1
-                self._gather_and_distribute_weights(adapter_name)
+                batch_stats = self._gather_and_distribute_weights(adapter_name, compute_stats=is_stats_reporter)
+                if is_stats_reporter and batch_stats:
+                    lora_stats[adapter_name] = batch_stats
                 # Register adapter on all infer workers (colocated + broadcast).
                 # BLOCKING: upstream was fire-and-forget which races with inference requests.
                 # Fix vs upstream: upstream only registered on _co_infer_worker.
@@ -573,11 +585,17 @@ class MegatronWeightUpdater:
                     )
                 if add_lora_refs:
                     ray.get(add_lora_refs)
+            if lora_stats:
+                weight_stats["lora"] = lora_stats
         else:
-            self._gather_and_distribute_weights(None)
-        return {}
+            batch_stats = self._gather_and_distribute_weights(None, compute_stats=is_stats_reporter)
+            if is_stats_reporter and batch_stats:
+                weight_stats["base"] = batch_stats
+        return {"weight_stats": weight_stats}
 
-    def _gather_and_distribute_weights(self, adapter_name: str | None = None):
+    def _gather_and_distribute_weights(
+        self, adapter_name: str | None = None, compute_stats: bool = False
+    ) -> dict[str, float]:
         """Gather HF-format weights from this PP stage and push them to colocated inference workers.
 
         Converts Megatron-Core weights to HF naming in buffered batches, serializes each batch,
@@ -585,7 +603,14 @@ class MegatronWeightUpdater:
 
         adapter_name: which adapter's weights to gather. None means base weights only
             (LoRA keys stripped); a string means that adapter's LoRA delta weights.
+        compute_stats: if True, accumulate running sum/max/min across all batches for verification.
+        Returns aggregate stats dict if compute_stats=True, otherwise empty dict.
         """
+        # Running stats accumulators across all weight batches.
+        running_sum = 0.0
+        running_max = float("-inf")
+        running_min = float("inf")
+        tensor_count = 0
         refs = []
         infer_parallel_size = dist.get_world_size(self._infer_parallel_cpu_group)
         co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
@@ -598,6 +623,15 @@ class MegatronWeightUpdater:
             weights_meta=weights_meta,
             adapter_name=adapter_name,
         ):
+            # Accumulate running stats across batches for post-sync verification.
+            if compute_stats:
+                batch_stats = compute_weight_stats(hf_named_weights)
+                if batch_stats:
+                    running_sum += batch_stats["sum"]
+                    running_max = max(running_max, batch_stats["max"])
+                    running_min = min(running_min, batch_stats["min"])
+                    tensor_count += 1
+
             if self._co_infer_worker is not None:
                 serialized_tensors = serialize_named_weights(
                     hf_named_weights,
@@ -624,6 +658,10 @@ class MegatronWeightUpdater:
         if refs:
             ray.get(refs)
 
+        if compute_stats and tensor_count > 0:
+            return {"sum": running_sum, "max": running_max, "min": running_min}
+        return {}
+
     def _separated_model_update(self, *, adapters_to_update: list[str] | None = None):
         """Broadcast weights from train workers to remote (non-colocated) infer workers.
 
@@ -633,9 +671,16 @@ class MegatronWeightUpdater:
         LoRA mode: iterates over each adapter, broadcasts LoRA adapter weights, then registers
         the adapter on infer workers via add_lora().
         Base mode: broadcasts full model weights in a single pass.
+
+        Returns dict with weight_stats for post-sync verification.
+        Only workers with _broadcast_workers report stats (dp==0, tp==0, one per PP stage).
         """
         if not mpu.get_expert_data_parallel_rank() == 0:
             return {}
+
+        # Only workers with _broadcast_workers are canonical reporters (dp==0, tp==0).
+        is_stats_reporter = bool(self._broadcast_workers)
+        weight_stats: dict = {}
 
         logger.info(f"start broadcast model update {self.model_update_name}")
         if self.is_lora:
@@ -648,17 +693,32 @@ class MegatronWeightUpdater:
                 for adapter_name, peft_config in peft_configs.items()
                 if selected is None or adapter_name in selected
             ]
+            lora_stats: dict[str, dict[str, float]] = {}
             for adapter_index, (adapter_name, peft_config) in enumerate(adapter_items):
                 wake_after_add = adapter_index == len(adapter_items) - 1
                 logger.info(f"model_update: broadcasting adapter={adapter_name!r}")
+                # Accumulate stats across all batches for this adapter.
+                running_sum = 0.0
+                running_max = float("-inf")
+                running_min = float("inf")
+                batch_count = 0
                 for hf_named_weights in gather_pp_stage_hf_weights(
                     self.models_unwrapped,
                     buffer_size=self._model_update_buffer_size,
                     adapter_name=adapter_name,
                 ):
+                    if is_stats_reporter:
+                        batch_stats = compute_weight_stats(hf_named_weights)
+                        if batch_stats:
+                            running_sum += batch_stats["sum"]
+                            running_max = max(running_max, batch_stats["max"])
+                            running_min = min(running_min, batch_stats["min"])
+                            batch_count += 1
                     if not self._broadcast_workers:
                         continue
                     self._broadcast_bucket_under_lock(hf_named_weights)
+                if is_stats_reporter and batch_count > 0:
+                    lora_stats[adapter_name] = {"sum": running_sum, "max": running_max, "min": running_min}
                 # After broadcasting LoRA tensors, register the adapter on all infer workers.
                 if self._broadcast_workers:
                     logger.info(f"model_update: registering adapter={adapter_name!r} on infer workers")
@@ -673,14 +733,29 @@ class MegatronWeightUpdater:
                         ]
                     )
                     logger.info(f"model_update: adapter={adapter_name!r} registration complete")
+            if lora_stats:
+                weight_stats["lora"] = lora_stats
         else:
+            running_sum = 0.0
+            running_max = float("-inf")
+            running_min = float("inf")
+            batch_count = 0
             for hf_named_weights in gather_pp_stage_hf_weights(
                 self.models_unwrapped, buffer_size=self._model_update_buffer_size
             ):
+                if is_stats_reporter:
+                    batch_stats = compute_weight_stats(hf_named_weights)
+                    if batch_stats:
+                        running_sum += batch_stats["sum"]
+                        running_max = max(running_max, batch_stats["max"])
+                        running_min = min(running_min, batch_stats["min"])
+                        batch_count += 1
                 if not self._broadcast_workers:
                     continue
                 self._broadcast_bucket_under_lock(hf_named_weights)
-        return {}
+            if is_stats_reporter and batch_count > 0:
+                weight_stats["base"] = {"sum": running_sum, "max": running_max, "min": running_min}
+        return {"weight_stats": weight_stats}
 
     def _broadcast_bucket_under_lock(self, hf_named_weights: list[tuple[str, torch.Tensor]]) -> None:
         """Acquire model_update lock, broadcast one bucket to infer workers, then release."""

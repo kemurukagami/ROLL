@@ -16,7 +16,7 @@ from roll.utils.collective import collective
 from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
 from roll.utils.functionals import get_dist_info_from_comm_plan
 from roll.utils.logging import get_logger
-from roll.utils.send_recv_utils import monkey_patch_torch_reductions, named_tensors_from_bucket
+from roll.utils.send_recv_utils import compute_weight_stats, monkey_patch_torch_reductions, named_tensors_from_bucket
 
 logger = get_logger()
 
@@ -37,6 +37,9 @@ class TensorLoraManager:
         self.lora_params = OrderedDict()
         self.add_lora_count = 0
         self._lora_names: dict[str, int] = {}  # Track adapter_name -> lora_int_id for routing lookups.
+        # Preserve raw received tensors (HF-format) per adapter for post-sync verification.
+        # Populated in build_request() before lora_params is cleared; survives until next sync.
+        self._staged_weights: dict[str, OrderedDict] = {}
 
     def get_lora_id(self, adapter_name: str) -> int | None:
         """Return the vLLM integer adapter id for adapter_name, or None if not yet registered.
@@ -96,12 +99,15 @@ class TensorLoraManager:
             peft_config=peft_config_for_hash,
             lora_tensors=self.lora_params,
         )
+        # Preserve raw received tensors for post-sync verification before clearing.
+        # These are the same HF-format tensors the sender produced, so stats comparison
+        # against sender stats is valid (same format, no vLLM transformation applied yet).
+        self._staged_weights[adapter_name] = self.lora_params
         # Normal-path cleanup: transfer ownership of staged tensors to lora_request, then
         # reset lora_params immediately.  lora_request is a local in custom_add_lora; once
         # vLLM's add_lora() copies the tensors into GPU memory and the function returns,
         # lora_request goes out of scope and Python GC frees the staging buffers.
         # No separate cleanup step is needed on the happy path.
-        del self.lora_params
         self.lora_params = OrderedDict()
         return lora_request
 
@@ -266,6 +272,61 @@ class WorkerBase:
         """
         # Strategy uses this to resolve adapter name into vLLM integer adapter id.
         return self.tensor_lora_manager.get_lora_id(adapter_name)
+
+    def custom_verify_model(self, expected_stats: dict) -> dict:
+        """Compute weight stats from this TP rank and return them for strategy-level aggregation.
+
+        Base model: reads live GPU parameters from model_runner.model.named_parameters().
+        End-to-end — these are the actual tensors used for inference. Stats are computed
+        in-place using .sum(dtype=float32) — no fp32 copy is allocated, only a scalar.
+        When LoRA modules are active, named_parameters() returns base weights only; LoRA
+        delta tensors are plain torch.Tensors (not nn.Parameters) stored in
+        lora_a_stacked/lora_b_stacked GPU buffers, so they do NOT appear in named_parameters().
+
+        LoRA: reads raw received tensors from tensor_lora_manager._staged_weights (transport+
+        delivery verification — same HF-format as sender, before vLLM's _load_adapter
+        transformation). Identical across all TP ranks.
+
+        Also performs a LoRA presence check: verifies every adapter in _lora_names exists in
+        vLLM's live lora_manager.list_adapters().
+
+        Returns per-rank stats dict for strategy-level TP aggregation (base) and comparison (LoRA).
+        """
+        result: dict = {}
+
+        # LoRA presence check: every registered adapter must be in vLLM's live manager.
+        # Direct attribute access — model_runner.lora_manager is always present on vLLM
+        # workers when LoRA is active (which is the only case where _lora_names is non-empty).
+        if self.tensor_lora_manager._lora_names:
+            live_ids = set(self.model_runner.lora_manager.list_adapters())
+            for adapter_name, expected_id in self.tensor_lora_manager._lora_names.items():
+                    if expected_id not in live_ids:
+                        raise RuntimeError(
+                            f"verify_model: adapter {adapter_name!r} (int_id={expected_id}) "
+                            f"not in vLLM live adapters {sorted(live_ids)}"
+                        )
+
+        # Base model stats: live GPU parameters (TP-sharded per rank).
+        if "base" in expected_stats:
+            model = self.model_runner.model
+            base_stats = compute_weight_stats(model.named_parameters(remove_duplicate=False))
+            result["base"] = base_stats
+
+        # LoRA stats: raw received tensors (identical across TP ranks).
+        if "lora" in expected_stats:
+            result["lora"] = {}
+            for adapter_name in expected_stats["lora"]:
+                staged = self.tensor_lora_manager._staged_weights.get(adapter_name)
+                if staged is None:
+                    raise RuntimeError(
+                        f"verify_model: no staged weights for adapter {adapter_name!r}; "
+                        f"available={sorted(self.tensor_lora_manager._staged_weights.keys())}"
+                    )
+                adapter_stats = compute_weight_stats(staged.items())
+                result["lora"][adapter_name] = adapter_stats
+
+        logger.info("[vllm][verify_model] rank=%s stats_keys=%s", self.rank, sorted(result.keys()))
+        return result
 
     def reload_model(self):
         """Allocate the GPU weight memory pool — does NOT update parameter values.

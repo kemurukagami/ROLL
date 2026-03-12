@@ -1,5 +1,6 @@
+import math
 import pickle
-from typing import Dict
+from typing import Dict, Iterable
 
 import torch
 from torch.multiprocessing import reductions
@@ -243,6 +244,52 @@ def named_tensors_from_bucket(bucket: "torch.Tensor", tensors_meta: list[dict]) 
         tensor = bucket[meta["start_idx"] : meta["end_idx"]].view(meta["dtype"]).reshape(torch.Size(meta["shape"]))
         reconstructed.append((meta["name"], tensor))
     return reconstructed
+
+
+def compute_weight_stats(named_tensors: Iterable[tuple[str, torch.Tensor]]) -> dict[str, float]:
+    """Accumulate running sum/max/min across all tensors for verification.
+
+    Uses dtype=torch.float32 in .sum() to avoid bf16/fp16 overflow without
+    creating a full fp32 copy (only a scalar is allocated). max/min do not
+    overflow so they use the original dtype.
+    Returns {"sum": float, "max": float, "min": float} or empty dict if no tensors.
+    """
+    running_sum = 0.0
+    running_max = float("-inf")
+    running_min = float("inf")
+    tensor_count = 0
+    for _name, tensor in named_tensors:
+        # .sum(dtype=float32) accumulates in fp32 without allocating a full copy — only a scalar.
+        running_sum += tensor.detach().sum(dtype=torch.float32).item()
+        # max/min are safe in original dtype (no overflow risk for extrema).
+        running_max = max(running_max, tensor.detach().max().item())
+        running_min = min(running_min, tensor.detach().min().item())
+        tensor_count += 1
+    if tensor_count == 0:
+        return {}
+    return {"sum": running_sum, "max": running_max, "min": running_min}
+
+
+def verify_weight_stats(
+    actual: dict[str, float],
+    expected: dict[str, float],
+    label: str,
+    rel_tol: float = 1e-4,
+) -> None:
+    """Compare actual vs expected weight stats; raise RuntimeError on mismatch."""
+    for stat_key in ("sum", "max", "min"):
+        actual_val = actual.get(stat_key)
+        expected_val = expected.get(stat_key)
+        if actual_val is None or expected_val is None:
+            raise RuntimeError(
+                f"verify_weight_stats({label}): missing '{stat_key}' — "
+                f"actual_keys={sorted(actual.keys())} expected_keys={sorted(expected.keys())}"
+            )
+        if not math.isclose(actual_val, expected_val, rel_tol=rel_tol):
+            raise RuntimeError(
+                f"verify_weight_stats({label}): {stat_key} mismatch — "
+                f"actual={actual_val} expected={expected_val} rel_tol={rel_tol}"
+            )
 
 
 def serialize_named_weights(

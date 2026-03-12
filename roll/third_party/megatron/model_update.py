@@ -539,7 +539,8 @@ class MegatronWeightUpdater:
         """
         co_infer_rank = dist.get_rank(self._infer_parallel_cpu_group)
         # Only global rank 0 reports stats; all workers have identical gathered weights.
-        is_stats_reporter = dist.get_rank() == 0
+        # Gated by config flag to skip stats computation when verification is disabled.
+        is_stats_reporter = dist.get_rank() == 0 and self.pipeline_config.verify_model_after_sync
         weight_stats: dict = {}
 
         if self.is_lora:
@@ -679,7 +680,8 @@ class MegatronWeightUpdater:
             return {}
 
         # Only workers with _broadcast_workers are canonical reporters (dp==0, tp==0).
-        is_stats_reporter = bool(self._broadcast_workers)
+        # Gated by config flag to skip stats computation when verification is disabled.
+        is_stats_reporter = bool(self._broadcast_workers) and self.pipeline_config.verify_model_after_sync
         weight_stats: dict = {}
 
         logger.info(f"start broadcast model update {self.model_update_name}")

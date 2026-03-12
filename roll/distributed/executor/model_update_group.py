@@ -89,6 +89,10 @@ class ModelUpdateGroup:
             ]
         )
 
+        # Post-sync verification gated by config flag (disabled by default).
+        if not self.pipeline_config.verify_model_after_sync:
+            return reduce_metrics_list([dataproto.meta_info["metrics"] for dataproto in dataprotos])
+
         # Extract weight_stats separately before reduce_metrics_list (which would
         # corrupt nested dicts via np.mean). Only non-empty stats from canonical
         # reporter workers are included.

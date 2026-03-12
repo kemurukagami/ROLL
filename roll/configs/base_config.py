@@ -191,6 +191,16 @@ class BaseConfig(ScheduleConfig):
             )
         },
     )
+    verify_model_after_sync: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "When True, verify weight integrity after every model update sync "
+                "by comparing sender-side stats against receiver-side live weights. "
+                "Raises RuntimeError on mismatch."
+            )
+        },
+    )
     num_nodes: int = field(
         default=1,
         metadata={"help": "Number of nodes available for distributed training."}

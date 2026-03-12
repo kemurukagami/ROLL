@@ -1937,6 +1937,8 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             # Only the cache owner stores results; non-owners drain and discard each batch.
             cached_buckets: List[Any] = []
             # Accumulate sender stats from globally-gathered weights for verification.
+            # Gated by config flag to skip stats computation when verification is disabled.
+            compute_stats = self.worker.pipeline_config.verify_model_after_sync
             running_sum = 0.0
             running_max = float("-inf")
             running_min = float("inf")
@@ -1959,12 +1961,13 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                 ]
                 # Compute sender stats from cpu_named_weights before bucketing (bucketing
                 # flattens to int8, destroying the original dtype needed for stats).
-                batch_stats = compute_weight_stats(cpu_named_weights)
-                if batch_stats:
-                    running_sum += batch_stats["sum"]
-                    running_max = max(running_max, batch_stats["max"])
-                    running_min = min(running_min, batch_stats["min"])
-                    batch_count += 1
+                if compute_stats:
+                    batch_stats = compute_weight_stats(cpu_named_weights)
+                    if batch_stats:
+                        running_sum += batch_stats["sum"]
+                        running_max = max(running_max, batch_stats["max"])
+                        running_min = min(running_min, batch_stats["min"])
+                        batch_count += 1
 
                 bucket, tensors_meta = _bucket_named_tensors(cpu_named_weights)  # CPU int8
                 cached_buckets.append((tensors_meta, bucket))

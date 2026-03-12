@@ -20,11 +20,11 @@ logging_dir: ./output/lora_pipeline1/logs
 output_dir: ./output/lora_pipeline1
 render_save_dir: /tmp/roll_output/lora_pipeline1/render
 
-track_with: wandb
-tracker_kwargs:
-  entity: "khd6t7hdhn-university-of-pennsylvania"
-  project: "rlix"
-  api_key: "${oc.env:WANDB_API_KEY}"
+# track_with: wandb
+# tracker_kwargs:
+#   entity: "khd6t7hdhn-university-of-pennsylvania"
+#   project: "rlix"
+#   api_key: "${oc.env:WANDB_API_KEY}"
 
 
 system_envs:
@@ -152,7 +152,7 @@ actor_infer:
       max_num_batched_tokens: 1024  # Match reduced sequence_length=1024
       max_num_seqs: 2
       enforce_eager: true
-      sleep_level: 1  # RLix requires sleep_level=1 for weight offload
+      sleep_level: 1
   device_mapping: "[0, 1, ]"
 
 reference:

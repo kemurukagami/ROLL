@@ -307,9 +307,11 @@ class WorkerBase:
                         )
 
         # Base model stats: live GPU parameters (TP-sharded per rank).
+        # remove_duplicate=True (default) so tied weights (e.g. embed_tokens/lm_head when
+        # tie_word_embeddings=True) are counted once, matching the sender's gather_all_hf_weights.
         if "base" in expected_stats:
             model = self.model_runner.model
-            base_stats = compute_weight_stats(model.named_parameters(remove_duplicate=False))
+            base_stats = compute_weight_stats(model.named_parameters())
             result["base"] = base_stats
 
         # LoRA stats: raw received tensors (identical across TP ranks).

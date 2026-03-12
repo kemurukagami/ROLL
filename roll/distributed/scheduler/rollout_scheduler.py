@@ -896,9 +896,10 @@ class RolloutScheduler(RolloutMockMixin):
             mode
         )
 
+        # Include env-manager name so multiple train schedulers (one per tag) do not collide on actor name.
         self.generate_scheduler = RequestScheduler.options(
                 name=(
-                    f"{self.pipeline_id}_request_scheduler_{mode}"
+                    f"{self.pipeline_id}_request_scheduler_{self.env_manager_config.name}_{mode}"
                     if self.pipeline_id
                     else f"RequestScheduler-{self.env_manager_config.name}-{mode}"
                 ),

@@ -1099,7 +1099,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                        (getattr(self.worker_config.model_args, "lora_target", None) is not None)
         # Multi-adapter discriminator: True only for RLix multi-adapter LoRA configs.
         # Legacy single-LoRA (lora_target only, no adapters dict) uses train_step + shared optimizer.
-        self.has_multi_adapter = self.worker_config.model_args.adapters is not None
+        self.has_multi_adapter = self.worker_config.model_args.adapters is not None and len(self.worker_config.model_args.adapters) > 1
 
         # --- Config validation: reject incompatible configs before DDP wrapping ---
 

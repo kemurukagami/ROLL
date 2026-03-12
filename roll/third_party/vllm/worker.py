@@ -83,7 +83,9 @@ class TensorLoraManager:
         peft_config["add_lora_count"] = self.add_lora_count
         # Use a stable hash key (adapter + config only). Do NOT include call-order counters,
         # otherwise different registration order across workers yields inconsistent adapter ids.
-        peft_config_for_hash = dict(peft_config)
+        # Exclude add_lora_count from hash — it increments per call, producing different int_ids
+        # for the same adapter across sync cycles and causing vLLM LRU eviction mismatches.
+        peft_config_for_hash = {k: v for k, v in peft_config.items() if k != "add_lora_count"}
         peft_config_for_hash["adapter_name"] = adapter_name
         peft_config_str = json.dumps(peft_config_for_hash, sort_keys=True)
         hash_obj = hashlib.sha256(peft_config_str.encode("utf-8"))

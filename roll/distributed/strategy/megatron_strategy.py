@@ -1953,21 +1953,21 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
                     # Non-owner must consume the generator element to keep the PP collective moving,
                     # but does not store anything.
                     continue
+                # Compute sender stats on GPU tensors before CPU copy (GPU reductions are
+                # ~20-40x faster than CPU for large models).
+                if compute_stats:
+                    batch_stats = compute_weight_stats(hf_named_weights)
+                    if batch_stats:
+                        running_sum += batch_stats["sum"]
+                        running_max = max(running_max, batch_stats["max"])
+                        running_min = min(running_min, batch_stats["min"])
+                        batch_count += 1
                 # Cache as raw CPU tensors. GPU staging + serialization happens at transport
                 # time because IPC handles are ephemeral (tied to specific GPU allocations).
                 cpu_named_weights = [
                     (str(name), weight.detach().to("cpu").contiguous())
                     for name, weight in hf_named_weights
                 ]
-                # Compute sender stats from cpu_named_weights before bucketing (bucketing
-                # flattens to int8, destroying the original dtype needed for stats).
-                if compute_stats:
-                    batch_stats = compute_weight_stats(cpu_named_weights)
-                    if batch_stats:
-                        running_sum += batch_stats["sum"]
-                        running_max = max(running_max, batch_stats["max"])
-                        running_min = min(running_min, batch_stats["min"])
-                        batch_count += 1
 
                 bucket, tensors_meta = _bucket_named_tensors(cpu_named_weights)  # CPU int8
                 cached_buckets.append((tensors_meta, bucket))

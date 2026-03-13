@@ -650,7 +650,9 @@ class MegatronWeightUpdater:
             if co_infer_rank == 0 and self._co_infer_worker is not None:
                 refs.append(
                     self._co_infer_worker.update_parameter_in_bucket.remote(
-                        infer_parallel_tensors, is_lora=self.is_lora
+                        infer_parallel_tensors,
+                        is_lora=self.is_lora,
+                        model_update_transport=self.pipeline_config.model_update_transport,
                     )
                 )
             if self._broadcast_workers:

@@ -184,7 +184,7 @@ class BaseConfig(ScheduleConfig):
                 "Transport for colocated model weight transfer (Megatron+vLLM only). "
                 "'cuda_ipc': default GPU transport via CUDA IPC; may require additional "
                 "container privileges in restricted environments. "
-                "'cpu_pickle': CPU byte serialization fallback via standard pickle, "
+                "'cpu_serialize': CPU byte serialization fallback via standard pickle, "
                 "avoids 'pidfd_getfd: Operation not permitted' in restricted containers. "
                 "Payload size equals model_update_buffer_size_mb per rank; rank 0 holds "
                 "num_gpus_per_worker copies during gather."

@@ -681,8 +681,13 @@ class VllmStrategy(InferenceStrategy):
     async def broadcast_parameter(self, names, dtypes, shapes, group_name, is_lora=False, *, broadcast_local_ranks=None):
         await self.model.broadcast_parameter(names, dtypes, shapes, group_name, is_lora, broadcast_local_ranks=broadcast_local_ranks)
 
-    async def update_parameter_in_bucket(self, serialized_named_tensors, is_lora=False, *, ipc_local_ranks=None):
-        await self.model.update_parameter_in_bucket(serialized_named_tensors, is_lora, ipc_local_ranks=ipc_local_ranks)
+    async def update_parameter_in_bucket(
+        self, serialized_named_tensors, is_lora=False, *, ipc_local_ranks=None, model_update_transport="cuda_ipc"
+    ):
+        await self.model.update_parameter_in_bucket(
+            serialized_named_tensors, is_lora,
+            ipc_local_ranks=ipc_local_ranks, model_update_transport=model_update_transport,
+        )
 
     async def destroy_collective_group(self, group_name: str, model_update_name: str | None = None) -> None:
         """Destroy a previously created collective communication group.

@@ -624,7 +624,7 @@ class GroupQueueManager:
             fifo_timestamp=time.time(),
             metrics={
                 "mode": self.mode,
-                "remaining": int(remaining),
+                "collected": int(self._progress_collected_estimated),
                 "bucket": int(bucket),
                 "new_batch": bool(emitted_for_new_batch),
                 "current_train_step": current_train_step,

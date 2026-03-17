@@ -620,11 +620,7 @@ class GroupQueueManager:
 
         report = ProgressReport(
             pipeline_id=str(self.pipeline_id),
-            queued_trajectories=0,
-            inflight_trajectories=0,
             step_target_trajectories=int(total_required),
-            percent_completed=percent_completed,
-            oldest_unfinished_creation_ts=oldest_ts,
             fifo_timestamp=time.time(),
             metrics={
                 "mode": self.mode,

@@ -481,9 +481,7 @@ class GroupQueueManager:
         self._progress_total_required_estimated = self._estimate_total_required()  # Target: batch_size * num_return_sequences
         self._progress_collected_estimated = 0  # Trajectories collected so far (clamped to total_required)
         self._progress_episode_non_null: Dict[Tuple[int, int], int] = {}  # Per-episode count for rollback on filter/reject
-        if self._rlix_enabled:
-            self._mark_new_batch()
-            self._maybe_emit_progress(current_train_step=None)
+        self._progress_active = False  # True only between begin_progress_batch/end_progress_batch
 
     def _resolve_num_return_sequences(self) -> int:
         # RLix progress should be expressed in "trajectory units" that match the rollout batch contract.
@@ -574,6 +572,9 @@ class GroupQueueManager:
     def _maybe_emit_progress(self, *, current_train_step: Optional[int]) -> None:
         """Emit progress report to coordinator if conditions are met.
 
+        Suppressed when _progress_active is False (before begin or after end),
+        preventing stale emissions from late put() calls after batch deactivation.
+
         Emits when:
             - 2% bucket changed (bucket != self._progress_last_bucket), OR
             - Batch complete (remaining == 0), OR
@@ -586,6 +587,8 @@ class GroupQueueManager:
         Args:
             current_train_step: Current training step (for metrics), or None if unknown.
         """
+        if not self._progress_active:
+            return
         if not self._rlix_enabled:
             return
         if self.max_traj_per_env is None:
@@ -645,9 +648,10 @@ class GroupQueueManager:
     def clear(self):
         """Reset scheduler state for a new training step or after suspension.
 
-        Cancels pending batch retrieval tasks, clears all group queue state,
-        and resets progress tracking. Called when rolling back to a checkpoint
-        or when starting fresh after a suspend operation.
+        Cancels pending batch retrieval tasks and clears all group queue state.
+        Called when rolling back to a checkpoint or when starting fresh after a
+        suspend operation. Progress deactivation is handled separately by
+        end_progress_batch() via the RolloutScheduler lifecycle.
         """
         self.rollout_complete = {}
         for get_task in self.pending_gets:
@@ -655,23 +659,47 @@ class GroupQueueManager:
         self.pending_gets = set()
         for group_queue in self.group_queue.values():
             group_queue.clear()
-        self._reset_progress_for_new_batch(current_train_step=None)
 
     def advance_step(self, step):
-        """Advance to a new training step, resetting progress for a fresh batch cycle.
+        """Advance to a new training step.
 
-        Propagates step advancement to all group queues and resets progress tracking
-        to start collecting a new batch. Emits a progress report marking the start
-        of the new batch.
+        Propagates step advancement to all group queues (creates/expires async
+        groups, wakes waiters). Does NOT reset progress; that is now handled
+        by begin_progress_batch() at the start of each get_batch() request.
 
         Args:
             step: The new training step number, or None if step is unknown.
         """
         for group_queue in self.group_queue.values():
             group_queue.advance_step(step)
-        self._reset_progress_for_new_batch(
-            current_train_step=int(step) if step is not None else None
-        )
+
+    def begin_progress_batch(self, current_train_step: Optional[int]) -> None:
+        """Activate progress tracking for a new batch collection cycle.
+
+        Called by RolloutScheduler.get_batch() to mark the start of active demand.
+        Resets counters, sets _progress_active, and emits a new_batch report to
+        the coordinator so the scheduler allocates GPU resources for this stream.
+
+        Args:
+            current_train_step: The training step number, or None if unknown.
+        """
+        self._progress_active = True
+        self._reset_progress_for_new_batch(current_train_step=current_train_step)
+
+    def end_progress_batch(self) -> None:
+        """Deactivate progress tracking for the completed batch.
+
+        Called by RolloutScheduler.get_batch() after batch collection finishes
+        (success, empty, or exception). Sets _progress_active = False to suppress
+        late put()-driven emissions, then tells the coordinator to remove this
+        stream from aggregation so stale demand does not distort scheduling.
+        """
+        self._progress_active = False
+        if self._rlix_coordinator is not None:
+            self._rlix_coordinator.clear_progress_stream.remote(
+                mode=self.mode,
+                adapter_id=self.adapter_id,
+            )
 
     async def get_episode_id(self, group_id, env_id=None):
         """
@@ -1016,39 +1044,50 @@ class RolloutScheduler(RolloutMockMixin):
         if not DO_TIME_SHARING:
             await self.generate_scheduler.resume.remote()
 
-        get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
-        await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)
-        if self.rollout_task.done() and self.rollout_task.exception() is not None:
-            await self.rollout_task
-        data_batch = await get_task
-        logger.info(
-            f"[RolloutScheduler] env_output_queue.get_batch returned mode={self.mode} "
-            f"global_step={global_step} items={len(data_batch) if data_batch else 0}"
+        # Activate progress tracking for this batch.
+        await self.env_output_queue.begin_progress_batch.remote(
+            int(global_step) if global_step is not None else None
         )
-        if batch_size <= 0:
-            await self.rollout_task
-            self.rollout_task = None
-            await self.env_output_queue.clear.remote()
 
-        if len(data_batch) == 0:
-            return None
+        try:
+            get_task = asyncio.create_task(self._get_batch(batch_size, global_step))
+            await asyncio.wait({get_task, self.rollout_task}, return_when=asyncio.FIRST_COMPLETED)
+            if self.rollout_task.done() and self.rollout_task.exception() is not None:
+                await self.rollout_task
+            data_batch = await get_task
+            logger.info(
+                f"[RolloutScheduler] env_output_queue.get_batch returned mode={self.mode} "
+                f"global_step={global_step} items={len(data_batch) if data_batch else 0}"
+            )
+            if batch_size <= 0:
+                await self.rollout_task
+                self.rollout_task = None
+                await self.env_output_queue.clear.remote()
 
-        metrics = {}
-        get_batch_return_start_time = None
-        for d_item in data_batch:
-            get_batch_return_start_time = d_item.meta_info.pop("get_batch_return_start_time", None)
-            append_to_dict(metrics, d_item.meta_info["metrics"])
-        if get_batch_return_start_time is not None:
-            metrics["time/get_batch_cost_gqm"] = time.time() - get_batch_return_start_time
-        metrics.update(await self.env_output_queue.collect_metrics.remote())
-        batch = DataProto.concat(data_batch)
-        batch.meta_info["metrics"] = metrics
-        batch.meta_info["get_batch_return_start_time"] = time.time()
+            if len(data_batch) == 0:
+                return None
 
-        # DUMP MODE: Save merged batch (from mixin)
-        await self._maybe_dump_batch(batch, global_step)
+            metrics = {}
+            get_batch_return_start_time = None
+            for d_item in data_batch:
+                get_batch_return_start_time = d_item.meta_info.pop("get_batch_return_start_time", None)
+                append_to_dict(metrics, d_item.meta_info["metrics"])
+            if get_batch_return_start_time is not None:
+                metrics["time/get_batch_cost_gqm"] = time.time() - get_batch_return_start_time
+            metrics.update(await self.env_output_queue.collect_metrics.remote())
+            batch = DataProto.concat(data_batch)
+            batch.meta_info["metrics"] = metrics
+            batch.meta_info["get_batch_return_start_time"] = time.time()
 
-        return batch
+            # DUMP MODE: Save merged batch (from mixin)
+            await self._maybe_dump_batch(batch, global_step)
+
+            return batch
+        finally:
+            # Deactivate progress: suppress late emissions and clear coordinator/scheduler state.
+            # Awaited (not fire-and-forget) to serialize with the next begin_progress_batch call
+            # and prevent lifecycle races on the GQM actor (which has max_concurrency > 1).
+            await self.env_output_queue.end_progress_batch.remote()
 
     async def shrink_sampler(self, dp_ranks: List[int], skip_offload: bool = False) -> Dict[str, Any]:
         """Offload model weights from specified DP ranks and deactivate them for routing.

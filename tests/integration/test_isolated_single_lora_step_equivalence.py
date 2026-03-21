@@ -6,7 +6,7 @@ Strategy
 Run the two clusters **sequentially** on the *same* GPU set so GPU requirements are
 halved compared to running them in parallel.
 
-Phase 1 — isolated cluster (multi-LoRA, ROLL_rlix ported strategy):
+Phase 1 — isolated cluster (multi-LoRA, ROLL ported strategy):
   - Register all adapters under ``is_lora_optimizer_isolated=True``.
   - For each adapter in turn, run ``train_step_lora`` for *n_steps* steps.
   - Record the scalar loss returned at every step.
@@ -66,7 +66,7 @@ The test enforces this via four mechanisms:
    are seeded identically so any remaining RNG-dependent operation (e.g., Megatron
    TP dropout, weight init) starts from the same state.
 
-Phase 1 dependencies (must be ported into ROLL_rlix before tests pass):
+Phase 1 dependencies (must be ported into ROLL before tests pass):
   - ``MegatronTrainStrategy.train_step_lora``  with ``is_lora_optimizer_isolated=True``
   - ``Worker.train_step_lora``
   - ``Worker.{get_lora_tensors, set_lora_tensors, copy_lora_params}``
@@ -305,7 +305,7 @@ def _extract_loss(result: DataProto) -> float:
     """Extract the scalar loss from a train_step / train_step_lora DataProto result.
 
     Checks both ``{worker_name}/loss`` (upstream convention) and
-    ``{worker_name}/loss@sum`` (ROLL_rlix convention).
+    ``{worker_name}/loss@sum`` (ROLL convention).
     """
     metrics: dict = result.meta_info.get("metrics", {}) if result.meta_info else {}
     for key in (f"{_WORKER_NAME}/loss", f"{_WORKER_NAME}/loss@sum"):
